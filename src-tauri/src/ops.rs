@@ -84,8 +84,10 @@ impl SyncOne {
 
 /// 一键同步单个项目：先检查状态，再按状态处理
 /// - 待推送 → push；待拉取 → pull --ff-only；已同步 → 跳过
-/// - 有未提交改动 / 分叉 / 未关联云端 → 不做任何操作，记为异常
-pub async fn sync_one(dir: &Path) -> SyncOne {
+/// - 有未提交改动：打开了自动提交（`auto_commit` 为提交信息）→ 自动提交并推送，见 `auto_commit_and_push`；
+///   没打开 → 不做任何操作，记为异常
+/// - 分叉 / 未关联云端 → 不做任何操作，记为异常
+pub async fn sync_one(dir: &Path, auto_commit: Option<&str>) -> SyncOne {
     let ins = match check(dir).await {
         Checked::Fresh(i) => i,
         Checked::FetchFailed { local, error } => return SyncOne::failed(error.message(), Some(local), true),
@@ -102,11 +104,110 @@ pub async fn sync_one(dir: &Path) -> SyncOne {
             Err(e) => SyncOne::failed(e.message(), Some(ins), false),
         },
         SyncStatus::Synced => SyncOne::ok(SyncOutcome::UpToDate, 0, ins),
+        // 有未提交改动意味着已有上游（"未关联云端"优先级更高）
+        SyncStatus::Dirty if auto_commit.is_some() => {
+            auto_commit_and_push(dir, ins, auto_commit.unwrap_or("")).await
+        }
         _ => {
             let reason = issue_text(&ins);
             SyncOne::failed(reason, Some(ins), false)
         }
     }
+}
+
+/// 一键同步时的自动提交：
+/// 1. 有冲突中的文件，或正在 merge / cherry-pick / revert → 不提交
+/// 2. 领先且落后（分叉）→ 不提交
+/// 3. 落后 → 先 pull --ff-only；git 拒绝（本地改动和云端改动碰到同一文件等）→ 不提交
+/// 4. git add -A → git commit -m → push（不强推）；推送失败时提交保留在本地
+async fn auto_commit_and_push(dir: &Path, ins: Inspection, message: &str) -> SyncOne {
+    if ins.conflicts > 0 {
+        let reason = format!("有 {} 个文件处于冲突状态（合并未完成），不会自动提交，请先手动解决冲突", ins.conflicts);
+        return SyncOne::failed(reason, Some(ins), false);
+    }
+    match operation_in_progress(dir).await {
+        Ok(None) => {}
+        Ok(Some(op)) => {
+            let reason = format!("仓库正在{op}，还没完成，不会自动提交，请先手动完成或中止");
+            return SyncOne::failed(reason, Some(ins), false);
+        }
+        Err(e) => {
+            let reason = format!("无法确认仓库是否正在合并，未提交任何内容：{}", e.message());
+            return SyncOne::failed(reason, Some(ins), false);
+        }
+    }
+    if ins.ahead > 0 && ins.behind > 0 {
+        let reason = format!(
+            "本地和云端各有新提交（领先 {}、落后 {}），不会自动提交，需要先合并",
+            ins.ahead, ins.behind
+        );
+        return SyncOne::failed(reason, Some(ins), false);
+    }
+
+    let mut ins = ins;
+    if ins.behind > 0 {
+        if let Err(e) = pull_ff_only(dir, &ins).await {
+            let reason = format!("拉取云端的 {} 个新提交失败，未提交任何内容：\n{}", ins.behind, e.message());
+            return SyncOne::failed(reason, Some(ins), false);
+        }
+        let pulled = ins.behind;
+        ins = match inspect(dir).await {
+            Ok(i) => i,
+            Err(e) => {
+                let reason = format!("已拉取云端的新提交，但读取状态失败，未提交任何内容：{}", e.message());
+                return SyncOne::failed(reason, Some(ins), false);
+            }
+        };
+        match ins.status {
+            SyncStatus::Dirty => {}
+            // 拉取后工作区刚好变干净（本地改动和云端一致），不需要再提交
+            SyncStatus::Synced => return SyncOne::ok(SyncOutcome::Pulled, pulled, ins),
+            _ => {
+                let reason = issue_text(&ins);
+                return SyncOne::failed(reason, Some(ins), false);
+            }
+        }
+    }
+
+    if let Err(e) = run_git(dir, &["add", "-A"], NETWORK_TIMEOUT).await {
+        let reason = format!("自动提交失败（暂存改动时出错），未提交任何内容：{}", e.message());
+        return SyncOne::failed(reason, Some(reinspect(dir, ins.clone()).await), false);
+    }
+    if let Err(e) = run_git(dir, &["commit", "--quiet", "-m", message], NETWORK_TIMEOUT).await {
+        let reason = format!("自动提交失败，未提交任何内容：{}", e.message());
+        return SyncOne::failed(reason, Some(reinspect(dir, ins.clone()).await), false);
+    }
+    let after = match inspect(dir).await {
+        Ok(i) => i,
+        Err(e) => {
+            let reason = format!("已提交到本地，但读取状态失败，没有推送：{}", e.message());
+            return SyncOne::failed(reason, Some(ins), false);
+        }
+    };
+    match push(dir, &after).await {
+        Ok(()) => SyncOne::ok(SyncOutcome::Committed, after.ahead, reinspect(dir, after.clone()).await),
+        Err(e) => {
+            let reason = format!("已提交到本地，但推送失败：{}", e.message());
+            SyncOne::failed(reason, Some(reinspect(dir, after.clone()).await), false)
+        }
+    }
+}
+
+/// 是否有未完成的 merge / cherry-pick / revert（此时提交会把它们"完成"掉，所以不自动提交）
+async fn operation_in_progress(dir: &Path) -> Result<Option<&'static str>, GitError> {
+    for (head, label) in [
+        ("MERGE_HEAD", "合并（merge）"),
+        ("CHERRY_PICK_HEAD", "拣选提交（cherry-pick）"),
+        ("REVERT_HEAD", "撤销提交（revert）"),
+    ] {
+        match run_git(dir, &["rev-parse", "-q", "--verify", head], STATUS_TIMEOUT).await {
+            Ok(_) => return Ok(Some(label)),
+            // 不存在时退出码为 1
+            Err(GitError::Failed { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
 }
 
 /// 操作成功后重新读取状态；万一读取失败，就用操作前的结果

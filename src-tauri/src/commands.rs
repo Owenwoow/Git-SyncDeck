@@ -13,7 +13,7 @@ use crate::model::*;
 use crate::ops::{self, Checked, SyncOne};
 use crate::status::{inspect, Inspection};
 use crate::util::{
-    folder_name, map_limited, normalize_path, now_iso, project_id, same_path, CONCURRENCY,
+    commit_message_now, folder_name, map_limited, normalize_path, now_iso, project_id, same_path, CONCURRENCY,
     DEFAULT_COMMIT_TEMPLATE,
 };
 use crate::{scan, system};
@@ -291,6 +291,9 @@ pub async fn sync_all(
     let weight = |sp: &StoredProject| st.cached(&sp.id).map_or(6, |p| p.status.weight());
     stored.sort_by(|a, b| weight(a).cmp(&weight(b)).then_with(|| folder_name(&a.path).cmp(&folder_name(&b.path))));
 
+    // 自动提交的提交信息：本轮所有项目共用同一个时间
+    let commit_message = Arc::new(commit_message_now(&st.config.read(commit_template_of)));
+
     let total = stored.len();
     let started = Arc::new(AtomicUsize::new(0));
     let finished = Arc::new(AtomicUsize::new(0));
@@ -300,10 +303,12 @@ pub async fn sync_all(
         let on_event = on_event.clone();
         let started = started.clone();
         let finished = finished.clone();
+        let commit_message = commit_message.clone();
         async move {
             let index = started.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Start { project_id: sp.id.clone(), index, total });
-            let one = ops::sync_one(Path::new(&sp.path)).await;
+            let auto_commit = sp.auto_commit.then_some(commit_message.as_str());
+            let one = ops::sync_one(Path::new(&sp.path), auto_commit).await;
             let (project, result) = record_sync(&st, &sp, one);
             let index = finished.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Done { result: result.clone(), project, index, total });
@@ -322,7 +327,7 @@ pub async fn sync_all(
     })
 }
 
-/// 记录单个项目的同步结果：成功 → 更新上次同步时间、清除异常；失败 → 保存异常原因
+/// 记录单个项目的同步结果：成功（含自动提交并推送）→ 更新上次同步时间、清除异常；失败 → 保存异常原因
 fn record_sync(st: &AppState, sp: &StoredProject, one: SyncOne) -> (Project, SyncItemResult) {
     let success = one.outcome != SyncOutcome::Failed;
     let reason = one.reason.clone();
