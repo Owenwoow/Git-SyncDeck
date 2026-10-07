@@ -17,6 +17,8 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // 默认 %APPDATA%\com.gitsyncdeck.desktop\config.json；
             // 开发测试时可用环境变量 SYNCDECK_CONFIG_DIR 指到别处，避免影响真实配置
