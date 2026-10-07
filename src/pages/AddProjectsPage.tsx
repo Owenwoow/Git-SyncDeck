@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FolderOpen, FolderSearch, GitBranch, Loader2 } from "lucide-react";
+import { FolderOpen, FolderSearch, GitBranch, Loader2, Search, X } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { repoShortName } from "@/lib/status";
 import { cn } from "@/lib/utils";
@@ -22,6 +23,7 @@ export function AddProjectsPage() {
   const [applying, setApplying] = useState(false);
   /** 勾选状态 = 希望被监控的仓库路径 */
   const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
 
   const scan = useCallback(async (target: string) => {
     setDir(target);
@@ -91,6 +93,15 @@ export function AddProjectsPage() {
 
   const monitoredCount = (repos ?? []).filter((r) => r.monitored).length;
 
+  // 按名称、路径、远程仓库搜索；只影响显示，勾选状态不受影响
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q || !repos) return repos ?? [];
+    return repos.filter((r) =>
+      [r.name, r.path, repoShortName(r.remoteUrl) ?? ""].some((s) => s.toLowerCase().includes(q)),
+    );
+  }, [repos, query]);
+
   return (
     <div className="space-y-5 pb-4">
       <header>
@@ -129,6 +140,35 @@ export function AddProjectsPage() {
           )}
         </div>
 
+        {!scanning && repos && repos.length > 0 && (
+          <div className="mb-2 flex items-center gap-3">
+            <div className="relative w-72 max-w-full">
+              <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="搜索名称、路径或仓库"
+                className="h-8 pr-8 pl-8"
+              />
+              {query && (
+                <button
+                  type="button"
+                  onClick={() => setQuery("")}
+                  className="absolute top-1/2 right-2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                  aria-label="清空搜索"
+                >
+                  <X className="size-3.5" />
+                </button>
+              )}
+            </div>
+            {query.trim() && (
+              <span className="text-xs text-muted-foreground">
+                匹配 {visible.length} / {repos.length} 个
+              </span>
+            )}
+          </div>
+        )}
+
         {scanning || !repos ? (
           <div className="space-y-2">
             {[0, 1, 2, 3, 4].map((i) => (
@@ -139,9 +179,16 @@ export function AddProjectsPage() {
           <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
             这个目录里没有找到 Git 仓库
           </div>
+        ) : visible.length === 0 ? (
+          <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
+            没有匹配"{query.trim()}"的仓库
+            <Button variant="link" size="sm" onClick={() => setQuery("")}>
+              清除搜索
+            </Button>
+          </div>
         ) : (
           <ul className="divide-y overflow-hidden rounded-lg border bg-card">
-            {repos.map((r) => (
+            {visible.map((r) => (
               <RepoRow
                 key={r.path}
                 repo={r}
