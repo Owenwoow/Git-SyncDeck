@@ -43,7 +43,11 @@ async fn full_command_flow() {
     // 设置
     let s = commands::save_settings(
         app.state(),
-        SettingsPatch { default_code_dir: Some(repos.to_string_lossy().into()), theme: Some("dark".into()) },
+        SettingsPatch {
+            default_code_dir: Some(repos.to_string_lossy().into()),
+            theme: Some("dark".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();

@@ -11,7 +11,7 @@ import type {
   SyncResult,
 } from "@/types";
 import { buildDiagnosticText } from "@/lib/diagnostic";
-import { describeIssue, isAbnormal, sortProjects } from "@/lib/status";
+import { DEFAULT_COMMIT_TEMPLATE, describeIssue, isAbnormal, sortProjects } from "@/lib/status";
 import { formatDateTime } from "@/lib/time";
 import { clone, db, delay, jitter } from "./db";
 import { defaultSettings, pickableDirs } from "./repos";
@@ -197,6 +197,8 @@ export async function getSettings(): Promise<Settings> {
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
   await delay(100);
   const next = { ...readSettings(), ...patch };
+  // 和真实实现一致：模板为空时恢复默认
+  next.commitTemplate = next.commitTemplate.trim() || DEFAULT_COMMIT_TEMPLATE;
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
   } catch {

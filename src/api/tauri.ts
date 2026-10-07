@@ -92,14 +92,16 @@ function systemTheme(): Theme {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-type StoredSettings = { defaultCodeDir: string; theme: Theme | null };
+type StoredSettings = { defaultCodeDir: string; theme: Theme | null; commitTemplate: string };
+
+function toSettings(s: StoredSettings): Settings {
+  return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme(), commitTemplate: s.commitTemplate };
+}
 
 export async function getSettings(): Promise<Settings> {
-  const s = await call<StoredSettings>("get_settings");
-  return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme() };
+  return toSettings(await call<StoredSettings>("get_settings"));
 }
 
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
-  const s = await call<StoredSettings>("save_settings", { patch });
-  return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme() };
+  return toSettings(await call<StoredSettings>("save_settings", { patch }));
 }

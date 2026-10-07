@@ -11,6 +11,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { FileChangeKind, Project, SyncStatus } from "@/types";
+import { formatDateTime } from "@/lib/time";
 
 export interface StatusMeta {
   label: string;
@@ -207,6 +208,18 @@ function noRemoteReason(p: Project): string {
   if (p.branch === DETACHED_BRANCH) return "处于 detached HEAD 状态（不在任何分支上），无法同步";
   if (p.upstream) return `上游分支 ${p.upstream} 在云端已不存在`;
   return `分支 ${p.branch} 没有设置上游分支，不知道该推到哪里`;
+}
+
+// ---------------- 自动提交 ----------------
+
+/** 默认的自动提交信息模板（与 src-tauri/src/util.rs 的 DEFAULT_COMMIT_TEMPLATE 一致） */
+export const DEFAULT_COMMIT_TEMPLATE = "自动同步：{date} 来自 {host}";
+
+/** 按模板生成提交信息（与 src-tauri/src/util.rs 的 render_commit_message 一致）：
+ *  {date} → 本地时间 YYYY-MM-DD HH:mm，{host} → 电脑名；模板为空时用默认模板 */
+export function renderCommitMessage(template: string, date: Date, host: string): string {
+  const t = template.trim() || DEFAULT_COMMIT_TEMPLATE;
+  return t.split("{date}").join(formatDateTime(date)).split("{host}").join(host);
 }
 
 /** 文件变更类型的显示 */
