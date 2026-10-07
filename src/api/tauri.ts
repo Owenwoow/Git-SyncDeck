@@ -1,7 +1,10 @@
 // 真实数据模式：调用 Rust 端的 Tauri 命令（src-tauri/src/commands.rs）。
 // 函数签名必须与 src/mock/api.ts 完全一致。
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { open } from "@tauri-apps/plugin-dialog";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import type {
   CommitInfo,
   GitInfo,
@@ -11,6 +14,8 @@ import type {
   SyncProgressEvent,
   SyncResult,
   Theme,
+  UpdateInfo,
+  UpdateProgress,
 } from "@/types";
 import { buildDiagnosticText } from "@/lib/diagnostic";
 
@@ -102,4 +107,53 @@ export async function getSettings(): Promise<Settings> {
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
   const s = await call<StoredSettings>("save_settings", { patch });
   return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme() };
+}
+
+// ---------------- 应用更新（tauri-plugin-updater，读取 GitHub Releases 的 latest.json）----------------
+
+/** 最近一次 checkForUpdate 发现的新版本，installUpdate 用它下载安装 */
+let pendingUpdate: Update | null = null;
+
+export function getAppVersion(): Promise<string> {
+  return getVersion();
+}
+
+/** 有新版本返回版本信息，已是最新返回 null；网络或签名问题抛出 Error */
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  try {
+    const update = await check();
+    pendingUpdate = update;
+    if (!update) return null;
+    return {
+      version: update.version,
+      currentVersion: update.currentVersion,
+      date: update.date ?? null,
+      notes: update.body ?? null,
+    };
+  } catch (e) {
+    pendingUpdate = null;
+    throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** 下载并安装最近发现的新版本，完成后重启应用 */
+export async function installUpdate(onProgress: (p: UpdateProgress) => void): Promise<void> {
+  const update = pendingUpdate;
+  if (!update) throw new Error("没有可安装的更新，请先检查更新");
+  let downloaded = 0;
+  let total: number | null = null;
+  try {
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength ?? null;
+        onProgress({ downloaded: 0, total });
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength;
+        onProgress({ downloaded, total });
+      }
+    });
+  } catch (e) {
+    throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
+  }
+  await relaunch();
 }

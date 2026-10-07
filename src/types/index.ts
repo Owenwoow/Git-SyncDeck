@@ -109,3 +109,17 @@ export interface Settings {
   defaultCodeDir: string;
   theme: Theme;
 }
+
+/** 应用内更新：发现的新版本 */
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  date: string | null;
+  notes: string | null;
+}
+
+/** 更新包下载进度；total 为 null 表示服务器没给出总大小 */
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+}

@@ -1,5 +1,6 @@
 // 假数据模式下的 api 实现（第一阶段的 Demo 逻辑）。只允许 src/api/index.ts 引用。
 // 函数签名必须与 src/api/tauri.ts 完全一致。
+import { toast } from "sonner";
 import type {
   CommitInfo,
   GitInfo,
@@ -9,6 +10,8 @@ import type {
   SyncItemResult,
   SyncProgressEvent,
   SyncResult,
+  UpdateInfo,
+  UpdateProgress,
 } from "@/types";
 import { buildDiagnosticText } from "@/lib/diagnostic";
 import { describeIssue, isAbnormal, sortProjects } from "@/lib/status";
@@ -203,4 +206,35 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
     // 存储不可用时只在本次会话生效
   }
   return next;
+}
+
+// ---------------- 应用更新（演示）----------------
+
+export async function getAppVersion(): Promise<string> {
+  await delay(30);
+  return "0.1.0";
+}
+
+/** 演示：假装有个新版本 */
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  await delay(900);
+  return {
+    version: "0.2.0",
+    currentVersion: "0.1.0",
+    date: new Date().toISOString(),
+    notes: ["- 新增应用内更新", "- 修复若干问题", "（演示数据）"].join("\n"),
+  };
+}
+
+/** 演示：模拟下载进度，最后不会真的安装或重启 */
+export async function installUpdate(onProgress: (p: UpdateProgress) => void): Promise<void> {
+  const total = 24_000_000;
+  onProgress({ downloaded: 0, total });
+  for (let downloaded = 0; downloaded < total; ) {
+    await delay(150);
+    downloaded = Math.min(total, downloaded + Math.round(total * (0.06 + Math.random() * 0.08)));
+    onProgress({ downloaded, total });
+  }
+  await delay(400);
+  toast.info("演示模式：不会真的更新", { description: "真实环境下这里会安装新版本并自动重启应用" });
 }
