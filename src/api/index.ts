@@ -32,4 +32,7 @@ export const {
   openInEditor,
   getSettings,
   saveSettings,
+  getAppVersion,
+  checkForUpdate,
+  installUpdate,
 } = impl;
