@@ -17,7 +17,7 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 - 全量测试：`cd src-tauri; cargo test`（CI 跑的就是 `npm run build` + `cargo test`）
 - 单个集成测试：`cd src-tauri; cargo test --test repo_states -- --nocapture`，或 `--test commands_flow`
 - 单元测试（例如 git 白名单）：`cd src-tauri; cargo test --lib git::`
-- 打包：`npm run tauri build`，产物在 `src-tauri\target\release\bundle\`
+- 打包：`npm run tauri build`，产物在 `src-tauri\target\release\bundle\`。因为开了 `createUpdaterArtifacts`，必须先设置环境变量 `TAURI_SIGNING_PRIVATE_KEY`（私钥在 `%USERPROFILE%\.tauri\git-syncdeck.key`，绝不进仓库），否则打包最后一步会失败
 - 手动体验用测试仓库：`npm run test:repos`，生成在 `%TEMP%\syncdeck-test`，再在应用里"添加项目"选 `repos` 子目录
 
 集成测试会自己调用 `node scripts/make-test-repos.mjs`，在 `%TEMP%` 里重新生成测试仓库（本地裸仓库充当云端），所以 PATH 里要有 `node` 和 `git`。`commands_flow` 用 `tauri::test::mock_builder()` 调全部命令，并用 `SYNCDECK_CONFIG_DIR` 把配置写到临时目录。
@@ -56,4 +56,5 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 - 不修改用户的全局 git 配置（包括 `safe.directory`），不读写凭据；取消监控只改清单，不删除任何文件。
 - 开发服务器固定监听 `127.0.0.1:1420`（`strictPort`）：部分 Windows 机器上 `localhost` 只解析到 `::1`，Tauri CLI 会一直等不到开发服务器。
 - 调试时用环境变量 `SYNCDECK_CONFIG_DIR` 指定配置目录，以免改到真实配置 `%APPDATA%\com.gitsyncdeck.desktop\config.json`。
-- 发布：先把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 三处的版本号改成同一个并提交，再推 `v*` 标签。`.github/workflows/release.yml` 会先跑测试，再构建 Windows 安装包并发布到 Releases。
+- 发布：先把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 三处的版本号改成同一个并提交，再推 `v*` 标签。`.github/workflows/release.yml` 会先跑测试，再构建 Windows 安装包并发布到 Releases，同时上传应用内更新用的 `latest.json` 和 `.sig`（需要仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`）。`tauri.conf.json` 里的 updater 公钥和这把私钥是一对，换私钥等于让所有已安装版本收不到更新。
+- 自动提交只在一键同步时、对打开了开关的项目进行；不做后台定时提交。

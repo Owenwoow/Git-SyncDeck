@@ -6,19 +6,22 @@
 
 到 [Releases](https://github.com/Owenwoow/Git-SyncDeck/releases/latest) 下载以 `-setup.exe` 结尾的安装程序。使用前需要先安装 [Git for Windows](https://git-scm.com/download/win)。安装包没有签名，Windows 提示"已保护你的电脑"时，点"更多信息"→"仍要运行"。
 
+**升级**：新版本直接覆盖安装即可，不用先卸载，监控清单和设置都会保留。0.2.0 起支持应用内更新：启动时自动检查，有新版本时提示；也可以在"设置 → 关于"里手动检查，点"下载并安装"后会自动重启到新版本。
+
 ## 功能
 
 - **主页**：所有监控项目的同步状态（7 种），需要处理的排在前面；按状态筛选、按名称搜索；点开看详情（领先/落后、未提交文件）。
   - 启动时先显示本地状态（不联网），随后自动在后台联网刷新一次。
   - 断网等原因检查失败时，保留上一次的状态，并在项目上显示"检查失败：原因"。
 - **一键同步**：每个项目先 `git fetch` + `git status` 检查，然后待推送 → `git push`，待拉取 → `git pull --ff-only`；有未提交改动 / 分叉 / 未关联云端的项目不做任何操作，记为异常。最多 4 个项目并行，进度实时显示。
+- **自动提交**（类似 Obsidian Git，按项目开关，默认关）：在项目详情里打开"一键同步时自动提交"后，一键同步遇到这个项目有未提交改动时，会 `git add -A` → 按模板提交 → 推送。模板在设置里改，默认 `自动同步：{date} 来自 {host}`。云端有新提交时先 `pull --ff-only` 再提交；有冲突、正在合并、本地和云端分叉，或拉取被 git 拒绝时都不提交，记为异常。
 - **异常处理**：
   - 复制诊断文本：内容是项目信息、文件名、最近 3 次提交，可以直接粘贴给 AI，不含文件内容。
   - 直接提交并推送：add -A → commit → push；提交后如果发现落后于云端，会停下来报告，不自动合并。
   - 本次跳过：异常标记保留在主页，直到下次同步成功或刷新到"已同步"。
   - 打开终端（Windows Terminal，没有就用 cmd）或 VS Code。
-- **添加项目**：选择目录后递归扫描（最多 3 层），勾选加入或取消监控。
-- **设置**：默认代码目录、浅色/深色主题。监控清单、设置、上次同步时间和遗留异常都会保存，重启后恢复。
+- **添加项目**：选择目录后递归扫描（最多 3 层），可按名称、路径、仓库搜索，勾选加入或取消监控。
+- **设置**：默认代码目录、自动提交的提交信息模板、浅色/深色主题、关于与检查更新。监控清单、设置、上次同步时间和遗留异常都会保存，重启后恢复。
 
 ## 环境要求
 
@@ -43,9 +46,17 @@ npm run tauri dev     # 桌面窗口，真实数据
 npm run tauri build   # 打包，安装包在 src-tauri\target\release\bundle\（nsis\*.exe、msi\*.msi）
 ```
 
+本地打包会同时生成应用内更新用的签名文件，需要先设置私钥环境变量（私钥在 `%USERPROFILE%\.tauri\git-syncdeck.key`，不在仓库里）：
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.tauri\git-syncdeck.key"
+```
+
 ### 发布新版本
 
-GitHub Actions（`.github/workflows/release.yml`）会在推送 `v*` 标签时先跑测试，再在 Windows 上构建安装包，并发布到 Releases。
+GitHub Actions（`.github/workflows/release.yml`）会在推送 `v*` 标签时先跑测试，再在 Windows 上构建安装包，并发布到 Releases，同时上传应用内更新用的 `latest.json` 和签名文件。
+
+前提：仓库 Settings → Secrets 里有 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件的内容，只需配置一次）。私钥务必备份，丢了的话，已安装的版本就再也收不到应用内更新。
 
 1. 把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 里的版本号改成新版本，例如 `0.2.0`，然后提交。
 2. 打标签并推送：`git tag v0.2.0`，`git push origin main v0.2.0`。
@@ -82,8 +93,9 @@ npm run test:repos                     # 在 %TEMP%\syncdeck-test 创建测试�
 cd src-tauri; cargo test -- --nocapture
 ```
 
-- `scripts/make-test-repos.mjs` 构造出这些状态：已同步、待推送、待拉取、有未提交改动（含中文文件名）、分叉、未关联云端（无远程 / 无上游 / detached HEAD）、检查失败（远程地址无效）、有改动且落后。
+- `scripts/make-test-repos.mjs` 构造出这些状态：已同步、待推送、待拉取、有未提交改动（含中文文件名）、分叉、未关联云端（无远程 / 无上游 / detached HEAD）、检查失败（远程地址无效）、有改动且落后、有改动且落后且和云端改了同一个文件。
 - `src-tauri/tests/repo_states.rs` 验证状态检测、一键同步、提交并推送，并检查异常项目的提交和工作区没被改动。
+- `src-tauri/tests/auto_commit.rs` 验证自动提交：开关打开时按模板提交并推送；开关关闭时不动；落后时先拉取再提交；拉取冲突时不提交，本地改动还在。
 - `src-tauri/tests/commands_flow.rs` 用 Tauri 模拟运行时调用全部命令：扫描 → 添加 → 刷新 → 同步进度 → 持久化 → 取消监控。
 
 想在界面里亲手试：运行 `npm run test:repos`，然后在应用里"添加项目"，选择 `%TEMP%\syncdeck-test\repos`。
@@ -94,7 +106,7 @@ cd src-tauri; cargo test -- --nocapture
 
 - **不弹窗口、不等待输入**：`CREATE_NO_WINDOW`；`GIT_TERMINAL_PROMPT=0`；`GCM_INTERACTIVE=never`，没有已保存的凭据就直接报错，不弹登录窗口。
 - **中文和超时**：加 `-c core.quotepath=false`，输出按 UTF-8 解码。状态查询超时 10 秒，fetch / push / pull / commit 超时 60 秒，超时后终止。
-- **白名单**：只允许 status、fetch、push（显式 refspec，不带 +）、pull（`--ff-only --no-rebase --no-autostash`）、add -A、commit -m、log、config 只读等。`--force`、reset、rebase、stash、clean、checkout、restore 等一律拒绝，有单元测试覆盖。
+- **白名单**：只允许 status、fetch、push（显式 refspec，不带 +）、pull（`--ff-only --no-rebase --no-autostash`）、add -A、commit -m、log、rev-parse、config 只读等。`--force`、reset、rebase、stash、clean、checkout、restore 等一律拒绝，有单元测试覆盖。
 - **不碰凭据**：远程地址和错误输出里的账号或 token 一律去掉后才显示或保存。
 - **不动文件**：取消监控只改清单，不删除任何文件或仓库。
 
@@ -147,5 +159,5 @@ scripts/make-test-repos.mjs   测试仓库生成脚本
 - **不自动解决冲突**：分叉、合并冲突、正在进行的 merge / rebase 都需要手动处理，可以复制诊断文本交给 AI。
 - **"dubious ownership"**：外置硬盘上的仓库，或其他用户创建的仓库，git 可能拒绝操作。界面会显示 git 的原始错误，需要按提示自己执行 `git config --global --add safe.directory <路径>`，本工具不会改你的全局 git 配置。
 - **扫描范围**：最多 3 层，跳过 node_modules、.venv、target、dist、build 等目录和所有以 `.` 开头的目录，不跟随符号链接。
-- **自动刷新只有一次**：只在启动时自动联网刷新一次，之后要点"刷新状态"。
+- **自动刷新只有一次**：只在启动时自动联网刷新一次，之后要点"刷新状态"。自动提交也只在点"一键同步"时发生，不会在后台定时运行。
 - **安装包未签名**：首次运行时 Windows SmartScreen 可能提示"未知发布者"。应用图标暂时是 Tauri 默认图标。
