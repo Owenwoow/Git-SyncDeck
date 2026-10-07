@@ -72,7 +72,7 @@ function ProgressRow({ project: p, sync }: { project: Project; sync: SyncState }
 
   let text: React.ReactNode;
   if (result) text = <OutcomeText result={result} />;
-  else if (active) text = <span className="text-status-syncing">{activeText(before)}</span>;
+  else if (active) text = <span className="text-status-syncing">{activeText(before, p.autoCommit)}</span>;
   else
     text = (
       <span className="inline-flex items-center gap-1 text-muted-foreground">
@@ -93,8 +93,10 @@ function ProgressRow({ project: p, sync }: { project: Project; sync: SyncState }
   );
 }
 
-function activeText(before: SyncState["before"][string] | undefined): string {
+function activeText(before: SyncState["before"][string] | undefined, autoCommit: boolean): string {
   switch (before?.status) {
+    case "dirty":
+      return autoCommit ? "正在自动提交并推送…" : "正在检查…";
     case "ahead":
       return `正在推送 ${before.ahead} 个提交…`;
     case "behind":
@@ -114,6 +116,8 @@ function OutcomeText({ result }: { result: SyncItemResult }) {
       return <span className="text-status-synced">已拉取 {result.commits} 个提交</span>;
     case "up-to-date":
       return <span className="text-muted-foreground">已是最新</span>;
+    case "committed":
+      return <span className="text-status-synced">已自动提交并推送 {result.commits} 个提交</span>;
     case "failed":
       return <span className="text-status-dirty">需要手动处理</span>;
   }

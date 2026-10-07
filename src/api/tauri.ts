@@ -52,6 +52,11 @@ export function removeProject(id: string): Promise<void> {
   return call("remove_project", { id });
 }
 
+/** 打开 / 关闭"一键同步时自动提交"，返回最新的项目 */
+export function setAutoCommit(projectId: string, enabled: boolean): Promise<Project> {
+  return call("set_auto_commit", { projectId, enabled });
+}
+
 // ---------------- 目录 ----------------
 
 export async function pickDirectory(defaultPath?: string): Promise<string | null> {
@@ -97,16 +102,18 @@ function systemTheme(): Theme {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-type StoredSettings = { defaultCodeDir: string; theme: Theme | null };
+type StoredSettings = { defaultCodeDir: string; theme: Theme | null; commitTemplate: string };
+
+function toSettings(s: StoredSettings): Settings {
+  return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme(), commitTemplate: s.commitTemplate };
+}
 
 export async function getSettings(): Promise<Settings> {
-  const s = await call<StoredSettings>("get_settings");
-  return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme() };
+  return toSettings(await call<StoredSettings>("get_settings"));
 }
 
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
-  const s = await call<StoredSettings>("save_settings", { patch });
-  return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme() };
+  return toSettings(await call<StoredSettings>("save_settings", { patch }));
 }
 
 // ---------------- 应用更新（tauri-plugin-updater，读取 GitHub Releases 的 latest.json）----------------

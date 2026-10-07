@@ -23,6 +23,7 @@ export const {
   refreshStatus,
   addProjects,
   removeProject,
+  setAutoCommit,
   pickDirectory,
   scanDirectory,
   syncAll,

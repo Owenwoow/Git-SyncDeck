@@ -71,3 +71,67 @@ pub fn folder_name(path: &str) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
 }
+
+// ---------------- 自动提交的提交信息 ----------------
+
+/// 默认的提交信息模板（与 src/lib/status.ts 的 DEFAULT_COMMIT_TEMPLATE 一致）
+pub const DEFAULT_COMMIT_TEMPLATE: &str = "自动同步：{date} 来自 {host}";
+
+/// 取不到电脑名时的显示
+pub const UNKNOWN_HOST: &str = "未知电脑";
+
+/// 按模板生成提交信息：`{date}` → 传入的时间文本，`{host}` → 电脑名。
+/// 模板去掉空白后为空就用默认模板。
+pub fn render_commit_message(template: &str, date: &str, host: &str) -> String {
+    let t = template.trim();
+    let t = if t.is_empty() { DEFAULT_COMMIT_TEMPLATE } else { t };
+    t.replace("{date}", date).replace("{host}", host)
+}
+
+/// 电脑名：Windows 取环境变量 COMPUTERNAME，取不到用"未知电脑"
+pub fn computer_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| UNKNOWN_HOST.to_string())
+}
+
+/// 用本地当前时间（YYYY-MM-DD HH:mm）和电脑名生成提交信息
+pub fn commit_message_now(template: &str) -> String {
+    let date = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    render_commit_message(template, &date, &computer_name())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_placeholders() {
+        assert_eq!(
+            render_commit_message(DEFAULT_COMMIT_TEMPLATE, "2026-10-07 14:30", "DESKTOP-1"),
+            "自动同步：2026-10-07 14:30 来自 DESKTOP-1"
+        );
+        assert_eq!(render_commit_message("{host}/{host} {date}", "D", "H"), "H/H D");
+        assert_eq!(render_commit_message("  同步笔记  ", "D", "H"), "同步笔记");
+    }
+
+    #[test]
+    fn empty_template_falls_back_to_default() {
+        let want = "自动同步：D 来自 H";
+        assert_eq!(render_commit_message("", "D", "H"), want);
+        assert_eq!(render_commit_message(" \t\n ", "D", "H"), want);
+    }
+
+    #[test]
+    fn message_now_has_date_format() {
+        let msg = commit_message_now("{date}");
+        // YYYY-MM-DD HH:mm
+        assert_eq!(msg.len(), 16, "{msg}");
+        assert_eq!(&msg[4..5], "-");
+        assert_eq!(&msg[10..11], " ");
+        assert_eq!(&msg[13..14], ":");
+        assert!(!computer_name().is_empty());
+    }
+}

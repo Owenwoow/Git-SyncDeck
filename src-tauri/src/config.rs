@@ -19,6 +19,8 @@ pub struct AppConfig {
 pub struct StoredSettings {
     pub default_code_dir: Option<String>,
     pub theme: Option<String>,
+    /// 自动提交的提交信息模板；None 表示用默认模板
+    pub commit_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,9 @@ pub struct StoredProject {
     /// 一键同步时的异常原因，直到下次同步成功（或刷新检测到已同步）才清除
     #[serde(default)]
     pub issue: Option<String>,
+    /// 一键同步时自动提交并推送（默认关；旧配置里没有这个字段时读出来为 false）
+    #[serde(default)]
+    pub auto_commit: bool,
 }
 
 pub struct ConfigStore {
@@ -73,5 +78,36 @@ impl ConfigStore {
         std::fs::write(&tmp, json).map_err(|e| format!("无法写入配置文件：{e}"))?;
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("无法保存配置文件：{e}"))?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_without_new_fields_still_loads() {
+        // 加入"自动提交"之前的配置文件：没有 autoCommit、commitTemplate
+        let old = r#"{
+          "version": 1,
+          "settings": { "defaultCodeDir": "D:\\code", "theme": "dark" },
+          "projects": [
+            { "id": "p-1", "path": "D:\\code\\blog", "lastSyncAt": null, "issue": "有改动" }
+          ]
+        }"#;
+        let c: AppConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(c.settings.theme.as_deref(), Some("dark"));
+        assert!(c.settings.commit_template.is_none());
+        assert_eq!(c.projects.len(), 1);
+        assert!(!c.projects[0].auto_commit);
+        assert_eq!(c.projects[0].issue.as_deref(), Some("有改动"));
+
+        // 写回去再读，新字段能往返
+        let mut c = c;
+        c.projects[0].auto_commit = true;
+        c.settings.commit_template = Some("同步 {date}".into());
+        let back: AppConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(back.projects[0].auto_commit);
+        assert_eq!(back.settings.commit_template.as_deref(), Some("同步 {date}"));
     }
 }

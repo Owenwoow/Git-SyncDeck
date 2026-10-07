@@ -37,6 +37,7 @@ pub fn run() {
             commands::refresh_status,
             commands::add_projects,
             commands::remove_project,
+            commands::set_auto_commit,
             commands::scan_directory,
             commands::sync_all,
             commands::commit_and_push,

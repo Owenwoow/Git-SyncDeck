@@ -31,6 +31,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(20 * HOUR + 14),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-python-crawler",
@@ -51,6 +52,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(3 * DAY + 2 * HOUR),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-tauri-playground",
@@ -66,6 +68,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(26 * HOUR),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-ps-scripts",
@@ -81,6 +84,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: null,
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-home-dashboard",
@@ -96,6 +100,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(6 * DAY + 5 * HOUR),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-dotfiles",
@@ -111,6 +116,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(2 * DAY + 3 * HOUR),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-ctf-toolkit",
@@ -128,6 +134,7 @@ export const initialProjects: Project[] = [
     // 演示"检查失败"：fetch 失败时保留上一次的状态，并显示原因
     checkError:
       "fatal: unable to access 'https://github.com/Owenwoow/ctf-toolkit.git/': Could not resolve host: github.com",
+    autoCommit: false,
   },
   {
     id: "p-vulnhub-writeups",
@@ -143,6 +150,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(3 * HOUR + 8),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-resume",
@@ -158,6 +166,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(9 * DAY),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-bambu-mcp",
@@ -173,6 +182,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(12),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-leetcode-solutions",
@@ -188,6 +198,7 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(35),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-pentest-notes",
@@ -203,5 +214,6 @@ export const initialProjects: Project[] = [
     lastSyncAt: minutesAgo(3),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
 ];
