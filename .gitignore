@@ -25,3 +25,16 @@ dist-ssr
 
 # Claude Code 本地设置（个人偏好，不提交）
 .claude/settings.local.json
+
+# 协作规范必需（repo-init 补齐）
+.env
+.env.*
+!.env.example
+!.env.mock
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.db
+.claude/worktrees/
+CLAUDE.local.md
