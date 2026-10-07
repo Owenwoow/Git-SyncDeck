@@ -11,7 +11,7 @@ import type {
   SyncResult,
 } from "@/types";
 import { buildDiagnosticText } from "@/lib/diagnostic";
-import { DEFAULT_COMMIT_TEMPLATE, describeIssue, isAbnormal, sortProjects } from "@/lib/status";
+import { DEFAULT_COMMIT_TEMPLATE, describeIssue, isAbnormal, sortProjects, willAutoCommit } from "@/lib/status";
 import { formatDateTime } from "@/lib/time";
 import { clone, db, delay, jitter } from "./db";
 import { defaultSettings, pickableDirs } from "./repos";
@@ -98,12 +98,25 @@ export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promi
     onProgress({ type: "start", projectId: original.id, index, total });
 
     const abnormal = isAbnormal(original.status);
-    const needsWork = original.status === "ahead" || original.status === "behind";
+    // 打开了自动提交的"有未提交改动"项目：演示自动提交并推送
+    const autoCommit = willAutoCommit(original);
+    const needsWork = original.status === "ahead" || original.status === "behind" || autoCommit;
     await delay(needsWork ? jitter(800, 1200) : jitter(350, 600));
 
     let result: SyncItemResult;
     let updated: Project;
-    if (abnormal) {
+    if (autoCommit) {
+      updated = db.updateRepo(original.id, {
+        status: "synced",
+        changes: [],
+        ahead: 0,
+        behind: 0,
+        lastSyncAt: new Date().toISOString(),
+        issue: null,
+        checkError: null,
+      });
+      result = { projectId: original.id, outcome: "committed", commits: original.ahead + 1, reason: null };
+    } else if (abnormal) {
       const reason = describeIssue(original);
       updated = db.updateRepo(original.id, { status: original.status, issue: reason });
       result = { projectId: original.id, outcome: "failed", commits: 0, reason };

@@ -50,6 +50,8 @@ interface ProjectsContextValue {
   /** 联网刷新所有项目的状态，返回刷新后的列表 */
   refresh: () => Promise<Project[]>;
   commitAndPush: (id: string, message: string) => Promise<Project>;
+  /** 打开 / 关闭"一键同步时自动提交" */
+  setAutoCommit: (id: string, enabled: boolean) => Promise<Project>;
   sync: SyncState;
   startSync: () => Promise<void>;
   closeSync: () => void;
@@ -176,6 +178,15 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     [replaceProject, reload],
   );
 
+  const setAutoCommit = useCallback(async (id: string, enabled: boolean) => {
+    const updated = await api.setAutoCommit(id, enabled);
+    // 一键同步进行中时保留"同步中"的显示，结束时会被最新结果覆盖
+    setProjects((list) =>
+      list.map((p) => (p.id === id ? { ...updated, status: p.status === "syncing" ? p.status : updated.status } : p)),
+    );
+    return updated;
+  }, []);
+
   const value = useMemo(
     () => ({
       projects,
@@ -184,12 +195,13 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       reload,
       refresh,
       commitAndPush,
+      setAutoCommit,
       sync,
       startSync,
       closeSync,
       skipInSync,
     }),
-    [projects, loading, refreshing, reload, refresh, commitAndPush, sync, startSync, closeSync, skipInSync],
+    [projects, loading, refreshing, reload, refresh, commitAndPush, setAutoCommit, sync, startSync, closeSync, skipInSync],
   );
 
   return <ProjectsContext.Provider value={value}>{children}</ProjectsContext.Provider>;

@@ -1,9 +1,10 @@
-import { useState } from "react";
-import { Check, FolderSearch, Loader2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Check, FolderSearch, Loader2, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { DEFAULT_COMMIT_TEMPLATE, renderCommitMessage } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/state/settings";
 import type { Theme } from "@/types";
@@ -48,6 +49,11 @@ export function SettingsPage() {
       </section>
 
       <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">自动提交</h2>
+        <CommitTemplateCard />
+      </section>
+
+      <section className="space-y-3">
         <h2 className="text-sm font-medium text-muted-foreground">外观</h2>
         <div className="rounded-lg border bg-card p-4">
           <div className="text-sm font-medium">主题</div>
@@ -67,6 +73,79 @@ export function SettingsPage() {
           </div>
         </div>
       </section>
+    </div>
+  );
+}
+
+/** 预览里电脑名的占位文字（实际提交时由后端取这台电脑的名字） */
+const HOST_PREVIEW = "本机电脑名";
+
+/** 自动提交的提交信息模板：失焦或回车保存，空值恢复默认 */
+function CommitTemplateCard() {
+  const { settings, updateSettings } = useSettings();
+  const saved = settings?.commitTemplate ?? DEFAULT_COMMIT_TEMPLATE;
+  const [draft, setDraft] = useState(saved);
+  useEffect(() => setDraft(saved), [saved]);
+
+  async function save(value: string) {
+    const next = value.trim();
+    if (next === saved) {
+      setDraft(saved);
+      return;
+    }
+    try {
+      await updateSettings({ commitTemplate: next });
+      toast.success(next && next !== DEFAULT_COMMIT_TEMPLATE ? "提交信息模板已保存" : "已恢复默认模板");
+    } catch (e) {
+      setDraft(saved);
+      toast.error("保存失败", { description: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="text-sm font-medium">提交信息模板</div>
+      <p className="mt-0.5 text-xs text-muted-foreground">
+        在项目详情里打开"一键同步时自动提交"的项目，一键同步时会用这个格式提交所有改动并推送。
+      </p>
+      <div className="mt-3 flex gap-2">
+        <Input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => save(draft)}
+          onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+          placeholder={DEFAULT_COMMIT_TEMPLATE}
+          disabled={!settings}
+          className="font-mono"
+          aria-label="提交信息模板"
+        />
+        <Button
+          variant="outline"
+          // 不让输入框先失焦保存一次草稿
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => save(DEFAULT_COMMIT_TEMPLATE)}
+          disabled={!settings || (saved === DEFAULT_COMMIT_TEMPLATE && draft === saved)}
+        >
+          <RotateCcw />
+          恢复默认
+        </Button>
+      </div>
+      <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
+        <li>
+          <code className="rounded bg-muted px-1 py-px font-mono text-foreground/80">{"{date}"}</code>{" "}
+          同步时的本地时间，如 2026-10-07 14:30
+        </li>
+        <li>
+          <code className="rounded bg-muted px-1 py-px font-mono text-foreground/80">{"{host}"}</code>{" "}
+          这台电脑的名字（预览里用"{HOST_PREVIEW}"代替）
+        </li>
+      </ul>
+      <div className="mt-3 rounded-md bg-muted/50 px-3 py-2 text-xs">
+        <span className="text-muted-foreground">预览：</span>
+        <span className="font-mono break-all select-text">
+          {renderCommitMessage(draft, new Date(), HOST_PREVIEW)}
+        </span>
+      </div>
     </div>
   );
 }

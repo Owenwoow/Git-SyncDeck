@@ -117,6 +117,11 @@ export function isAbnormal(status: SyncStatus): boolean {
   return STATUS_META[status].abnormal;
 }
 
+/** 一键同步时会自动提交并推送：有未提交改动、打开了自动提交、有上游、本地和云端没有分叉 */
+export function willAutoCommit(p: Project): boolean {
+  return p.status === "dirty" && p.autoCommit && !!p.upstream && !(p.ahead > 0 && p.behind > 0);
+}
+
 /** 需要处理的排在前面；同权重按名称 */
 export function sortProjects(list: Project[]): Project[] {
   return [...list].sort(
@@ -171,6 +176,10 @@ export function describeStatus(p: Project): string {
     case "behind":
       return `GitHub 上有 ${p.behind} 个新提交还没拉到本地。一键同步会自动拉取。`;
     case "dirty":
+      if (willAutoCommit(p))
+        return `工作区有 ${p.changes.length} 个文件改动还没提交。已打开自动提交，一键同步会自动提交并推送${p.behind ? "（先拉取云端的新提交）" : ""}。`;
+      if (p.autoCommit && p.ahead > 0 && p.behind > 0)
+        return `工作区有 ${p.changes.length} 个文件改动还没提交，而且本地和云端各有新提交。即使打开了自动提交，一键同步也不会处理，需要先合并。`;
       return `工作区有 ${p.changes.length} 个文件改动还没提交。一键同步不会处理，可以在下方直接提交并推送。`;
     case "diverged":
       return `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。一键同步不会处理，需要先合并。`;

@@ -1,4 +1,4 @@
-import { STATUS_META } from "@/lib/status";
+import { STATUS_META, willAutoCommit } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import type { Project } from "@/types";
 
@@ -6,8 +6,9 @@ import type { Project } from "@/types";
 export function OverviewStats({ projects }: { projects: Project[] }) {
   const total = projects.length;
   const synced = projects.filter((p) => p.status === "synced").length;
-  const autoSync = projects.filter((p) => STATUS_META[p.status].autoSync).length;
-  const manual = projects.filter((p) => STATUS_META[p.status].abnormal).length;
+  // 打开了自动提交的"有未提交改动"项目也算可自动同步
+  const autoSync = projects.filter((p) => STATUS_META[p.status].autoSync || willAutoCommit(p)).length;
+  const manual = projects.filter((p) => STATUS_META[p.status].abnormal && !willAutoCommit(p)).length;
   const pending = total - synced;
 
   return (
