@@ -67,8 +67,12 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 更新包签名：私钥与口令在仓库 Settings → Secrets 里配置
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
+          includeUpdaterJson: true
           releaseName: Git SyncDeck v__VERSION__
           releaseDraft: false
           prerelease: false
@@ -82,3 +86,6 @@ jobs:
             **使用前**
             - 需要先安装 [Git for Windows](https://git-scm.com/download/win)，并且 GitHub 登录已保存在凭据管理器里（在终端里 `git push` 不用输密码即可）。
             - 安装包未签名，Windows 提示"已保护你的电脑"时，点"更多信息"→"仍要运行"。
+
+            **更新**
+            - 0.2.0 起支持应用内更新：在"设置 → 关于"里检查更新，或等待启动时的提示。

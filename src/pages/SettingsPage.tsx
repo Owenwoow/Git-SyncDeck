@@ -1,15 +1,16 @@
-import { useState } from "react";
-import { Check, FolderSearch, Loader2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Check, CircleAlert, Download, FolderSearch, Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/state/settings";
-import type { Theme } from "@/types";
+import type { Theme, UpdateInfo, UpdateProgress } from "@/types";
 
-/** 设置：默认代码目录、浅色/深色主题 */
-export function SettingsPage() {
+/** 设置：默认代码目录、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
+export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateInfo | null }) {
   const { settings, updateSettings } = useSettings();
   const [picking, setPicking] = useState(false);
 
@@ -67,6 +68,8 @@ export function SettingsPage() {
           </div>
         </div>
       </section>
+
+      <AboutSection pendingUpdate={pendingUpdate} />
     </div>
   );
 }
@@ -121,5 +124,138 @@ function ThemeCard({
         {active && <Check className="size-4" />}
       </div>
     </button>
+  );
+}
+
+
+// ---------------- 关于与应用更新 ----------------
+
+type UpdatePhase = "idle" | "checking" | "latest" | "available" | "installing" | "error";
+
+function formatBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(n / 1024))} KB`;
+}
+
+function AboutSection({ pendingUpdate }: { pendingUpdate: UpdateInfo | null }) {
+  const [version, setVersion] = useState<string | null>(null);
+  const [phase, setPhase] = useState<UpdatePhase>(pendingUpdate ? "available" : "idle");
+  const [update, setUpdate] = useState<UpdateInfo | null>(pendingUpdate);
+  const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<UpdateProgress | null>(null);
+
+  useEffect(() => {
+    api.getAppVersion().then(setVersion, () => setVersion(null));
+  }, []);
+
+  // 启动时的静默检查可能在打开设置页之后才完成
+  useEffect(() => {
+    if (pendingUpdate) {
+      setUpdate(pendingUpdate);
+      setPhase((p) => (p === "idle" || p === "latest" ? "available" : p));
+    }
+  }, [pendingUpdate]);
+
+  async function check() {
+    setPhase("checking");
+    setError(null);
+    try {
+      const info = await api.checkForUpdate();
+      setUpdate(info);
+      setPhase(info ? "available" : "latest");
+    } catch (e) {
+      setUpdate(null);
+      setError(e instanceof Error ? e.message : String(e));
+      setPhase("error");
+    }
+  }
+
+  async function install() {
+    setPhase("installing");
+    setError(null);
+    setProgress(null);
+    try {
+      await api.installUpdate(setProgress);
+      // 真实环境下这里已经重启；演示模式不会真的更新，回到"有新版本"
+      setPhase("available");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setPhase("error");
+    }
+  }
+
+  const percent = progress?.total ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100)) : null;
+  const busy = phase === "checking" || phase === "installing";
+  const showUpdate = update !== null && (phase === "available" || phase === "installing" || phase === "error");
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-medium text-muted-foreground">关于</h2>
+      <div className="rounded-lg border bg-card p-4">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <div className="text-sm font-medium">Git SyncDeck</div>
+            <p className="mt-0.5 text-xs text-muted-foreground">当前版本 {version ? `v${version}` : "未知"}</p>
+          </div>
+          <Button variant="outline" onClick={check} disabled={busy}>
+            {phase === "checking" ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            {phase === "checking" ? "检查中…" : "检查更新"}
+          </Button>
+        </div>
+
+        {phase === "latest" && (
+          <p className="mt-3 flex items-center gap-1.5 text-sm text-muted-foreground">
+            <Check className="size-4" />
+            已是最新版本
+          </p>
+        )}
+
+        {phase === "error" && error && (
+          <p className="mt-3 flex items-start gap-1.5 text-sm text-destructive">
+            <CircleAlert className="mt-0.5 size-4 shrink-0" />
+            <span className="min-w-0 break-words">检查或安装更新失败：{error}</span>
+          </p>
+        )}
+
+        {showUpdate && update && (
+          <div className="mt-4 space-y-3 border-t pt-4">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <div className="text-sm font-medium">发现新版本 v{update.version}</div>
+                {update.date && (
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    发布于 {new Date(update.date).toLocaleDateString("zh-CN")}
+                  </p>
+                )}
+              </div>
+              <Button onClick={install} disabled={busy}>
+                {phase === "installing" ? <Loader2 className="animate-spin" /> : <Download />}
+                {phase === "installing" ? "正在下载…" : "下载并安装"}
+              </Button>
+            </div>
+
+            {update.notes && (
+              <div>
+                <div className="text-xs font-medium text-muted-foreground">更新说明</div>
+                <p className="mt-1 max-h-40 overflow-y-auto text-sm whitespace-pre-wrap select-text">{update.notes}</p>
+              </div>
+            )}
+
+            {phase === "installing" && (
+              <div className="space-y-1.5">
+                <Progress value={percent ?? 0} aria-label="下载进度" />
+                <p className="text-xs text-muted-foreground">
+                  {progress
+                    ? progress.total
+                      ? `已下载 ${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}（${percent}%），完成后会自动重启`
+                      : `已下载 ${formatBytes(progress.downloaded)}，完成后会自动重启`
+                    : "正在连接…"}
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
