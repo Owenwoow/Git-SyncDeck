@@ -1,6 +1,7 @@
 // 扫描目录时会额外发现、但还没有加入监控的假仓库。
 // 加入监控后，它们会以这里的数据出现在主页。
 import type { Project } from "@/types";
+import { DEFAULT_COMMIT_TEMPLATE } from "@/lib/status";
 import { minutesAgo } from "./projects";
 
 const GH = "https://github.com/Owenwoow";
@@ -22,6 +23,7 @@ export const unmonitoredRepos: Project[] = [
     lastSyncAt: minutesAgo(64 * DAY),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-rust-learning",
@@ -37,6 +39,7 @@ export const unmonitoredRepos: Project[] = [
     lastSyncAt: minutesAgo(12 * DAY),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-temp-vite-demo",
@@ -52,6 +55,7 @@ export const unmonitoredRepos: Project[] = [
     lastSyncAt: null,
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-jquery-lazyload",
@@ -67,6 +71,7 @@ export const unmonitoredRepos: Project[] = [
     lastSyncAt: minutesAgo(400 * DAY),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   // ---- E:\work 下（"选择目录"切换到这里时能看到）----
   {
@@ -83,6 +88,7 @@ export const unmonitoredRepos: Project[] = [
     lastSyncAt: minutesAgo(4 * DAY),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
   {
     id: "p-report-generator",
@@ -98,6 +104,7 @@ export const unmonitoredRepos: Project[] = [
     lastSyncAt: minutesAgo(DAY + 90),
     issue: null,
     checkError: null,
+    autoCommit: false,
   },
 ];
 
@@ -106,4 +113,5 @@ export const pickableDirs = ["E:\\work", "D:\\code"];
 
 export const defaultSettings = {
   defaultCodeDir: "D:\\code",
+  commitTemplate: DEFAULT_COMMIT_TEMPLATE,
 };

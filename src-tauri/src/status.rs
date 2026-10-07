@@ -29,6 +29,8 @@ pub struct Inspection {
     pub ahead: u32,
     pub behind: u32,
     pub changes: Vec<FileChange>,
+    /// 处于冲突状态（未合并）的文件数
+    pub conflicts: u32,
     pub status: SyncStatus,
 }
 
@@ -56,6 +58,8 @@ pub struct Porcelain {
     pub upstream: Option<String>,
     pub ahead_behind: Option<(u32, u32)>,
     pub changes: Vec<FileChange>,
+    /// 未合并（冲突中）的条目数
+    pub conflicts: u32,
 }
 
 pub fn parse_porcelain_v2(out: &str) -> Porcelain {
@@ -105,6 +109,7 @@ pub fn parse_porcelain_v2(out: &str) -> Porcelain {
                 let f: Vec<&str> = r.splitn(11, ' ').collect();
                 if f.len() == 11 {
                     p.changes.push(change(f[10], ChangeKind::Modified, false, None));
+                    p.conflicts += 1;
                 }
             }
             b'?' => {
@@ -239,6 +244,7 @@ pub fn build_inspection(p: Porcelain, cfg: &RepoConfig) -> Inspection {
         ahead,
         behind,
         changes: p.changes,
+        conflicts: p.conflicts,
         status,
     }
 }
@@ -332,6 +338,17 @@ mod tests {
     }
 
     #[test]
+    fn counts_conflicts() {
+        let out = "# branch.head main\0u UU N... 100644 100644 100644 100644 aaa bbb ccc 冲突 文件.md\0\
+1 M. N... 100644 100644 100644 aaa bbb ok.txt\0";
+        let p = parse_porcelain_v2(out);
+        assert_eq!(p.conflicts, 1);
+        assert_eq!(p.changes.len(), 2);
+        assert_eq!(p.changes[0].path, "冲突 文件.md");
+        assert_eq!(parse_porcelain_v2("# branch.head main\0? a.txt\0").conflicts, 0);
+    }
+
+    #[test]
     fn detached_and_priority() {
         let p = parse_porcelain_v2("# branch.oid abc\0# branch.head (detached)\0");
         assert!(p.head.is_none());
@@ -354,7 +371,7 @@ mod tests {
         assert_eq!(c.remotes, vec![("origin".to_string(), "https://tok@github.com/o/r.git".to_string())]);
         assert_eq!(c.branch_remote.get("feature/x.y").map(String::as_str), Some("origin"));
         let ins = build_inspection(
-            Porcelain { head: Some("feature/x.y".into()), upstream: Some("origin/feature/x.y".into()), ahead_behind: Some((0, 0)), changes: vec![] },
+            Porcelain { head: Some("feature/x.y".into()), upstream: Some("origin/feature/x.y".into()), ahead_behind: Some((0, 0)), changes: vec![], conflicts: 0 },
             &c,
         );
         assert_eq!(ins.remote_url.as_deref(), Some("https://github.com/o/r.git"));

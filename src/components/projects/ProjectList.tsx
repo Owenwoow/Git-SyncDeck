@@ -1,4 +1,4 @@
-import { AlertTriangle, GitBranch } from "lucide-react";
+import { AlertTriangle, GitBranch, GitCommitHorizontal } from "lucide-react";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { repoShortName } from "@/lib/status";
@@ -67,6 +67,16 @@ function ProjectRow({
             <GitBranch className="size-3 shrink-0" />
             <span className="truncate">{p.branch}</span>
           </span>
+          {p.autoCommit && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex shrink-0 text-muted-foreground" aria-label="自动提交">
+                  <GitCommitHorizontal className="size-3.5" />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>自动提交</TooltipContent>
+            </Tooltip>
+          )}
         </div>
         <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground">{p.path}</div>
         {notice && (

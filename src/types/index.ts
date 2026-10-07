@@ -46,6 +46,8 @@ export interface Project {
   issue: string | null;
   /** 检查失败（如断网时 fetch 失败）的原因；此时 status 保留上一次的结果 */
   checkError: string | null;
+  /** 一键同步时自动提交并推送（每个项目单独开关，默认关） */
+  autoCommit: boolean;
 }
 
 /** 扫描目录时发现的 Git 仓库 */
@@ -65,12 +67,13 @@ export type SyncOutcome =
   | "pushed" // 已推送
   | "pulled" // 已拉取
   | "up-to-date" // 已是最新
+  | "committed" // 已自动提交并推送（项目打开了"自动提交"）
   | "failed"; // 异常，需要手动处理
 
 export interface SyncItemResult {
   projectId: string;
   outcome: SyncOutcome;
-  /** 推送或拉取的提交数 */
+  /** 推送或拉取的提交数（committed 时为推送的提交数，含自动提交的那一个） */
   commits: number;
   /** 异常原因，仅 outcome 为 failed 时有值 */
   reason: string | null;
@@ -108,6 +111,8 @@ export interface Settings {
   /** 默认代码目录，添加项目页默认扫描这里 */
   defaultCodeDir: string;
   theme: Theme;
+  /** 自动提交的提交信息模板，占位符 {date}、{host}；保存空值会恢复默认模板 */
+  commitTemplate: string;
 }
 
 /** 应用内更新：发现的新版本 */

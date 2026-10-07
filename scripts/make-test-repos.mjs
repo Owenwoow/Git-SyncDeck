@@ -164,6 +164,16 @@ expected["synced"] = "synced";
   expected["dirty-behind"] = "dirty";
 }
 
+// 9. 有改动且落后，并且本地改动和云端新提交改的是同一个文件：
+//    用来验证自动提交时"先拉取"会被 git 拒绝，此时不提交、本地改动保持原样
+{
+  const { local, other } = setup("dirty-conflict");
+  commit(other, "README.md", "# dirty-conflict\n\n笔记本上改了这一行\n", "笔记本上改了 README");
+  git(other, "push", "--quiet", "origin", "main");
+  write(local, "README.md", "# dirty-conflict\n\n台式机上没提交的改动\n");
+  expected["dirty-conflict"] = "dirty";
+}
+
 fs.writeFileSync(path.join(root, "expected.json"), JSON.stringify(expected, null, 2));
 
 console.log(`测试仓库已创建：${reposDir}`);

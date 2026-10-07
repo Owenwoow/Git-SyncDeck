@@ -12,7 +12,10 @@ use crate::config::{AppConfig, ConfigStore, StoredProject};
 use crate::model::*;
 use crate::ops::{self, Checked, SyncOne};
 use crate::status::{inspect, Inspection};
-use crate::util::{folder_name, map_limited, normalize_path, now_iso, project_id, same_path, CONCURRENCY};
+use crate::util::{
+    commit_message_now, folder_name, map_limited, normalize_path, now_iso, project_id, same_path, CONCURRENCY,
+    DEFAULT_COMMIT_TEMPLATE,
+};
 use crate::{scan, system};
 
 pub struct AppState {
@@ -83,6 +86,7 @@ fn project_from(sp: &StoredProject, ins: &Inspection) -> Project {
         last_sync_at: sp.last_sync_at.clone(),
         issue: sp.issue.clone(),
         check_error: None,
+        auto_commit: sp.auto_commit,
     }
 }
 
@@ -102,9 +106,11 @@ fn with_error(prev: Option<Project>, sp: &StoredProject, error: String) -> Proje
         last_sync_at: None,
         issue: None,
         check_error: None,
+        auto_commit: false,
     });
     p.last_sync_at = sp.last_sync_at.clone();
     p.issue = sp.issue.clone();
+    p.auto_commit = sp.auto_commit;
     p.check_error = Some(error);
     p
 }
@@ -187,7 +193,13 @@ pub async fn add_projects(state: State<'_, Shared>, paths: Vec<String>) -> Resul
             if c.projects.iter().any(|p| same_path(&p.path, &path)) || !scan::is_repo(Path::new(&path)) {
                 continue;
             }
-            let sp = StoredProject { id: project_id(&path), path, last_sync_at: None, issue: None };
+            let sp = StoredProject {
+                id: project_id(&path),
+                path,
+                last_sync_at: None,
+                issue: None,
+                auto_commit: false,
+            };
             c.projects.push(sp.clone());
             added.push(sp);
         }
@@ -206,6 +218,22 @@ pub async fn remove_project(state: State<'_, Shared>, id: String) -> Result<(), 
     state.config.update(|c| c.projects.retain(|p| p.id != id))?;
     state.forget(&id);
     Ok(())
+}
+
+/// 打开 / 关闭某个项目的"一键同步时自动提交"，返回最新的项目（本地检查，不联网）
+#[tauri::command]
+pub async fn set_auto_commit(state: State<'_, Shared>, project_id: String, enabled: bool) -> Result<Project, String> {
+    let st = state.inner().clone();
+    let sp = st
+        .config
+        .update(|c| {
+            c.projects.iter_mut().find(|p| p.id == project_id).map(|p| {
+                p.auto_commit = enabled;
+                p.clone()
+            })
+        })?
+        .ok_or("项目不存在")?;
+    Ok(local_project(&st, &sp).await)
 }
 
 #[tauri::command]
@@ -263,6 +291,9 @@ pub async fn sync_all(
     let weight = |sp: &StoredProject| st.cached(&sp.id).map_or(6, |p| p.status.weight());
     stored.sort_by(|a, b| weight(a).cmp(&weight(b)).then_with(|| folder_name(&a.path).cmp(&folder_name(&b.path))));
 
+    // 自动提交的提交信息：本轮所有项目共用同一个时间
+    let commit_message = Arc::new(commit_message_now(&st.config.read(commit_template_of)));
+
     let total = stored.len();
     let started = Arc::new(AtomicUsize::new(0));
     let finished = Arc::new(AtomicUsize::new(0));
@@ -272,10 +303,12 @@ pub async fn sync_all(
         let on_event = on_event.clone();
         let started = started.clone();
         let finished = finished.clone();
+        let commit_message = commit_message.clone();
         async move {
             let index = started.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Start { project_id: sp.id.clone(), index, total });
-            let one = ops::sync_one(Path::new(&sp.path)).await;
+            let auto_commit = sp.auto_commit.then_some(commit_message.as_str());
+            let one = ops::sync_one(Path::new(&sp.path), auto_commit).await;
             let (project, result) = record_sync(&st, &sp, one);
             let index = finished.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Done { result: result.clone(), project, index, total });
@@ -294,7 +327,7 @@ pub async fn sync_all(
     })
 }
 
-/// 记录单个项目的同步结果：成功 → 更新上次同步时间、清除异常；失败 → 保存异常原因
+/// 记录单个项目的同步结果：成功（含自动提交并推送）→ 更新上次同步时间、清除异常；失败 → 保存异常原因
 fn record_sync(st: &AppState, sp: &StoredProject, one: SyncOne) -> (Project, SyncItemResult) {
     let success = one.outcome != SyncOutcome::Failed;
     let reason = one.reason.clone();
@@ -386,7 +419,19 @@ fn settings_of(c: &AppConfig) -> Settings {
             .clone()
             .unwrap_or_else(|| std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into())),
         theme: c.settings.theme.clone(),
+        commit_template: commit_template_of(c),
     }
+}
+
+/// 提交信息模板：没设置过或为空时用默认模板
+fn commit_template_of(c: &AppConfig) -> String {
+    c.settings
+        .commit_template
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(DEFAULT_COMMIT_TEMPLATE)
+        .to_string()
 }
 
 #[tauri::command]
@@ -407,6 +452,12 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
         }
         if let Some(t) = &patch.theme {
             c.settings.theme = Some(t.clone());
+        }
+        if let Some(t) = &patch.commit_template {
+            // 空模板或等于默认模板时不单独保存，读取时回落为默认模板
+            let t = t.trim();
+            c.settings.commit_template =
+                if t.is_empty() || t == DEFAULT_COMMIT_TEMPLATE { None } else { Some(t.to_string()) };
         }
         settings_of(c)
     })

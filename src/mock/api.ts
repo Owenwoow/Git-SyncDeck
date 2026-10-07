@@ -14,7 +14,7 @@ import type {
   UpdateProgress,
 } from "@/types";
 import { buildDiagnosticText } from "@/lib/diagnostic";
-import { describeIssue, isAbnormal, sortProjects } from "@/lib/status";
+import { DEFAULT_COMMIT_TEMPLATE, describeIssue, isAbnormal, sortProjects, willAutoCommit } from "@/lib/status";
 import { formatDateTime } from "@/lib/time";
 import { clone, db, delay, jitter } from "./db";
 import { defaultSettings, pickableDirs } from "./repos";
@@ -51,6 +51,12 @@ export async function addProjects(paths: string[]): Promise<Project[]> {
 export async function removeProject(id: string): Promise<void> {
   await delay(200);
   db.unmonitor(id);
+}
+
+export async function setAutoCommit(projectId: string, enabled: boolean): Promise<Project> {
+  await delay(150);
+  if (!db.getRepo(projectId)) throw new Error("项目不存在");
+  return clone(db.updateRepo(projectId, { autoCommit: enabled }));
 }
 
 // ---------------- 目录 ----------------
@@ -95,12 +101,25 @@ export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promi
     onProgress({ type: "start", projectId: original.id, index, total });
 
     const abnormal = isAbnormal(original.status);
-    const needsWork = original.status === "ahead" || original.status === "behind";
+    // 打开了自动提交的"有未提交改动"项目：演示自动提交并推送
+    const autoCommit = willAutoCommit(original);
+    const needsWork = original.status === "ahead" || original.status === "behind" || autoCommit;
     await delay(needsWork ? jitter(800, 1200) : jitter(350, 600));
 
     let result: SyncItemResult;
     let updated: Project;
-    if (abnormal) {
+    if (autoCommit) {
+      updated = db.updateRepo(original.id, {
+        status: "synced",
+        changes: [],
+        ahead: 0,
+        behind: 0,
+        lastSyncAt: new Date().toISOString(),
+        issue: null,
+        checkError: null,
+      });
+      result = { projectId: original.id, outcome: "committed", commits: original.ahead + 1, reason: null };
+    } else if (abnormal) {
       const reason = describeIssue(original);
       updated = db.updateRepo(original.id, { status: original.status, issue: reason });
       result = { projectId: original.id, outcome: "failed", commits: 0, reason };
@@ -200,6 +219,8 @@ export async function getSettings(): Promise<Settings> {
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
   await delay(100);
   const next = { ...readSettings(), ...patch };
+  // 和真实实现一致：模板为空时恢复默认
+  next.commitTemplate = next.commitTemplate.trim() || DEFAULT_COMMIT_TEMPLATE;
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
   } catch {

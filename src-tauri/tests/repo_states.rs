@@ -48,6 +48,7 @@ async fn states_sync_and_commit() {
         ("no-upstream", SyncStatus::NoRemote),
         ("detached", SyncStatus::NoRemote),
         ("dirty-behind", SyncStatus::Dirty),
+        ("dirty-conflict", SyncStatus::Dirty),
     ];
     for (name, want) in expected {
         match ops::check(&repo(name)).await {
@@ -84,7 +85,8 @@ async fn states_sync_and_commit() {
 
     // ---------------- 2. 一键同步 ----------------
     println!("\n== 一键同步 ==");
-    let untouchable = ["dirty", "diverged", "no-remote", "no-upstream", "detached", "fetch-fail", "dirty-behind"];
+    // 这里都没打开自动提交，有未提交改动的项目一律记为异常
+    let untouchable =["dirty", "diverged", "no-remote", "no-upstream", "detached", "fetch-fail", "dirty-behind", "dirty-conflict"];
     let before: Vec<(&str, String, String)> = untouchable
         .iter()
         .map(|n| (*n, head(&repo(n)), git(&repo(n), &["status", "--porcelain"])))
@@ -101,9 +103,10 @@ async fn states_sync_and_commit() {
         ("detached", SyncOutcome::Failed),
         ("fetch-fail", SyncOutcome::Failed),
         ("dirty-behind", SyncOutcome::Failed),
+        ("dirty-conflict", SyncOutcome::Failed),
     ];
     for (name, want) in cases {
-        let r = ops::sync_one(&repo(name)).await;
+        let r = ops::sync_one(&repo(name), None).await;
         let after = r.inspection.as_ref().map_or("—", |i| i.status.label());
         println!(
             "  {name:<13} → {:<10} {}{}",
@@ -125,7 +128,7 @@ async fn states_sync_and_commit() {
         assert_eq!(&head(&repo(name)), h, "{name} 的 HEAD 被改动了");
         assert_eq!(&git(&repo(name), &["status", "--porcelain"]), st, "{name} 的工作区被改动了");
     }
-    println!("  ✓ 7 个异常项目的 HEAD 和工作区均未改动");
+    println!("  ✓ 8 个异常项目的 HEAD 和工作区均未改动");
 
     // ---------------- 3. 提交并推送 ----------------
     println!("\n== 提交并推送 ==");

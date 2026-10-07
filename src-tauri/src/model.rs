@@ -82,6 +82,8 @@ pub struct Project {
     pub issue: Option<String>,
     /// 检查失败（如断网时 fetch 失败）的原因；此时 status 保留上一次的结果
     pub check_error: Option<String>,
+    /// 一键同步时是否自动提交并推送
+    pub auto_commit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +103,8 @@ pub enum SyncOutcome {
     Pushed,
     Pulled,
     UpToDate,
+    /// 已自动提交并推送
+    Committed,
     Failed,
 }
 
@@ -139,6 +143,8 @@ pub struct SyncResult {
 pub struct Settings {
     pub default_code_dir: String,
     pub theme: Option<String>,
+    /// 自动提交的提交信息模板；没设置过时为默认模板
+    pub commit_template: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -146,6 +152,8 @@ pub struct Settings {
 pub struct SettingsPatch {
     pub default_code_dir: Option<String>,
     pub theme: Option<String>,
+    /// 去掉空白后为空（或等于默认模板）时恢复默认
+    pub commit_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

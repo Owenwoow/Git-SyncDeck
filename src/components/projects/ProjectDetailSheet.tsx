@@ -1,4 +1,8 @@
+import { useState } from "react";
 import { AlertTriangle, ArrowDown, ArrowUp, Info } from "lucide-react";
+import { toast } from "sonner";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { StatusBadge } from "@/components/StatusBadge";
 import { FileChangeList } from "@/components/projects/FileChangeList";
@@ -6,6 +10,7 @@ import { ProjectActions } from "@/components/projects/ProjectActions";
 import { STATUS_META, describeStatus } from "@/lib/status";
 import { formatDateTime, formatRelative } from "@/lib/time";
 import { cn } from "@/lib/utils";
+import { useProjects } from "@/state/projects";
 import type { Project } from "@/types";
 
 /** 点击主页某一行后，从右侧滑出的项目详情 */
@@ -93,6 +98,8 @@ function DetailBody({ project: p }: { project: Project }) {
           </dd>
         </dl>
 
+        <AutoCommitToggle project={p} />
+
         {/* 未提交的文件 */}
         <section>
           <h3 className="mb-2 text-sm font-medium">
@@ -117,6 +124,48 @@ function DetailBody({ project: p }: { project: Project }) {
         </div>
       )}
     </>
+  );
+}
+
+/** "一键同步时自动提交"开关 */
+function AutoCommitToggle({ project: p }: { project: Project }) {
+  const { setAutoCommit } = useProjects();
+  const [saving, setSaving] = useState(false);
+  const id = `auto-commit-${p.id}`;
+
+  async function toggle(enabled: boolean) {
+    setSaving(true);
+    try {
+      await setAutoCommit(p.id, enabled);
+    } catch (e) {
+      toast.error("保存失败", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="flex gap-2.5 rounded-lg border px-3 py-2.5">
+      <Checkbox
+        id={id}
+        checked={p.autoCommit}
+        disabled={saving}
+        onCheckedChange={(c) => toggle(c === true)}
+        className="mt-px"
+      />
+      <div className="min-w-0 space-y-1">
+        <Label htmlFor={id} className="cursor-pointer">
+          一键同步时自动提交
+        </Label>
+        <p className="text-xs text-muted-foreground">一键同步时会把所有改动按固定格式提交并推送</p>
+        {!p.upstream && (
+          <p className="flex items-center gap-1 text-xs text-status-dirty">
+            <AlertTriangle className="size-3.5 shrink-0" />
+            没有上游分支，不会生效
+          </p>
+        )}
+      </div>
+    </section>
   );
 }
 

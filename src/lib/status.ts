@@ -11,6 +11,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { FileChangeKind, Project, SyncStatus } from "@/types";
+import { formatDateTime } from "@/lib/time";
 
 export interface StatusMeta {
   label: string;
@@ -116,6 +117,11 @@ export function isAbnormal(status: SyncStatus): boolean {
   return STATUS_META[status].abnormal;
 }
 
+/** 一键同步时会自动提交并推送：有未提交改动、打开了自动提交、有上游、本地和云端没有分叉 */
+export function willAutoCommit(p: Project): boolean {
+  return p.status === "dirty" && p.autoCommit && !!p.upstream && !(p.ahead > 0 && p.behind > 0);
+}
+
 /** 需要处理的排在前面；同权重按名称 */
 export function sortProjects(list: Project[]): Project[] {
   return [...list].sort(
@@ -170,6 +176,10 @@ export function describeStatus(p: Project): string {
     case "behind":
       return `GitHub 上有 ${p.behind} 个新提交还没拉到本地。一键同步会自动拉取。`;
     case "dirty":
+      if (willAutoCommit(p))
+        return `工作区有 ${p.changes.length} 个文件改动还没提交。已打开自动提交，一键同步会自动提交并推送${p.behind ? "（先拉取云端的新提交）" : ""}。`;
+      if (p.autoCommit && p.ahead > 0 && p.behind > 0)
+        return `工作区有 ${p.changes.length} 个文件改动还没提交，而且本地和云端各有新提交。即使打开了自动提交，一键同步也不会处理，需要先合并。`;
       return `工作区有 ${p.changes.length} 个文件改动还没提交。一键同步不会处理，可以在下方直接提交并推送。`;
     case "diverged":
       return `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。一键同步不会处理，需要先合并。`;
@@ -207,6 +217,18 @@ function noRemoteReason(p: Project): string {
   if (p.branch === DETACHED_BRANCH) return "处于 detached HEAD 状态（不在任何分支上），无法同步";
   if (p.upstream) return `上游分支 ${p.upstream} 在云端已不存在`;
   return `分支 ${p.branch} 没有设置上游分支，不知道该推到哪里`;
+}
+
+// ---------------- 自动提交 ----------------
+
+/** 默认的自动提交信息模板（与 src-tauri/src/util.rs 的 DEFAULT_COMMIT_TEMPLATE 一致） */
+export const DEFAULT_COMMIT_TEMPLATE = "自动同步：{date} 来自 {host}";
+
+/** 按模板生成提交信息（与 src-tauri/src/util.rs 的 render_commit_message 一致）：
+ *  {date} → 本地时间 YYYY-MM-DD HH:mm，{host} → 电脑名；模板为空时用默认模板 */
+export function renderCommitMessage(template: string, date: Date, host: string): string {
+  const t = template.trim() || DEFAULT_COMMIT_TEMPLATE;
+  return t.split("{date}").join(formatDateTime(date)).split("{host}").join(host);
 }
 
 /** 文件变更类型的显示 */
