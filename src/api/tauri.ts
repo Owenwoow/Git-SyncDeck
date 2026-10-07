@@ -47,6 +47,11 @@ export function removeProject(id: string): Promise<void> {
   return call("remove_project", { id });
 }
 
+/** 打开 / 关闭"一键同步时自动提交"，返回最新的项目 */
+export function setAutoCommit(projectId: string, enabled: boolean): Promise<Project> {
+  return call("set_auto_commit", { projectId, enabled });
+}
+
 // ---------------- 目录 ----------------
 
 export async function pickDirectory(defaultPath?: string): Promise<string | null> {

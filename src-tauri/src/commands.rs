@@ -220,6 +220,22 @@ pub async fn remove_project(state: State<'_, Shared>, id: String) -> Result<(), 
     Ok(())
 }
 
+/// 打开 / 关闭某个项目的"一键同步时自动提交"，返回最新的项目（本地检查，不联网）
+#[tauri::command]
+pub async fn set_auto_commit(state: State<'_, Shared>, project_id: String, enabled: bool) -> Result<Project, String> {
+    let st = state.inner().clone();
+    let sp = st
+        .config
+        .update(|c| {
+            c.projects.iter_mut().find(|p| p.id == project_id).map(|p| {
+                p.auto_commit = enabled;
+                p.clone()
+            })
+        })?
+        .ok_or("项目不存在")?;
+    Ok(local_project(&st, &sp).await)
+}
+
 #[tauri::command]
 pub async fn scan_directory(state: State<'_, Shared>, dir: String) -> Result<Vec<ScannedRepo>, String> {
     let root = PathBuf::from(normalize_path(&dir));

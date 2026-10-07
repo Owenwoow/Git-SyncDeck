@@ -50,6 +50,12 @@ export async function removeProject(id: string): Promise<void> {
   db.unmonitor(id);
 }
 
+export async function setAutoCommit(projectId: string, enabled: boolean): Promise<Project> {
+  await delay(150);
+  if (!db.getRepo(projectId)) throw new Error("项目不存在");
+  return clone(db.updateRepo(projectId, { autoCommit: enabled }));
+}
+
 // ---------------- 目录 ----------------
 
 /** 不弹窗，返回一个与 defaultPath 不同的假目录 */
