@@ -2,6 +2,10 @@
 
 在一个界面里统一管理多个本地 Git 项目与 GitHub 的同步状态。离开一台电脑前点一次"一键同步"把改动推上去，到另一台电脑再点一次拉下来。
 
+## 下载
+
+到 [Releases](https://github.com/Owenwoow/Git-SyncDeck/releases/latest) 下载以 `-setup.exe` 结尾的安装程序。使用前需要先安装 [Git for Windows](https://git-scm.com/download/win)。安装包没有签名，Windows 提示"已保护你的电脑"时，点"更多信息"→"仍要运行"。
+
 ## 功能
 
 - **主页**：所有监控项目的同步状态（7 种），需要处理的排在前面；按状态筛选、按名称搜索；点开看详情（领先/落后、未提交文件）。
@@ -38,6 +42,15 @@ npm install
 npm run tauri dev     # 桌面窗口，真实数据
 npm run tauri build   # 打包，安装包在 src-tauri\target\release\bundle\（nsis\*.exe、msi\*.msi）
 ```
+
+### 发布新版本
+
+GitHub Actions（`.github/workflows/release.yml`）会在推送 `v*` 标签时先跑测试，再在 Windows 上构建安装包，并发布到 Releases。
+
+1. 把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 里的版本号改成新版本，例如 `0.2.0`，然后提交。
+2. 打标签并推送：`git tag v0.2.0`，`git push origin main v0.2.0`。
+
+也可以在 GitHub 网页的 Actions 页面手动运行 "Release (Windows)"。
 
 ## 假数据模式（继续调界面用）
 

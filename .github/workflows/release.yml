@@ -1,0 +1,84 @@
+# 构建并发布 Windows 安装包
+# 触发方式：推送 v* 标签（如 v0.1.0），或在 GitHub 网页 Actions 页面手动运行
+name: Release (Windows)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: 测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 前端类型检查与构建
+        run: npm run build
+
+      - name: Rust 测试（只用临时目录里生成的测试仓库）
+        working-directory: src-tauri
+        run: cargo test
+
+  release:
+    name: 构建并发布
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 构建安装包并发布 Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Git SyncDeck v__VERSION__
+          releaseDraft: false
+          prerelease: false
+          releaseBody: |
+            Windows 桌面工具：在一个界面里统一管理多个本地 Git 项目与 GitHub 的同步状态。
+
+            **下载**
+            - `…_x64-setup.exe`：安装程序（推荐）
+            - `…_x64_en-US.msi`：MSI 安装包
+
+            **使用前**
+            - 需要先安装 [Git for Windows](https://git-scm.com/download/win)，并且 GitHub 登录已保存在凭据管理器里（在终端里 `git push` 不用输密码即可）。
+            - 安装包未签名，Windows 提示"已保护你的电脑"时，点"更多信息"→"仍要运行"。
