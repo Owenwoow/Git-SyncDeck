@@ -1,7 +1,16 @@
 import { useState } from "react";
-import { AlertTriangle, ArrowDown, ArrowUp, Info } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, EyeOff, Info } from "lucide-react";
 import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -115,6 +124,8 @@ function DetailBody({ project: p }: { project: Project }) {
             </div>
           )}
         </section>
+
+        <UnmonitorButton project={p} />
       </div>
 
       {meta.abnormal && (
@@ -123,6 +134,60 @@ function DetailBody({ project: p }: { project: Project }) {
           <ProjectActions project={p} />
         </div>
       )}
+    </>
+  );
+}
+
+/** 取消监控：只从清单里移除，不动任何文件（"添加项目"页里也能取消） */
+function UnmonitorButton({ project: p }: { project: Project }) {
+  const { removeProject, sync } = useProjects();
+  const [open, setOpen] = useState(false);
+  const [removing, setRemoving] = useState(false);
+
+  async function confirm() {
+    setRemoving(true);
+    try {
+      await removeProject(p.id);
+      setOpen(false);
+      toast.success(`已取消监控 ${p.name}`, { description: "文件没有任何改动，之后可以在\"添加项目\"里重新加回来" });
+    } catch (e) {
+      toast.error("取消监控失败", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="text-muted-foreground"
+        disabled={sync.phase === "running"}
+        title={sync.phase === "running" ? "一键同步进行中，结束后再取消监控" : undefined}
+        onClick={() => setOpen(true)}
+      >
+        <EyeOff />
+        取消监控
+      </Button>
+      <Dialog open={open} onOpenChange={(o) => !removing && setOpen(o)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>取消监控 {p.name}？</DialogTitle>
+            <DialogDescription>
+              只是从列表里移除，不会删除或改动这个文件夹里的任何文件。之后可以在"添加项目"里重新加回来。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" disabled={removing} onClick={() => setOpen(false)}>
+              取消
+            </Button>
+            <Button variant="destructive" disabled={removing} onClick={confirm}>
+              {removing ? "正在移除…" : "取消监控"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

@@ -37,6 +37,8 @@ pub enum GitError {
     NotInstalled,
     /// 工作目录不存在
     NoDirectory(String),
+    /// 目录还在，但已经不是 Git 仓库（根目录下没有 .git）
+    NotRepo(String),
     Timeout { command: String, secs: u64 },
     /// git 返回非 0 退出码；stderr 为原文（已去掉 URL 里的账号信息）
     Failed { command: String, code: Option<i32>, stderr: String },
@@ -53,6 +55,7 @@ impl GitError {
                 "未找到 git 命令，请先安装 Git for Windows：https://git-scm.com/download/win".to_string()
             }
             GitError::NoDirectory(dir) => format!("找不到目录：{dir}"),
+            GitError::NotRepo(dir) => format!("这个文件夹已经不是 Git 仓库（找不到 .git）：{dir}，可以在详情里取消监控"),
             GitError::Timeout { command, secs } => format!("git {command} 超时（{secs} 秒），已终止"),
             GitError::Failed { command, code, stderr } => {
                 if stderr.trim().is_empty() {
@@ -75,6 +78,10 @@ impl std::fmt::Display for GitError {
     }
 }
 
+fn is_version_query(args: &[&str]) -> bool {
+    args == ["--version"]
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -88,6 +95,11 @@ pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<Git
     validate(args).map_err(GitError::Forbidden)?;
     if !dir.is_dir() {
         return Err(GitError::NoDirectory(dir.display().to_string()));
+    }
+    // 项目目录必须自己就是仓库根目录：否则 git 会往上层找仓库，
+    // 删掉 .git 的项目会被当成上层仓库来检查甚至推送
+    if !is_version_query(args) && !dir.join(".git").exists() {
+        return Err(GitError::NotRepo(dir.display().to_string()));
     }
     let command = args.first().copied().unwrap_or("").to_string();
 
@@ -316,5 +328,20 @@ mod tests {
         ] {
             assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
         }
+    }
+
+    /// 删掉了 .git 的项目目录放在另一个仓库里面时，不能让 git 往上找到外层仓库
+    #[tokio::test]
+    async fn refuses_dir_without_own_git() {
+        let outer = std::env::temp_dir().join(format!("syncdeck-notrepo-{}", std::process::id()));
+        let inner = outer.join("skill");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        let err = super::run_git(&inner, &["status", "--porcelain=v2"], std::time::Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::GitError::NotRepo(_)), "{err:?}");
+        assert!(super::run_git(&inner, &["--version"], std::time::Duration::from_secs(10)).await.is_ok());
+        let _ = std::fs::remove_dir_all(&outer);
     }
 }

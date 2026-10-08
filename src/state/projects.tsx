@@ -52,6 +52,8 @@ interface ProjectsContextValue {
   commitAndPush: (id: string, message: string) => Promise<Project>;
   /** 打开 / 关闭"一键同步时自动提交" */
   setAutoCommit: (id: string, enabled: boolean) => Promise<Project>;
+  /** 取消监控：只从清单里移除，不动任何文件 */
+  removeProject: (id: string) => Promise<void>;
   sync: SyncState;
   startSync: () => Promise<void>;
   closeSync: () => void;
@@ -187,6 +189,11 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     return updated;
   }, []);
 
+  const removeProject = useCallback(async (id: string) => {
+    await api.removeProject(id);
+    setProjects((list) => list.filter((p) => p.id !== id));
+  }, []);
+
   const value = useMemo(
     () => ({
       projects,
@@ -196,12 +203,13 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       refresh,
       commitAndPush,
       setAutoCommit,
+      removeProject,
       sync,
       startSync,
       closeSync,
       skipInSync,
     }),
-    [projects, loading, refreshing, reload, refresh, commitAndPush, setAutoCommit, sync, startSync, closeSync, skipInSync],
+    [projects, loading, refreshing, reload, refresh, commitAndPush, setAutoCommit, removeProject, sync, startSync, closeSync, skipInSync],
   );
 
   return <ProjectsContext.Provider value={value}>{children}</ProjectsContext.Provider>;
