@@ -58,3 +58,9 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 - 调试时用环境变量 `SYNCDECK_CONFIG_DIR` 指定配置目录，以免改到真实配置 `%APPDATA%\com.gitsyncdeck.desktop\config.json`。
 - 发布：先把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 三处的版本号改成同一个并提交，再推 `v*` 标签。`.github/workflows/release.yml` 会先跑测试，再构建 Windows 安装包并发布到 Releases，同时上传应用内更新用的 `latest.json` 和 `.sig`（需要仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`）。`tauri.conf.json` 里的 updater 公钥和这把私钥是一对，换私钥等于让所有已安装版本收不到更新。
 - 自动提交只在一键同步时、对打开了开关的项目进行；不做后台定时提交。
+
+## 本项目例外
+
+- **每次会话收尾自动发版**（覆盖 dev-collab.md 里"不许 push"那条）：用户在本次会话里交代的所有任务都做完、合回 `main` 并且测试全绿之后，Claude 自己推送 `main`，再按 `.claude/skills/release/SKILL.md` 升版本号、打 `v*` 标签发布新版本，不用再问。
+  - 用户在当前会话里另有要求（"这次先别发""攒着下次一起发""只推不发"等）时，以用户为准。
+  - 本次改动没碰应用本身（只改了 `docs/`、`README.md`、`.claude/`、`CLAUDE.md`、测试或脚本）时只推 `main`，不发版，汇报时说一声。
