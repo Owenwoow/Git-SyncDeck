@@ -18,10 +18,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon：常驻托盘；image-png：托盘图标从 icons/32x32.png 读取后再画上状态色点
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# 开机自启（带 --autostart 参数启动时只进托盘）、系统通知、只允许运行一个实例
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 异步子进程（调用系统 git）、超时、并发限制
@@ -31,6 +36,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 [target.'cfg(windows)'.dependencies]
 # 读取 Windows 系统代理（注册表 HKCU\...\Internet Settings）
 winreg = "0.56"
+# 系统事件（锁屏/解锁、睡眠/唤醒、关机/注销）：隐藏的顶层窗口 + 自己的消息循环
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Shutdown",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 # 测试里用模拟运行时直接调用 Tauri 命令

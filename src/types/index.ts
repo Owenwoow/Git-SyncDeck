@@ -138,6 +138,34 @@ export interface Settings {
   effectiveProxy: string | null;
   /** 只读：实际生效的代理来自哪里 */
   proxySource: ProxySource;
+  /** 本机名称（如"家里台式机"），提交信息模板里的 {host} 用它；空字符串表示用电脑名 defaultHostName */
+  hostName: string;
+  /** 只读：这台电脑的系统名称（COMPUTERNAME） */
+  defaultHostName: string;
+  /** 开机自启（开机后只进托盘，不弹窗口），默认开 */
+  launchAtLogin: boolean;
+  /** 关窗口时隐藏到托盘，不退出，默认开 */
+  closeToTray: boolean;
+  /** 离开时同步：关机 / 重启 / 注销，默认开 */
+  syncOnShutdown: boolean;
+  /** 离开时同步：锁屏，默认开 */
+  syncOnLock: boolean;
+  /** 离开时同步：睡眠，默认开 */
+  syncOnSleep: boolean;
+  /** 到达时同步：程序启动（含开机自启），默认开 */
+  syncOnStartup: boolean;
+  /** 到达时同步：从睡眠唤醒，默认开 */
+  syncOnResume: boolean;
+  /** 到达时同步：解锁，默认开 */
+  syncOnUnlock: boolean;
+  /** 定时检查云端：每 30 分钟 fetch + status，只更新列表和托盘，不拉取，默认关 */
+  periodicCheck: boolean;
+  /** 后台同步成功且确实推送或拉取了东西时发系统通知，默认关 */
+  notifyOnSuccess: boolean;
+  /** 后台同步有项目出错或冲突时发系统通知，默认开 */
+  notifyOnError: boolean;
+  /** 只读：自动同步暂停到的时间（ISO，带时区）；null 表示没暂停。用 pauseAutoSync / resumeAutoSync 修改 */
+  autoSyncPausedUntil: string | null;
   /** 分叉时先预演合并，没有冲突就自动合并并推送（默认开） */
   autoMerge: boolean;
   /** 自动提交前检查大文件和疑似密钥文件（默认开；手动"提交并推送"不检查） */
@@ -145,6 +173,28 @@ export interface Settings {
   /** 提交前检查的单个文件大小上限（MB），1 ~ MAX_BIG_FILE_LIMIT_MB，默认 50 */
   bigFileLimitMb: number;
 }
+
+/** 自动同步的触发原因。离开：关机 / 锁屏 / 睡眠；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端 */
+export type AutoSyncTrigger = "shutdown" | "lock" | "sleep" | "startup" | "resume" | "unlock" | "manual" | "periodic";
+
+/** 后台自动同步的事件：开始时 result 为 null；结束时为同步结果（没有要同步的项目、定时检查时为 null） */
+export interface AutoSyncEvent {
+  trigger: AutoSyncTrigger;
+  /** 显示用的文字，如"解锁后同步" */
+  label: string;
+  result: SyncResult | null;
+}
+
+/** 后台自动同步的当前状态 */
+export interface AutoSyncState {
+  /** 正在进行的后台同步；null 表示没有 */
+  running: AutoSyncEvent | null;
+  /** 启动时的到达同步由后端负责（正在做或已做完）：前端启动时不用再自己刷新 */
+  startupSync: boolean;
+}
+
+/** 取消事件监听 */
+export type Unlisten = () => void;
 
 /** 代理模式：auto 自动（git 自己配了代理就用 git 的，否则用 Windows 系统代理）/ off 不用代理 / manual 手动填写 */
 export type ProxyMode = "auto" | "off" | "manual";

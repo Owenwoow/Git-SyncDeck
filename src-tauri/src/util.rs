@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -88,13 +88,31 @@ pub fn render_commit_message(template: &str, date: &str, host: &str) -> String {
     t.replace("{date}", date).replace("{host}", host)
 }
 
-/// 电脑名：Windows 取环境变量 COMPUTERNAME，取不到用"未知电脑"
-pub fn computer_name() -> String {
+/// 设置里填的本机名称（如"家里台式机"）；None 表示没填，用系统的电脑名
+static HOST_NAME: RwLock<Option<String>> = RwLock::new(None);
+
+/// 更新本机名称（启动时和保存设置时调用）；去掉空白后为空表示不填
+pub fn set_host_name(name: Option<&str>) {
+    let name = name.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    *HOST_NAME.write().unwrap_or_else(|e| e.into_inner()) = name;
+}
+
+/// 系统的电脑名：Windows 取环境变量 COMPUTERNAME，取不到用"未知电脑"
+pub fn system_computer_name() -> String {
     std::env::var("COMPUTERNAME")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| UNKNOWN_HOST.to_string())
+}
+
+/// 提交信息里的 `{host}`：优先用设置里的本机名称，没填时用系统的电脑名
+pub fn computer_name() -> String {
+    HOST_NAME
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(system_computer_name)
 }
 
 /// 用本地当前时间（YYYY-MM-DD HH:mm）和电脑名生成提交信息
@@ -196,6 +214,17 @@ mod tests {
         let want = "自动同步：D 来自 H";
         assert_eq!(render_commit_message("", "D", "H"), want);
         assert_eq!(render_commit_message(" \t\n ", "D", "H"), want);
+    }
+
+    #[test]
+    fn host_name_setting_overrides_computer_name() {
+        set_host_name(Some("  家里台式机 "));
+        assert_eq!(computer_name(), "家里台式机");
+        assert_eq!(commit_message_now("来自 {host}"), "来自 家里台式机");
+        set_host_name(Some("   "));
+        assert_eq!(computer_name(), system_computer_name(), "只填空白等于没填");
+        set_host_name(None);
+        assert_eq!(computer_name(), system_computer_name());
     }
 
     #[test]

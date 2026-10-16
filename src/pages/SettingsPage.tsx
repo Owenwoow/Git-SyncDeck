@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Check, CircleAlert, Download, FolderSearch, Loader2, RefreshCw, RotateCcw } from "lucide-react";
+import { useEffect, useId, useRef, useState } from "react";
+import { Check, CircleAlert, Download, FolderSearch, Loader2, Pause, Play, RefreshCw, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
@@ -7,6 +7,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
+import { Switch } from "@/components/ui/switch";
 import {
   DEFAULT_BIG_FILE_LIMIT_MB,
   DEFAULT_COMMIT_TEMPLATE,
@@ -16,10 +17,10 @@ import {
   renderCommitMessage,
 } from "@/lib/status";
 import { cn } from "@/lib/utils";
-import { useSettings } from "@/state/settings";
+import { activePause, describePauseUntil, useSettings } from "@/state/settings";
 import type { ProxyMode, Settings, Theme, UpdateInfo, UpdateProgress } from "@/types";
 
-/** 设置：默认代码目录、联网超时、代理、提交信息模板、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
+/** 设置：默认代码目录、联网超时、代理、自动同步、提交信息模板与本机名称、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
 export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateInfo | null }) {
   const { settings, updateSettings } = useSettings();
   const [picking, setPicking] = useState(false);
@@ -59,6 +60,8 @@ export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateI
         <NetworkTimeoutCard />
         <ProxyCard />
       </section>
+
+      <AutoSyncSection />
 
       <section className="space-y-3">
         <h2 className="text-sm font-medium text-muted-foreground">自动提交</h2>
@@ -291,15 +294,219 @@ function ProxyCard() {
   );
 }
 
-/** 预览里电脑名的占位文字（实际提交时由后端取这台电脑的名字） */
+// ---------------- 自动同步 ----------------
+
+type SwitchKey =
+  | "launchAtLogin"
+  | "closeToTray"
+  | "syncOnShutdown"
+  | "syncOnLock"
+  | "syncOnSleep"
+  | "syncOnStartup"
+  | "syncOnResume"
+  | "syncOnUnlock"
+  | "periodicCheck"
+  | "notifyOnSuccess"
+  | "notifyOnError";
+
+interface SwitchItem {
+  key: SwitchKey;
+  label: string;
+  description?: string;
+}
+
+const BACKGROUND_SWITCHES: SwitchItem[] = [
+  { key: "launchAtLogin", label: "开机自启", description: "开机后只在托盘里运行，不弹出窗口" },
+  {
+    key: "closeToTray",
+    label: "关窗口时隐藏到托盘",
+    description: "关掉窗口后继续在托盘里运行；要彻底退出，在托盘图标上右键选「退出」",
+  },
+];
+
+const LEAVE_SWITCHES: SwitchItem[] = [
+  { key: "syncOnShutdown", label: "关机、重启或注销", description: "最多等 30 秒，同步完或超时就继续关机" },
+  { key: "syncOnLock", label: "锁屏" },
+  { key: "syncOnSleep", label: "睡眠", description: "Windows 只给几秒，来不及推完的，下次唤醒或开机时补上" },
+];
+
+const ARRIVE_SWITCHES: SwitchItem[] = [
+  { key: "syncOnStartup", label: "启动 SyncDeck 时", description: "包括开机自启" },
+  { key: "syncOnResume", label: "从睡眠唤醒", description: "网络没连上时，等 15 秒再试一次" },
+  { key: "syncOnUnlock", label: "解锁" },
+];
+
+const CHECK_SWITCHES: SwitchItem[] = [
+  {
+    key: "periodicCheck",
+    label: "定时检查云端",
+    description: "每 30 分钟看一次云端有没有新提交，只更新列表和托盘图标，不会自动拉取",
+  },
+];
+
+const NOTIFY_SWITCHES: SwitchItem[] = [
+  { key: "notifyOnError", label: "出错或冲突时", description: '如"2 个项目需要处理：A、B"，每轮只发一条' },
+  { key: "notifyOnSuccess", label: "同步成功时", description: "只在确实推送或拉取了东西时发" },
+];
+
+/** 一行：左边文字，右边开关 */
+function SwitchRow({
+  item,
+  checked,
+  disabled,
+  onChange,
+}: {
+  item: SwitchItem;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  const id = useId();
+  return (
+    <div className="flex items-start justify-between gap-4 py-2">
+      <label htmlFor={id} className="min-w-0 cursor-pointer">
+        <div className="text-sm">{item.label}</div>
+        {item.description && <p className="mt-0.5 text-xs text-muted-foreground">{item.description}</p>}
+      </label>
+      <Switch id={id} checked={checked} onCheckedChange={onChange} disabled={disabled} className="mt-0.5" />
+    </div>
+  );
+}
+
+/** 一张卡片：标题、说明和若干开关 */
+function SwitchCard({ title, description, items }: { title: string; description?: string; items: SwitchItem[] }) {
+  const { settings, updateSettings } = useSettings();
+
+  async function toggle(key: SwitchKey, value: boolean) {
+    try {
+      await updateSettings({ [key]: value });
+    } catch (e) {
+      toast.error("保存失败", { description: e instanceof Error ? e.message : String(e) });
+      // updateSettings 会先乐观更新，失败时重新读回已保存的值
+      await updateSettings({}).catch(() => undefined);
+    }
+  }
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="text-sm font-medium">{title}</div>
+      {description && <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>}
+      <div className="mt-2 divide-y">
+        {items.map((item) => (
+          <SwitchRow
+            key={item.key}
+            item={item}
+            checked={settings?.[item.key] ?? false}
+            disabled={!settings}
+            onChange={(v) => void toggle(item.key, v)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** 暂停自动同步到明天 00:00 / 恢复 */
+function PauseCard() {
+  const { settings, pauseAutoSync, resumeAutoSync } = useSettings();
+  const [busy, setBusy] = useState(false);
+  const until = activePause(settings);
+
+  async function run(action: () => Promise<void>, done: string) {
+    setBusy(true);
+    try {
+      await action();
+      toast.success(done);
+    } catch (e) {
+      toast.error("操作失败", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-lg border bg-card p-4">
+      <div className="min-w-0">
+        <div className="text-sm font-medium">暂停自动同步</div>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          {until
+            ? `已暂停到 ${describePauseUntil(until)}，期间离开和回到电脑时都不会自动同步（托盘里的「立即同步」照常可用）。`
+            : "临时不想自动同步时，可以暂停到明天 00:00。托盘菜单里也能暂停和恢复。"}
+        </p>
+      </div>
+      {until ? (
+        <Button variant="outline" onClick={() => run(resumeAutoSync, "已恢复自动同步")} disabled={busy || !settings}>
+          {busy ? <Loader2 className="animate-spin" /> : <Play />}
+          恢复
+        </Button>
+      ) : (
+        <Button variant="outline" onClick={() => run(pauseAutoSync, "自动同步已暂停到明天 00:00")} disabled={busy || !settings}>
+          {busy ? <Loader2 className="animate-spin" /> : <Pause />}
+          暂停到明天
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/** 换电脑自动同步：后台运行、离开 / 到达时同步、定时检查、通知、暂停 */
+function AutoSyncSection() {
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-medium text-muted-foreground">自动同步</h2>
+      <SwitchCard title="后台运行" items={BACKGROUND_SWITCHES} />
+      <SwitchCard
+        title="离开这台电脑时同步"
+        description="只推送本机还没推上去的提交（打开了自动提交的项目先提交再推送）；没有要推的就完全不联网。"
+        items={LEAVE_SWITCHES}
+      />
+      <SwitchCard
+        title="回到这台电脑时同步"
+        description="对所有项目跑一遍一键同步：拉取云端的新提交，补推上次没推完的。同一种自动同步 10 分钟内只做一次。"
+        items={ARRIVE_SWITCHES}
+      />
+      <SwitchCard title="检查云端" items={CHECK_SWITCHES} />
+      <SwitchCard
+        title="通知"
+        description="只在后台自动同步和托盘「立即同步」之后发；窗口里点的一键同步直接看结果。"
+        items={NOTIFY_SWITCHES}
+      />
+      <PauseCard />
+    </section>
+  );
+}
+
+// ---------------- 自动提交 ----------------
+
+/** 预览里电脑名的占位文字（还没读到设置时用） */
 const HOST_PREVIEW = "本机电脑名";
 
-/** 自动提交的提交信息模板：失焦或回车保存，空值恢复默认 */
+/** 自动提交的提交信息模板：失焦或回车保存，空值恢复默认；下面是本机名称（模板里的 {host}） */
 function CommitTemplateCard() {
   const { settings, updateSettings } = useSettings();
   const saved = settings?.commitTemplate ?? DEFAULT_COMMIT_TEMPLATE;
   const [draft, setDraft] = useState(saved);
   useEffect(() => setDraft(saved), [saved]);
+  const savedHost = settings?.hostName ?? "";
+  const [hostDraft, setHostDraft] = useState(savedHost);
+  useEffect(() => setHostDraft(savedHost), [savedHost]);
+  const hostPreview = hostDraft.trim() || settings?.defaultHostName || HOST_PREVIEW;
+
+  async function saveHost(value: string) {
+    const next = value.trim();
+    if (next === savedHost) {
+      setHostDraft(savedHost);
+      return;
+    }
+    try {
+      await updateSettings({ hostName: next });
+      toast.success(next ? `本机名称已改为"${next}"` : "已改为使用电脑名");
+    } catch (e) {
+      setHostDraft(savedHost);
+      toast.error("保存失败", { description: e instanceof Error ? e.message : String(e) });
+      await updateSettings({}).catch(() => undefined);
+    }
+  }
 
   async function save(value: string) {
     const next = value.trim();
@@ -351,13 +558,33 @@ function CommitTemplateCard() {
         </li>
         <li>
           <code className="rounded bg-muted px-1 py-px font-mono text-foreground/80">{"{host}"}</code>{" "}
-          这台电脑的名字（预览里用"{HOST_PREVIEW}"代替）
+          这台电脑的名字，就是下面的"本机名称"
         </li>
       </ul>
+      <div className="mt-4 border-t pt-4">
+        <label htmlFor="host-name" className="text-sm font-medium">
+          本机名称
+        </label>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          如"家里台式机""学校笔记本"，在 GitHub 上一眼看出是哪台电脑提交的；不填就用电脑名
+          {settings?.defaultHostName ? ` ${settings.defaultHostName}` : ""}。
+        </p>
+        <Input
+          id="host-name"
+          value={hostDraft}
+          onChange={(e) => setHostDraft(e.target.value)}
+          onBlur={() => saveHost(hostDraft)}
+          onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+          placeholder={settings?.defaultHostName ?? ""}
+          disabled={!settings}
+          maxLength={40}
+          className="mt-3 max-w-xs"
+        />
+      </div>
       <div className="mt-3 rounded-md bg-muted/50 px-3 py-2 text-xs">
         <span className="text-muted-foreground">预览：</span>
         <span className="font-mono break-all select-text">
-          {renderCommitMessage(draft, new Date(), HOST_PREVIEW)}
+          {renderCommitMessage(draft, new Date(), hostPreview)}
         </span>
       </div>
     </div>

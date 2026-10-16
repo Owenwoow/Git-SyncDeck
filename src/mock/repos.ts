@@ -117,10 +117,26 @@ export const defaultSettings = {
   networkTimeoutSecs: DEFAULT_NETWORK_TIMEOUT_SECS,
   proxyMode: "auto" as ProxyMode,
   proxyUrl: null as string | null,
+  hostName: "",
+  launchAtLogin: true,
+  closeToTray: true,
+  syncOnShutdown: true,
+  syncOnLock: true,
+  syncOnSleep: true,
+  syncOnStartup: true,
+  syncOnResume: true,
+  syncOnUnlock: true,
+  periodicCheck: false,
+  notifyOnSuccess: false,
+  notifyOnError: true,
+  autoSyncPausedUntil: null as string | null,
   autoMerge: true,
   precommitCheck: true,
   bigFileLimitMb: DEFAULT_BIG_FILE_LIMIT_MB,
 };
+
+/** 演示：这台电脑的系统名称 */
+export const demoHostName = "DESKTOP-DEMO";
 
 /** 演示：自动模式下"探测到"的系统代理 */
 export const demoSystemProxy = "http://127.0.0.1:10808";

@@ -2,10 +2,13 @@
 // 函数签名必须与 src/mock/api.ts 完全一致。
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import type {
+  AutoSyncEvent,
+  AutoSyncState,
   DiagnosticInfo,
   GitInfo,
   Project,
@@ -15,6 +18,7 @@ import type {
   SyncProgressEvent,
   SyncResult,
   Theme,
+  Unlisten,
   UpdateInfo,
   UpdateProgress,
 } from "@/types";
@@ -122,6 +126,45 @@ export async function getSettings(): Promise<Settings> {
 
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
   return toSettings(await call<StoredSettings>("save_settings", { patch }));
+}
+
+/** 托盘菜单里暂停 / 恢复自动同步后，后端推送最新设置 */
+export function onSettingsChanged(cb: (s: Settings) => void): Promise<Unlisten> {
+  return listen<StoredSettings>("settings-changed", (e) => cb(toSettings(e.payload)));
+}
+
+// ---------------- 换电脑自动同步（后台进行，结果通过事件推送）----------------
+
+/** 暂停自动同步到明天 00:00，返回最新设置 */
+export async function pauseAutoSync(): Promise<Settings> {
+  return toSettings(await call<StoredSettings>("pause_auto_sync"));
+}
+
+/** 恢复自动同步，返回最新设置 */
+export async function resumeAutoSync(): Promise<Settings> {
+  return toSettings(await call<StoredSettings>("resume_auto_sync"));
+}
+
+/** 后台自动同步的当前状态（启动时查一次，之后靠 onAutoSync） */
+export function getAutoSyncState(): Promise<AutoSyncState> {
+  return call("get_auto_sync_state");
+}
+
+/** 后台检查 / 同步之后的最新项目列表 */
+export function onProjectsChanged(cb: (list: Project[]) => void): Promise<Unlisten> {
+  return listen<Project[]>("projects-changed", (e) => cb(e.payload));
+}
+
+/** 后台自动同步开始 / 结束 */
+export async function onAutoSync(handlers: {
+  started: (e: AutoSyncEvent) => void;
+  finished: (e: AutoSyncEvent) => void;
+}): Promise<Unlisten> {
+  const offs = await Promise.all([
+    listen<AutoSyncEvent>("auto-sync-started", (e) => handlers.started(e.payload)),
+    listen<AutoSyncEvent>("auto-sync-finished", (e) => handlers.finished(e.payload)),
+  ]);
+  return () => offs.forEach((off) => off());
 }
 
 // ---------------- 应用更新（tauri-plugin-updater，读取 GitHub Releases 的 latest.json）----------------
