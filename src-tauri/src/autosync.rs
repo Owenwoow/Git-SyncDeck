@@ -427,16 +427,23 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// 唤醒后最多等多久"睡眠前那一轮"结束（它被睡眠打断，唤醒后接着跑完）
-pub const WAIT_SLEEP_LEFTOVER: Duration = Duration::from_secs(120);
+/// 到达类最多等多久"离开前那一轮"结束（它常被睡眠打断，唤醒后接着跑完）
+pub const WAIT_DEPARTURE_LEFTOVER: Duration = Duration::from_secs(120);
+
+/// 到达类触发遇到正在跑的离开同步时，要不要先等它结束。
+/// 离开同步（锁屏、睡眠……）常被睡眠打断、唤醒后才接着跑完：设了"唤醒需要登录"时，合盖往往先锁屏再睡眠，
+/// 正在跑的就是锁屏那一轮。不等的话，唤醒和解锁的到达同步都会被它挡掉，唤醒后什么都不做
+pub fn waits_for_departure(trigger: AutoSyncTrigger, running: Option<AutoSyncTrigger>) -> bool {
+    trigger.kind() == Kind::Arrival && running.is_some_and(|t| t.kind() == Kind::Departure)
+}
 
 /// 处理一次触发（锁屏、解锁、唤醒、托盘立即同步、定时检查……）。关机走 `shutdown`。
-/// 已经有一轮同步在跑时直接跳过，也不记时间。例外：睡眠前的离开同步被睡眠打断、唤醒后还在跑时，
-/// 到达类先等它结束（最多 2 分钟）再做，免得唤醒后的同步被它挡掉
+/// 已经有一轮同步在跑时直接跳过，也不记时间。例外：到达类遇到正在跑的离开同步，先等它结束（最多 2 分钟）
+/// 再做，见 `waits_for_departure`
 pub async fn handle(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> Outcome {
-    if trigger.kind() == Kind::Arrival && st.auto.running() == Some(AutoSyncTrigger::Sleep) {
-        let deadline = Instant::now() + WAIT_SLEEP_LEFTOVER;
-        while st.auto.running() == Some(AutoSyncTrigger::Sleep) && Instant::now() < deadline {
+    if waits_for_departure(trigger, st.auto.running()) {
+        let deadline = Instant::now() + WAIT_DEPARTURE_LEFTOVER;
+        while waits_for_departure(trigger, st.auto.running()) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
@@ -838,5 +845,51 @@ mod tests {
         merge_retry(&mut first, result(&[("a", Pulled)]));
         assert_eq!(first.items[0].outcome, Pulled);
         assert_eq!((first.synced_count, first.failed_count), (2, 1));
+    }
+
+    #[test]
+    fn arrival_waits_only_for_departure_leftovers() {
+        // 正在跑的是离开类（锁屏、睡眠、关机）：到达类先等它结束
+        for running in [Lock, Sleep, Shutdown] {
+            for t in [Resume, Unlock, Startup, Manual] {
+                assert!(waits_for_departure(t, Some(running)), "{t:?} 遇到 {running:?}");
+            }
+        }
+        // 正在跑的是到达类、或者没在跑：不等（到达类遇到到达类直接跳过）
+        for running in [None, Some(Unlock), Some(Manual), Some(Resume)] {
+            assert!(!waits_for_departure(Resume, running), "{running:?}");
+        }
+        // 离开类、定时检查不等
+        assert!(!waits_for_departure(Lock, Some(Sleep)));
+        assert!(!waits_for_departure(Periodic, Some(Lock)));
+    }
+
+    fn empty_state(name: &str) -> Shared {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir); // 测试自己的临时配置目录
+        Arc::new(crate::commands::AppState::new(crate::config::ConfigStore::load(dir.join("config.json"))))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_lock_leftover_still_syncs() {
+        // 合盖时先锁屏再睡眠：锁屏那一轮被睡眠打断，唤醒后还没跑完
+        let st = empty_state("syncdeck-autosync-unit-leftover");
+        let leftover = st.auto.begin(Lock, false).unwrap();
+        let st2 = st.clone();
+        let resume = tokio::spawn(async move { handle(&st2, &NoHost, Resume).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!resume.is_finished(), "唤醒的到达同步在等锁屏那一轮");
+        drop(leftover);
+        let outcome = resume.await.unwrap();
+        assert!(matches!(outcome, Outcome::Synced(_)), "锁屏那一轮结束后照常做到达同步：{outcome:?}");
+        // 同属到达的解锁紧接着来：10 分钟内不再做
+        assert!(matches!(handle(&st, &NoHost, Unlock).await, Outcome::Skipped(Decision::TooSoon)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrival_skips_when_another_arrival_is_running() {
+        let st = empty_state("syncdeck-autosync-unit-busy");
+        let _running = st.auto.begin(Manual, false).unwrap();
+        assert!(matches!(handle(&st, &NoHost, Resume).await, Outcome::Busy));
     }
 }
