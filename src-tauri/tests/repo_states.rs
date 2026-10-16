@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git_syncdeck_lib::git::network_timeout;
 use git_syncdeck_lib::model::{ChangeKind, SyncOutcome, SyncStatus};
 use git_syncdeck_lib::ops::{self, Checked};
 use git_syncdeck_lib::status::inspect;
@@ -51,7 +52,7 @@ async fn states_sync_and_commit() {
         ("dirty-conflict", SyncStatus::Dirty),
     ];
     for (name, want) in expected {
-        match ops::check(&repo(name)).await {
+        match ops::check(&repo(name), network_timeout()).await {
             Checked::Fresh(ins) => {
                 println!(
                     "  {name:<13} → {:<6} 分支 {:<22} 领先 {} 落后 {} 改动 {}",
@@ -67,7 +68,7 @@ async fn states_sync_and_commit() {
             Checked::Failed(error) => panic!("{name} 不应该检查失败：{error}"),
         }
     }
-    match ops::check(&repo("fetch-fail")).await {
+    match ops::check(&repo("fetch-fail"), network_timeout()).await {
         Checked::FetchFailed { local, error } => {
             println!("  {:<13} → 检查失败（保留上次状态：{}）：{}", "fetch-fail", local.status.label(), first_line(&error.message()));
             assert!(!error.message().is_empty());

@@ -16,7 +16,7 @@ use crate::util::{
     commit_message_now, folder_name, map_limited, normalize_path, now_iso, project_id, same_path, CONCURRENCY,
     DEFAULT_COMMIT_TEMPLATE,
 };
-use crate::git::{set_network_timeout, DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES};
+use crate::git::{refresh_timeout, set_network_timeout, DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES};
 use crate::{scan, system};
 
 pub struct AppState {
@@ -133,10 +133,10 @@ async fn local_project(st: &AppState, sp: &StoredProject) -> Project {
     p
 }
 
-/// 联网检查：fetch + status
+/// 联网检查（刷新状态用）：fetch + status，fetch 用刷新的短超时
 async fn remote_project(st: &AppState, sp: &StoredProject) -> Project {
     let prev = st.cached(&sp.id);
-    let mut p = match ops::check(Path::new(&sp.path)).await {
+    let mut p = match ops::check(Path::new(&sp.path), refresh_timeout()).await {
         Checked::Fresh(ins) => project_from(sp, &ins),
         // fetch 失败：状态停留在上一次 fetch 时的结果（本地的远程跟踪分支没变）
         Checked::FetchFailed { local, error } => with_error(Some(project_from(sp, &local)), sp, error.message()),

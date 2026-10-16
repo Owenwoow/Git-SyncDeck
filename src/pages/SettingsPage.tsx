@@ -99,7 +99,7 @@ function NetworkTimeoutCard() {
     <div className="rounded-lg border bg-card p-4">
       <div className="text-sm font-medium">联网超时</div>
       <p className="mt-0.5 text-xs text-muted-foreground">
-        刷新、一键同步时连接 GitHub 超过这个时间就停止。网络慢或者一次要拉取的内容很多时，可以调长一些。
+        一键同步、提交并推送时连接 GitHub 超过这个时间就停止（刷新状态只是看一眼，最多等 30 秒）。网络慢或者一次要拉取的内容很多时，可以调长一些。
       </p>
       <div className="mt-3 inline-flex rounded-md border p-0.5" role="radiogroup" aria-label="联网超时">
         {NETWORK_TIMEOUT_CHOICES.map((secs) => {

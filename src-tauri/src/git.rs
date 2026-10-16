@@ -32,6 +32,19 @@ pub fn set_network_timeout(secs: u64) {
     NETWORK_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
 }
 
+/// 刷新状态时 fetch 的超时上限：刷新只是看一眼云端，代理卡住时不该让整轮转好几分钟。
+/// 一键同步、推送、拉取仍用设置里的联网超时。
+pub const REFRESH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 刷新时的 fetch 超时：30 秒和设置里的联网超时取较小的
+pub fn refresh_timeout() -> Duration {
+    refresh_timeout_for(network_timeout())
+}
+
+fn refresh_timeout_for(network: Duration) -> Duration {
+    REFRESH_FETCH_TIMEOUT.min(network)
+}
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -293,6 +306,16 @@ pub fn validate(args: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::validate;
+    use std::time::Duration;
+
+    #[test]
+    fn refresh_uses_shorter_timeout() {
+        let secs = |s| Duration::from_secs(s);
+        assert_eq!(super::refresh_timeout_for(secs(180)), secs(30));
+        assert_eq!(super::refresh_timeout_for(secs(600)), secs(30));
+        assert_eq!(super::refresh_timeout_for(secs(30)), secs(30));
+        assert_eq!(super::refresh_timeout_for(secs(10)), secs(10), "联网超时比 30 秒还短时用联网超时");
+    }
 
     #[test]
     fn allows_needed_commands() {

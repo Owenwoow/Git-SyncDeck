@@ -2,6 +2,7 @@
 //! 不使用 --force、reset、rebase、stash、clean、checkout 等任何可能改写历史或丢失改动的命令。
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::git::{network_timeout, run_git, GitError, STATUS_TIMEOUT};
 use crate::model::{CommitInfo, SyncOutcome, SyncStatus};
@@ -10,17 +11,17 @@ use crate::url::sanitize_url;
 
 /// 只 fetch 上游分支（下载量和 pull 一样，分支、标签多的仓库不会因为下载其他分支而超时）。
 /// 上游分支在本地已没有远程跟踪分支，或者按分支 fetch 失败（如云端分支已删除）时，退回 fetch 整个远程；
-/// 超时不退回，免得再等一轮。
-pub async fn fetch(dir: &Path, ins: &Inspection) -> Result<(), GitError> {
+/// 超时不退回，免得再等一轮。`timeout` 是每次 fetch 的超时（刷新用 `refresh_timeout()`，其余用 `network_timeout()`）。
+pub async fn fetch(dir: &Path, ins: &Inspection, timeout: Duration) -> Result<(), GitError> {
     let remote = ins.remote_name.as_deref().unwrap_or("origin");
     if let (Some(branch), false) = (ins.upstream_branch.as_deref(), ins.upstream_gone) {
-        match run_git(dir, &["fetch", "--quiet", remote, branch], network_timeout()).await {
+        match run_git(dir, &["fetch", "--quiet", remote, branch], timeout).await {
             Ok(_) => return Ok(()),
             Err(e @ GitError::Timeout { .. }) => return Err(e),
             Err(_) => {}
         }
     }
-    run_git(dir, &["fetch", "--quiet", remote], network_timeout()).await.map(|_| ())
+    run_git(dir, &["fetch", "--quiet", remote], timeout).await.map(|_| ())
 }
 
 /// 推送当前分支到它的上游（显式写出 refspec，不加 +，远程拒绝时不会强推）
@@ -54,8 +55,9 @@ pub enum Checked {
     Failed(GitError),
 }
 
-/// 刷新状态：先 fetch，再 git status。没有上游的项目不需要联网。
-pub async fn check(dir: &Path) -> Checked {
+/// 联网检查：先 fetch（超时为 `fetch_timeout`），再 git status。没有上游的项目不需要联网。
+/// 刷新状态时传 `refresh_timeout()`，一键同步时传 `network_timeout()`。
+pub async fn check(dir: &Path, fetch_timeout: Duration) -> Checked {
     let local = match inspect(dir).await {
         Ok(i) => i,
         Err(e) => return Checked::Failed(e),
@@ -63,7 +65,7 @@ pub async fn check(dir: &Path) -> Checked {
     if !local.can_fetch() {
         return Checked::Fresh(local);
     }
-    if let Err(error) = fetch(dir, &local).await {
+    if let Err(error) = fetch(dir, &local, fetch_timeout).await {
         return Checked::FetchFailed { local, error };
     }
     match inspect(dir).await {
@@ -98,7 +100,7 @@ impl SyncOne {
 ///   没打开 → 不做任何操作，记为异常
 /// - 分叉 / 未关联云端 → 不做任何操作，记为异常
 pub async fn sync_one(dir: &Path, auto_commit: Option<&str>) -> SyncOne {
-    let ins = match check(dir).await {
+    let ins = match check(dir, network_timeout()).await {
         Checked::Fresh(i) => i,
         Checked::FetchFailed { local, error } => return SyncOne::failed(error.message(), Some(local), true),
         Checked::Failed(error) => return SyncOne::failed(error.message(), None, true),
@@ -245,7 +247,7 @@ pub async fn commit_and_push(dir: &Path, message: &str) -> Result<Inspection, St
         .await
         .map_err(|e| format!("提交失败：{}", e.message()))?;
 
-    fetch(dir, &ins)
+    fetch(dir, &ins, network_timeout())
         .await
         .map_err(|e| format!("已提交到本地，但检查云端失败，没有推送：{}", e.message()))?;
     let after = inspect(dir)
