@@ -194,6 +194,8 @@ function ProxyCard() {
 
   async function choose(next: ProxyMode) {
     if (next === mode) return;
+    // 切换模式时丢掉没保存的地址草稿：切回"手动填写"时生效的是已保存的地址，输入框也要显示它
+    setDraft(null);
     if (next === "manual" && !savedUrl) {
       // 还没填过地址：先填，失焦或回车时再保存
       setPendingMode("manual");
