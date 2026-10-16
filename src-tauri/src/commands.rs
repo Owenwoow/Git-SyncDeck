@@ -33,8 +33,6 @@ pub struct AppState {
     /// 联网操作（刷新、一键同步、提交推送）互斥，避免同一个仓库被同时 fetch / push
     net_lock: tokio::sync::Mutex<()>,
     syncing: AtomicBool,
-    /// 最近一次解析出的代理（设置页显示"当前"用）
-    proxy: Mutex<ResolvedProxy>,
     /// 代理解析互斥：保存设置和刷新 / 同步同时解析时，保证最后生效的是按最新配置算出的结果
     proxy_lock: tokio::sync::Mutex<()>,
 }
@@ -50,7 +48,6 @@ impl AppState {
             checked_at: Mutex::new(HashMap::new()),
             net_lock: tokio::sync::Mutex::new(()),
             syncing: AtomicBool::new(false),
-            proxy: Mutex::new(ResolvedProxy::default()),
             proxy_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -247,7 +244,6 @@ async fn refresh_proxy(st: &AppState) -> ResolvedProxy {
     let system_proxy = if auto && git_proxy.is_none() { util::windows_system_proxy() } else { None };
     let resolved = decide_proxy(mode, manual.as_deref(), git_proxy.as_deref(), system_proxy.as_deref());
     set_proxy_override(resolved.over.clone());
-    *st.proxy.lock().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
     resolved
 }
 
