@@ -6,7 +6,7 @@ use std::process::Command;
 
 use git_syncdeck_lib::git::network_timeout;
 use git_syncdeck_lib::model::{ChangeKind, SyncOutcome, SyncStatus};
-use git_syncdeck_lib::ops::{self, Checked};
+use git_syncdeck_lib::ops::{self, Checked, SyncOptions};
 use git_syncdeck_lib::status::inspect;
 
 /// 每次都重新生成一套干净的测试仓库（与手动体验用的 %TEMP%\syncdeck-test 分开）
@@ -107,7 +107,7 @@ async fn states_sync_and_commit() {
         ("dirty-conflict", SyncOutcome::Failed),
     ];
     for (name, want) in cases {
-        let r = ops::sync_one(&repo(name), None).await;
+        let r = ops::sync_one(&repo(name), &SyncOptions::default()).await;
         let after = r.inspection.as_ref().map_or("—", |i| i.status.label());
         println!(
             "  {name:<13} → {:<10} {}{}",

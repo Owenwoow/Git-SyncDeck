@@ -94,17 +94,35 @@ impl SyncOne {
     }
 }
 
+/// 一键同步单个项目时的选项。只由 `commands::sync_options_for` 构造，以后加选项也只改那里。
+#[derive(Debug, Clone, Default)]
+pub struct SyncOptions {
+    /// 有未提交改动时自动提交用的提交信息；None 表示不自动提交
+    pub auto_commit: Option<String>,
+    /// 跳过 fetch，直接用本地的远程跟踪分支判断（刚联网检查过时，复用那次的结果）
+    pub skip_fetch: bool,
+}
+
 /// 一键同步单个项目：先检查状态，再按状态处理
 /// - 待推送 → push；待拉取 → pull --ff-only；已同步 → 跳过
-/// - 有未提交改动：打开了自动提交（`auto_commit` 为提交信息）→ 自动提交并推送，见 `auto_commit_and_push`；
+/// - 有未提交改动：打开了自动提交（`opts.auto_commit` 为提交信息）→ 自动提交并推送，见 `auto_commit_and_push`；
 ///   没打开 → 不做任何操作，记为异常
 /// - 分叉 / 未关联云端 → 不做任何操作，记为异常
-pub async fn sync_one(dir: &Path, auto_commit: Option<&str>) -> SyncOne {
-    let ins = match check(dir, network_timeout()).await {
+pub async fn sync_one(dir: &Path, opts: &SyncOptions) -> SyncOne {
+    let checked = if opts.skip_fetch {
+        match inspect(dir).await {
+            Ok(i) => Checked::Fresh(i),
+            Err(e) => Checked::Failed(e),
+        }
+    } else {
+        check(dir, network_timeout()).await
+    };
+    let ins = match checked {
         Checked::Fresh(i) => i,
         Checked::FetchFailed { local, error } => return SyncOne::failed(error.message(), Some(local), true),
         Checked::Failed(error) => return SyncOne::failed(error.message(), None, true),
     };
+    let auto_commit = opts.auto_commit.as_deref();
 
     match ins.status {
         SyncStatus::Ahead => match push(dir, &ins).await {

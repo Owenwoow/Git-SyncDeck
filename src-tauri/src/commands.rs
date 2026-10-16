@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tauri::ipc::Channel;
 use tauri::State;
@@ -23,6 +24,8 @@ pub struct AppState {
     pub config: ConfigStore,
     /// 每个项目最近一次检查的结果（内存），检查失败时用它保留上一次的状态
     cache: Mutex<HashMap<String, Project>>,
+    /// 每个项目最近一次联网检查（fetch）成功的时间，刷新和一键同步都会记；一键同步据此跳过刚 fetch 过的项目
+    checked_at: Mutex<HashMap<String, Instant>>,
     /// 联网操作（刷新、一键同步、提交推送）互斥，避免同一个仓库被同时 fetch / push
     net_lock: tokio::sync::Mutex<()>,
     syncing: AtomicBool,
@@ -36,6 +39,7 @@ impl AppState {
         AppState {
             config,
             cache: Mutex::new(HashMap::new()),
+            checked_at: Mutex::new(HashMap::new()),
             net_lock: tokio::sync::Mutex::new(()),
             syncing: AtomicBool::new(false),
         }
@@ -51,6 +55,16 @@ impl AppState {
 
     fn forget(&self, id: &str) {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    }
+
+    /// 记下"刚刚联网检查成功"
+    fn mark_checked(&self, id: &str) {
+        self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), Instant::now());
+    }
+
+    fn last_checked(&self, id: &str) -> Option<Instant> {
+        self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).get(id).copied()
     }
 
     fn stored(&self, id: &str) -> Option<StoredProject> {
@@ -137,7 +151,10 @@ async fn local_project(st: &AppState, sp: &StoredProject) -> Project {
 async fn remote_project(st: &AppState, sp: &StoredProject) -> Project {
     let prev = st.cached(&sp.id);
     let mut p = match ops::check(Path::new(&sp.path), refresh_timeout()).await {
-        Checked::Fresh(ins) => project_from(sp, &ins),
+        Checked::Fresh(ins) => {
+            st.mark_checked(&sp.id);
+            project_from(sp, &ins)
+        }
         // fetch 失败：状态停留在上一次 fetch 时的结果（本地的远程跟踪分支没变）
         Checked::FetchFailed { local, error } => with_error(Some(project_from(sp, &local)), sp, error.message()),
         Checked::Failed(error) => with_error(prev, sp, error.message()),
@@ -322,9 +339,9 @@ pub async fn sync_all(
         async move {
             let index = started.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Start { project_id: sp.id.clone(), index, total });
-            let auto_commit = sp.auto_commit.then_some(commit_message.as_str());
-            let one = ops::sync_one(Path::new(&sp.path), auto_commit).await;
-            let (project, result) = record_sync(&st, &sp, one);
+            let opts = sync_options_for(&st, &sp, &commit_message);
+            let one = ops::sync_one(Path::new(&sp.path), &opts).await;
+            let (project, result) = record_sync(&st, &sp, &opts, one);
             let index = finished.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Done { result: result.clone(), project, index, total });
             result
@@ -342,8 +359,29 @@ pub async fn sync_all(
     })
 }
 
-/// 记录单个项目的同步结果：成功（含自动提交并推送）→ 更新上次同步时间、清除异常；失败 → 保存异常原因
-fn record_sync(st: &AppState, sp: &StoredProject, one: SyncOne) -> (Project, SyncItemResult) {
+/// 一键同步时复用检查结果的时间窗口：这段时间内联网检查成功过的项目不再 fetch
+pub const REUSE_CHECK_WITHIN: Duration = Duration::from_secs(60);
+
+/// 一键同步要不要跳过 fetch：最近一次联网检查成功距现在不到 `REUSE_CHECK_WITHIN`
+pub fn should_skip_fetch(last_checked: Option<Instant>, now: Instant) -> bool {
+    last_checked.is_some_and(|t| now.saturating_duration_since(t) < REUSE_CHECK_WITHIN)
+}
+
+/// 一键同步时单个项目的选项。**唯一的构造入口**：`sync_all` 只通过这里拿选项，以后加选项也只改这里。
+/// `commit_message` 是本轮共用的自动提交信息，只给打开了自动提交的项目用。
+fn sync_options_for(st: &AppState, sp: &StoredProject, commit_message: &str) -> ops::SyncOptions {
+    ops::SyncOptions {
+        auto_commit: sp.auto_commit.then(|| commit_message.to_string()),
+        skip_fetch: should_skip_fetch(st.last_checked(&sp.id), Instant::now()),
+    }
+}
+
+/// 记录单个项目的同步结果：成功（含自动提交并推送）→ 更新上次同步时间、清除异常；失败 → 保存异常原因。
+/// 这次真的 fetch 成功了，就记下检查时间（跳过 fetch 时不记，免得一直沿用旧结果）。
+fn record_sync(st: &AppState, sp: &StoredProject, opts: &ops::SyncOptions, one: SyncOne) -> (Project, SyncItemResult) {
+    if !opts.skip_fetch && !one.check_failed {
+        st.mark_checked(&sp.id);
+    }
     let success = one.outcome != SyncOutcome::Failed;
     let reason = one.reason.clone();
     let now = now_iso();
@@ -495,4 +533,25 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
         set_network_timeout(s.network_timeout_secs);
         s
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_fetch_only_right_after_successful_check() {
+        // 用"基准时间 + 偏移"构造，避免 Instant 减法在刚开机时下溢
+        let base = Instant::now();
+        let now = base + Duration::from_secs(600);
+        let ago = |secs: u64| Some(now - Duration::from_secs(secs));
+        assert!(!should_skip_fetch(None, now), "从没检查成功过 → 要 fetch");
+        assert!(should_skip_fetch(ago(0), now));
+        assert!(should_skip_fetch(ago(10), now));
+        assert!(should_skip_fetch(ago(59), now));
+        assert!(!should_skip_fetch(ago(60), now), "满 1 分钟 → 要 fetch");
+        assert!(!should_skip_fetch(ago(300), now));
+        // 检查时间比 now 还晚（并行时先取了 now）：算刚检查过
+        assert!(should_skip_fetch(Some(now + Duration::from_secs(1)), now));
+    }
 }
