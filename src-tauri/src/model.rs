@@ -163,6 +163,34 @@ pub struct Settings {
     pub effective_proxy: Option<String>,
     /// 只读：实际生效的代理来自哪里
     pub proxy_source: ProxySource,
+    /// 本机名称，提交信息模板里的 `{host}` 用它；空字符串表示没填，用 `default_host_name`
+    pub host_name: String,
+    /// 只读：系统的电脑名（COMPUTERNAME）
+    pub default_host_name: String,
+    /// 开机自启（开机后只进托盘，不弹窗口）
+    pub launch_at_login: bool,
+    /// 关窗口时隐藏到托盘，不退出
+    pub close_to_tray: bool,
+    /// 离开时同步：关机 / 重启 / 注销
+    pub sync_on_shutdown: bool,
+    /// 离开时同步：锁屏
+    pub sync_on_lock: bool,
+    /// 离开时同步：睡眠
+    pub sync_on_sleep: bool,
+    /// 到达时同步：程序启动（含开机自启）
+    pub sync_on_startup: bool,
+    /// 到达时同步：从睡眠唤醒
+    pub sync_on_resume: bool,
+    /// 到达时同步：解锁
+    pub sync_on_unlock: bool,
+    /// 定时检查云端：每 30 分钟 fetch + status，只更新列表和托盘，不拉取
+    pub periodic_check: bool,
+    /// 后台同步成功且确实推送或拉取了东西时发系统通知
+    pub notify_on_success: bool,
+    /// 后台同步有项目出错或冲突时发系统通知
+    pub notify_on_error: bool,
+    /// 只读：自动同步暂停到什么时候（RFC 3339，带时区）；None 表示没暂停。用 pause_auto_sync / resume_auto_sync 修改
+    pub auto_sync_paused_until: Option<String>,
 }
 
 /// 实际生效的代理来自哪里
@@ -194,6 +222,56 @@ pub struct SettingsPatch {
     pub proxy_mode: Option<String>,
     /// 手动填写的代理地址；空字符串表示清除
     pub proxy_url: Option<String>,
+    /// 本机名称；空字符串表示清除（用电脑名）
+    pub host_name: Option<String>,
+    pub launch_at_login: Option<bool>,
+    pub close_to_tray: Option<bool>,
+    pub sync_on_shutdown: Option<bool>,
+    pub sync_on_lock: Option<bool>,
+    pub sync_on_sleep: Option<bool>,
+    pub sync_on_startup: Option<bool>,
+    pub sync_on_resume: Option<bool>,
+    pub sync_on_unlock: Option<bool>,
+    pub periodic_check: Option<bool>,
+    pub notify_on_success: Option<bool>,
+    pub notify_on_error: Option<bool>,
+}
+
+/// 自动同步的触发原因。离开：关机 / 锁屏 / 睡眠；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoSyncTrigger {
+    Shutdown,
+    Lock,
+    Sleep,
+    Startup,
+    Resume,
+    Unlock,
+    /// 托盘菜单"立即同步"
+    Manual,
+    /// 定时检查云端（只 fetch + status，不拉取）
+    Periodic,
+}
+
+/// 后台自动同步的事件（auto-sync-started / auto-sync-finished），也用于查询当前状态
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSyncEvent {
+    pub trigger: AutoSyncTrigger,
+    /// 显示用的文字，如"解锁后同步"
+    pub label: String,
+    /// 结束时的同步结果；开始时、或者没有要同步的项目（没联网）时为 None
+    pub result: Option<SyncResult>,
+}
+
+/// 后台自动同步的当前状态（前端启动时查询一次，之后靠事件更新）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSyncState {
+    /// 正在进行的后台同步；None 表示没有
+    pub running: Option<AutoSyncEvent>,
+    /// 启动时的到达同步由后端负责（正在做或已做完）：前端启动时不用再自己刷新一次
+    pub startup_sync: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

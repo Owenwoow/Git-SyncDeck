@@ -3,12 +3,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Local};
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::autosync::{self, AutoSync, Switches};
 use crate::config::{AppConfig, ConfigStore, StoredProject};
 use crate::model::*;
 use crate::ops::{self, Checked, SyncOne};
@@ -37,13 +39,28 @@ pub struct AppState {
     syncing: AtomicBool,
     /// 代理解析互斥：保存设置和刷新 / 同步同时解析时，保证最后生效的是按最新配置算出的结果
     proxy_lock: tokio::sync::Mutex<()>,
+    /// 换电脑自动同步的调度状态（上次离开 / 到达同步的时间、正在进行的后台同步）
+    pub auto: AutoSync,
+    /// 项目状态、"正在同步"或暂停状态变化后调用（托盘据此更新图标）；测试里不设置
+    on_change: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// 注册 / 取消开机自启（需要 AppHandle，由 lib.rs 设置）；测试里不设置
+    autostart: OnceLock<Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>>,
 }
 
 pub type Shared = Arc<AppState>;
 
+/// 一键同步的进度回调（前端的 Channel，或后台同步时什么都不做）
+pub type SyncSink = Arc<dyn Fn(SyncProgressEvent) + Send + Sync>;
+/// 刷新状态的进度回调
+pub type RefreshSink = Arc<dyn Fn(RefreshProgressEvent) + Send + Sync>;
+
+/// 已经有一轮同步在进行时 `run_sync` 返回的错误
+pub const SYNC_BUSY: &str = "正在同步中，请等这一轮结束";
+
 impl AppState {
     pub fn new(config: ConfigStore) -> Self {
         set_network_timeout(config.read(network_timeout_of));
+        util::set_host_name(config.read(|c| c.settings.host_name.clone()).as_deref());
         AppState {
             config,
             cache: Mutex::new(HashMap::new()),
@@ -51,7 +68,39 @@ impl AppState {
             net_lock: tokio::sync::Mutex::new(()),
             syncing: AtomicBool::new(false),
             proxy_lock: tokio::sync::Mutex::new(()),
+            auto: AutoSync::new(),
+            on_change: OnceLock::new(),
+            autostart: OnceLock::new(),
         }
+    }
+
+    /// 设置"状态变化"回调（只能设置一次）
+    pub fn set_change_hook(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_change.set(Box::new(f));
+    }
+
+    /// 设置"注册 / 取消开机自启"的实现（只能设置一次）
+    pub fn set_autostart_hook(&self, f: impl Fn(bool) -> Result<(), String> + Send + Sync + 'static) {
+        let _ = self.autostart.set(Box::new(f));
+    }
+
+    /// 通知托盘等：状态变了。调用时不能持有任何锁
+    pub fn changed(&self) {
+        if let Some(f) = self.on_change.get() {
+            f();
+        }
+    }
+
+    /// 是否有一轮同步正在进行（窗口里的一键同步或后台自动同步）
+    pub fn is_syncing(&self) -> bool {
+        self.syncing.load(Ordering::SeqCst)
+    }
+
+    /// 所有监控中的项目最近一次的检查结果（按清单顺序；还没检查过的不在里面）
+    pub fn snapshot(&self) -> Vec<Project> {
+        let ids: Vec<String> = self.config.read(|c| c.projects.iter().map(|p| p.id.clone()).collect());
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        ids.iter().filter_map(|id| cache.get(id).cloned()).collect()
     }
 
     fn cached(&self, id: &str) -> Option<Project> {
@@ -60,11 +109,13 @@ impl AppState {
 
     fn remember(&self, p: &Project) {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(p.id.clone(), p.clone());
+        self.changed();
     }
 
     fn forget(&self, id: &str) {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.changed();
     }
 
     /// 记下"刚刚联网检查成功"
@@ -291,13 +342,18 @@ pub async fn check_git() -> GitInfo {
 
 #[tauri::command]
 pub async fn list_projects(state: State<'_, Shared>) -> Result<Vec<Project>, String> {
-    let st = state.inner().clone();
+    Ok(local_projects(state.inner()).await)
+}
+
+/// 本地检查所有项目（不联网）：启动时的列表、离开时挑选要同步的项目都用它
+pub async fn local_projects(st: &Shared) -> Vec<Project> {
     let stored = st.config.read(|c| c.projects.clone());
-    Ok(map_limited(stored, CONCURRENCY, move |sp| {
+    let st = st.clone();
+    map_limited(stored, CONCURRENCY, move |sp| {
         let st = st.clone();
         async move { local_project(&st, &sp).await }
     })
-    .await)
+    .await
 }
 
 /// 联网刷新所有项目：每个项目检查完就通过 `on_event` 发一次 Done，最后仍返回完整列表。
@@ -307,9 +363,16 @@ pub async fn refresh_status(
     state: State<'_, Shared>,
     on_event: Channel<RefreshProgressEvent>,
 ) -> Result<Vec<Project>, String> {
-    let st = state.inner().clone();
+    Ok(run_refresh(state.inner(), Arc::new(move |e| {
+        let _ = on_event.send(e);
+    }))
+    .await)
+}
+
+/// 刷新状态的主体（fetch + status，不拉取）：窗口里的"刷新状态"和后台的定时检查云端都用它
+pub async fn run_refresh(st: &Shared, on_event: RefreshSink) -> Vec<Project> {
     let _net = st.net_lock.lock().await;
-    refresh_proxy(&st).await;
+    refresh_proxy(st).await;
     let stored = st.config.read(|c| c.projects.clone());
     let total = stored.len();
     let finished = Arc::new(AtomicUsize::new(0));
@@ -321,12 +384,12 @@ pub async fn refresh_status(
         async move {
             let project = remote_project(&st, &sp).await?;
             let index = finished.fetch_add(1, Ordering::SeqCst);
-            let _ = on_event.send(RefreshProgressEvent::Done { project: project.clone(), index, total });
+            on_event(RefreshProgressEvent::Done { project: project.clone(), index, total });
             Some(project)
         }
     })
     .await;
-    Ok(checked.into_iter().flatten().collect())
+    checked.into_iter().flatten().collect()
 }
 
 #[tauri::command]
@@ -416,24 +479,39 @@ struct SyncingFlag(Shared);
 impl Drop for SyncingFlag {
     fn drop(&mut self) {
         self.0.syncing.store(false, Ordering::SeqCst);
+        self.0.changed();
     }
 }
 
+/// 窗口里的"一键同步"：进度通过 Channel 推给前端
 #[tauri::command]
 pub async fn sync_all(
     state: State<'_, Shared>,
     on_event: Channel<SyncProgressEvent>,
 ) -> Result<SyncResult, String> {
-    let st = state.inner().clone();
+    run_sync(state.inner(), None, Arc::new(move |e| {
+        let _ = on_event.send(e);
+    }))
+    .await
+}
+
+/// 同步引擎：窗口里的一键同步和后台自动同步都用它。
+/// `only` 为 None 时同步所有项目，否则只同步这些 id 的项目（离开时只挑有东西要推的）。
+/// 同一时间只允许一轮（"正在同步"标记），已经有一轮在跑时返回 `SYNC_BUSY`；联网操作之间用 net_lock 互斥。
+pub async fn run_sync(st: &Shared, only: Option<Vec<String>>, on_event: SyncSink) -> Result<SyncResult, String> {
     if st.syncing.swap(true, Ordering::SeqCst) {
-        return Err("正在同步中，请等这一轮结束".into());
+        return Err(SYNC_BUSY.into());
     }
+    st.changed();
     let _flag = SyncingFlag(st.clone());
     let _net = st.net_lock.lock().await;
-    refresh_proxy(&st).await;
+    refresh_proxy(st).await;
 
     let started_at = now_iso();
     let mut stored = st.config.read(|c| c.projects.clone());
+    if let Some(ids) = &only {
+        stored.retain(|sp| ids.contains(&sp.id));
+    }
     // 处理顺序与界面一致：需要处理的在前
     let weight = |sp: &StoredProject| st.cached(&sp.id).map_or(6, |p| p.status.weight());
     stored.sort_by(|a, b| weight(a).cmp(&weight(b)).then_with(|| folder_name(&a.path).cmp(&folder_name(&b.path))));
@@ -453,12 +531,12 @@ pub async fn sync_all(
         let commit_message = commit_message.clone();
         async move {
             let index = started.fetch_add(1, Ordering::SeqCst);
-            let _ = on_event.send(SyncProgressEvent::Start { project_id: sp.id.clone(), index, total });
+            on_event(SyncProgressEvent::Start { project_id: sp.id.clone(), index, total });
             let opts = sync_options_for(&st, &sp, &commit_message);
             let one = ops::sync_one(Path::new(&sp.path), &opts).await;
             let (project, result) = record_sync(&st, &sp, &opts, one);
             let index = finished.fetch_add(1, Ordering::SeqCst);
-            let _ = on_event.send(SyncProgressEvent::Done { result: result.clone(), project, index, total });
+            on_event(SyncProgressEvent::Done { result: result.clone(), project, index, total });
             result
         }
     })
@@ -581,6 +659,7 @@ pub async fn open_in_editor(state: State<'_, Shared>, project_id: String) -> Res
 }
 
 fn settings_of(c: &AppConfig, proxy: &ResolvedProxy) -> Settings {
+    let sw = Switches::from_stored(&c.settings);
     Settings {
         default_code_dir: c
             .settings
@@ -594,7 +673,36 @@ fn settings_of(c: &AppConfig, proxy: &ResolvedProxy) -> Settings {
         proxy_url: c.settings.proxy_url.clone(),
         effective_proxy: proxy.effective.clone(),
         proxy_source: proxy.source,
+        host_name: c.settings.host_name.clone().unwrap_or_default(),
+        default_host_name: util::system_computer_name(),
+        launch_at_login: sw.launch_at_login,
+        close_to_tray: sw.close_to_tray,
+        sync_on_shutdown: sw.sync_on_shutdown,
+        sync_on_lock: sw.sync_on_lock,
+        sync_on_sleep: sw.sync_on_sleep,
+        sync_on_startup: sw.sync_on_startup,
+        sync_on_resume: sw.sync_on_resume,
+        sync_on_unlock: sw.sync_on_unlock,
+        periodic_check: sw.periodic_check,
+        notify_on_success: sw.notify_on_success,
+        notify_on_error: sw.notify_on_error,
+        auto_sync_paused_until: autosync::active_pause(&c.settings, &Local::now()).map(|d| d.to_rfc3339()),
     }
+}
+
+/// 本机名称最长多少个字
+const HOST_NAME_MAX_CHARS: usize = 40;
+
+/// 校验本机名称：去掉首尾空白；空 → None（用电脑名）；不能有换行等控制字符，不能太长
+fn validate_host_name(raw: &str) -> Result<Option<String>, String> {
+    let name = raw.trim();
+    if name.chars().any(char::is_control) {
+        return Err("本机名称不能包含换行等控制字符".into());
+    }
+    if name.chars().count() > HOST_NAME_MAX_CHARS {
+        return Err(format!("本机名称最多 {HOST_NAME_MAX_CHARS} 个字"));
+    }
+    Ok((!name.is_empty()).then(|| name.to_string()))
 }
 
 /// 联网超时：没设置过或配置文件里是不认识的值时用默认值
@@ -659,7 +767,19 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
     } else {
         None
     };
+    let host_name = patch.host_name.as_deref().map(validate_host_name).transpose()?;
+    // 开机自启：先注册 / 取消，成功了再保存，免得设置显示的和实际不一致
+    if let (Some(on), Some(apply)) = (patch.launch_at_login, state.autostart.get()) {
+        apply(on).map_err(|e| format!("设置开机自启失败：{e}"))?;
+    }
     state.config.update(|c| {
+        if let Some(name) = &host_name {
+            c.settings.host_name = name.clone();
+            util::set_host_name(name.as_deref());
+        }
+        let mut sw = Switches::from_stored(&c.settings);
+        sw.apply(&patch);
+        sw.store(&mut c.settings);
         if let Some((mode, url)) = &proxy_patch {
             c.settings.proxy_mode = (*mode != "auto").then(|| mode.to_string());
             c.settings.proxy_url = url.clone();
@@ -683,6 +803,39 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
     })?;
     let proxy = refresh_proxy(&state).await;
     Ok(state.config.read(|c| settings_of(c, &proxy)))
+}
+
+/// 当前设置（托盘里暂停 / 恢复后，用它把最新设置推给前端）
+pub async fn current_settings(st: &AppState) -> Settings {
+    let proxy = refresh_proxy(st).await;
+    st.config.read(|c| settings_of(c, &proxy))
+}
+
+/// 暂停自动同步到某个时间（None = 恢复）。托盘菜单和设置页都用它
+pub fn set_auto_sync_pause(st: &AppState, until: Option<DateTime<Local>>) -> Result<(), String> {
+    st.config.update(|c| c.settings.auto_sync_paused_until = until.map(|d| d.to_rfc3339()))?;
+    st.changed();
+    Ok(())
+}
+
+/// 暂停自动同步到明天 00:00（本地时间）
+#[tauri::command]
+pub async fn pause_auto_sync(state: State<'_, Shared>) -> Result<Settings, String> {
+    set_auto_sync_pause(&state, Some(autosync::next_midnight(&Local::now())))?;
+    Ok(current_settings(&state).await)
+}
+
+/// 恢复自动同步
+#[tauri::command]
+pub async fn resume_auto_sync(state: State<'_, Shared>) -> Result<Settings, String> {
+    set_auto_sync_pause(&state, None)?;
+    Ok(current_settings(&state).await)
+}
+
+/// 后台自动同步的当前状态（前端启动时查一次，之后靠 auto-sync-started / auto-sync-finished 事件）
+#[tauri::command]
+pub fn get_auto_sync_state(state: State<'_, Shared>) -> AutoSyncState {
+    state.auto.state()
 }
 
 #[cfg(test)]
