@@ -5,12 +5,12 @@ import * as api from "@/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
-import { DEFAULT_COMMIT_TEMPLATE, renderCommitMessage } from "@/lib/status";
+import { DEFAULT_COMMIT_TEMPLATE, NETWORK_TIMEOUT_CHOICES, renderCommitMessage } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/state/settings";
 import type { Theme, UpdateInfo, UpdateProgress } from "@/types";
 
-/** 设置：默认代码目录、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
+/** 设置：默认代码目录、联网超时、提交信息模板、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
 export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateInfo | null }) {
   const { settings, updateSettings } = useSettings();
   const [picking, setPicking] = useState(false);
@@ -47,6 +47,7 @@ export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateI
             </Button>
           </div>
         </div>
+        <NetworkTimeoutCard />
       </section>
 
       <section className="space-y-3">
@@ -76,6 +77,51 @@ export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateI
       </section>
 
       <AboutSection pendingUpdate={pendingUpdate} />
+    </div>
+  );
+}
+
+/** 联网超时：fetch、push、pull 超过这个时间就终止，点选即保存 */
+function NetworkTimeoutCard() {
+  const { settings, updateSettings } = useSettings();
+
+  async function choose(secs: number) {
+    if (secs === settings?.networkTimeoutSecs) return;
+    try {
+      await updateSettings({ networkTimeoutSecs: secs });
+      toast.success(`联网超时已改为 ${secs / 60} 分钟`);
+    } catch (e) {
+      toast.error("保存失败", { description: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="text-sm font-medium">联网超时</div>
+      <p className="mt-0.5 text-xs text-muted-foreground">
+        刷新、一键同步时连接 GitHub 超过这个时间就停止。网络慢或者一次要拉取的内容很多时，可以调长一些。
+      </p>
+      <div className="mt-3 inline-flex rounded-md border p-0.5" role="radiogroup" aria-label="联网超时">
+        {NETWORK_TIMEOUT_CHOICES.map((secs) => {
+          const active = settings?.networkTimeoutSecs === secs;
+          return (
+            <button
+              key={secs}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              disabled={!settings}
+              onClick={() => choose(secs)}
+              className={cn(
+                "rounded px-3 py-1 text-sm transition-colors",
+                active ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {secs / 60} 分钟
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

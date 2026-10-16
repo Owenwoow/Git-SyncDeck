@@ -145,6 +145,8 @@ pub struct Settings {
     pub theme: Option<String>,
     /// 自动提交的提交信息模板；没设置过时为默认模板
     pub commit_template: String,
+    /// 联网操作（fetch、push、pull）的超时秒数
+    pub network_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -154,6 +156,8 @@ pub struct SettingsPatch {
     pub theme: Option<String>,
     /// 去掉空白后为空（或等于默认模板）时恢复默认
     pub commit_template: Option<String>,
+    /// 只能是 git::NETWORK_TIMEOUT_CHOICES 之一
+    pub network_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

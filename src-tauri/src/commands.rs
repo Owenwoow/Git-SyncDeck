@@ -16,6 +16,7 @@ use crate::util::{
     commit_message_now, folder_name, map_limited, normalize_path, now_iso, project_id, same_path, CONCURRENCY,
     DEFAULT_COMMIT_TEMPLATE,
 };
+use crate::git::{set_network_timeout, DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES};
 use crate::{scan, system};
 
 pub struct AppState {
@@ -31,6 +32,7 @@ pub type Shared = Arc<AppState>;
 
 impl AppState {
     pub fn new(config: ConfigStore) -> Self {
+        set_network_timeout(config.read(network_timeout_of));
         AppState {
             config,
             cache: Mutex::new(HashMap::new()),
@@ -420,7 +422,16 @@ fn settings_of(c: &AppConfig) -> Settings {
             .unwrap_or_else(|| std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into())),
         theme: c.settings.theme.clone(),
         commit_template: commit_template_of(c),
+        network_timeout_secs: network_timeout_of(c),
     }
+}
+
+/// 联网超时：没设置过或配置文件里是不认识的值时用默认值
+fn network_timeout_of(c: &AppConfig) -> u64 {
+    c.settings
+        .network_timeout_secs
+        .filter(|s| NETWORK_TIMEOUT_CHOICES.contains(s))
+        .unwrap_or(DEFAULT_NETWORK_TIMEOUT_SECS)
 }
 
 /// 提交信息模板：没设置过或为空时用默认模板
@@ -446,6 +457,11 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
             return Err(format!("未知的主题：{t}"));
         }
     }
+    if let Some(secs) = patch.network_timeout_secs {
+        if !NETWORK_TIMEOUT_CHOICES.contains(&secs) {
+            return Err(format!("不支持的联网超时：{secs} 秒"));
+        }
+    }
     state.config.update(|c| {
         if let Some(dir) = &patch.default_code_dir {
             c.settings.default_code_dir = Some(normalize_path(dir));
@@ -459,6 +475,11 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
             c.settings.commit_template =
                 if t.is_empty() || t == DEFAULT_COMMIT_TEMPLATE { None } else { Some(t.to_string()) };
         }
-        settings_of(c)
+        if let Some(secs) = patch.network_timeout_secs {
+            c.settings.network_timeout_secs = (secs != DEFAULT_NETWORK_TIMEOUT_SECS).then_some(secs);
+        }
+        let s = settings_of(c);
+        set_network_timeout(s.network_timeout_secs);
+        s
     })
 }

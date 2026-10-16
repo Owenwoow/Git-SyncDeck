@@ -21,7 +21,7 @@
   - 本次跳过：异常标记保留在主页，直到下次同步成功或刷新到"已同步"。
   - 打开终端（Windows Terminal，没有就用 cmd）或 VS Code。
 - **添加项目**：选择目录后递归扫描（最多 3 层），可按名称、路径、仓库搜索，勾选加入或取消监控。
-- **设置**：默认代码目录、自动提交的提交信息模板、浅色/深色主题、关于与检查更新。监控清单、设置、上次同步时间和遗留异常都会保存，重启后恢复。
+- **设置**：默认代码目录、联网超时、自动提交的提交信息模板、浅色/深色主题、关于与检查更新。监控清单、设置、上次同步时间和遗留异常都会保存，重启后恢复。
 
 ## 环境要求
 
@@ -105,7 +105,7 @@ cd src-tauri; cargo test -- --nocapture
 所有 git 子进程都从 `src-tauri/src/git.rs` 的 `run_git` 创建：
 
 - **不弹窗口、不等待输入**：`CREATE_NO_WINDOW`；`GIT_TERMINAL_PROMPT=0`；`GCM_INTERACTIVE=never`，没有已保存的凭据就直接报错，不弹登录窗口。
-- **中文和超时**：加 `-c core.quotepath=false`，输出按 UTF-8 解码。状态查询超时 10 秒，fetch / push / pull / commit 超时 60 秒，超时后终止。
+- **中文和超时**：加 `-c core.quotepath=false`，输出按 UTF-8 解码。状态查询超时 10 秒，fetch / push / pull / commit 的超时在设置里选（1、3、5、10 分钟，默认 3 分钟），超时后终止。fetch 只拉当前分支的上游，云端分支已删除时退回拉整个远程。
 - **白名单**：只允许 status、fetch、push（显式 refspec，不带 +）、pull（`--ff-only --no-rebase --no-autostash`）、add -A、commit -m、log、rev-parse、config 只读等。`--force`、reset、rebase、stash、clean、checkout、restore 等一律拒绝，有单元测试覆盖。
 - **不碰凭据**：远程地址和错误输出里的账号或 token 一律去掉后才显示或保存。
 - **不动文件**：取消监控只改清单，不删除任何文件或仓库。

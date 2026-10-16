@@ -33,7 +33,7 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 
 ### Rust 端
 
-- **所有 git 子进程只能从 `git.rs` 的 `run_git` 创建**。它负责：不弹窗口（`CREATE_NO_WINDOW`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`）、超时（状态查询 10 秒，联网 60 秒）、UTF-8 加 `core.quotepath=false`，还有**命令白名单**。force push、reset、rebase、stash、clean、checkout、restore 等一律拒绝，有单元测试覆盖。新增 git 操作要先扩白名单、再补测试。
+- **所有 git 子进程只能从 `git.rs` 的 `run_git` 创建**。它负责：不弹窗口（`CREATE_NO_WINDOW`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`）、超时（状态查询 10 秒；联网默认 180 秒，设置里可改，见 `network_timeout()`）、UTF-8 加 `core.quotepath=false`，还有**命令白名单**。force push、reset、rebase、stash、clean、checkout、restore 等一律拒绝，有单元测试覆盖。新增 git 操作要先扩白名单、再补测试。
 - `status.rs` 解析 `git status --porcelain=v2`，按固定优先级判定 7 种状态：未关联云端 > 有未提交改动 > 分叉 > 待推送 > 待拉取 > 已同步（"同步中"只在前端出现）。
 - `ops.rs`：fetch / push（显式 refspec，不带 `+`）/ `pull --ff-only --no-rebase --no-autostash` / 提交并推送 / 最近提交。拉取不是快进时判为分叉，绝不自动合并。
 - `commands.rs` 的 `AppState`：

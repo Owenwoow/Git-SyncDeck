@@ -113,6 +113,8 @@ export interface Settings {
   theme: Theme;
   /** 自动提交的提交信息模板，占位符 {date}、{host}；保存空值会恢复默认模板 */
   commitTemplate: string;
+  /** 联网操作（fetch、push、pull）的超时秒数，只能是 NETWORK_TIMEOUT_CHOICES 之一 */
+  networkTimeoutSecs: number;
 }
 
 /** 应用内更新：发现的新版本 */

@@ -12,6 +12,7 @@ use tauri::Manager;
 
 use git_syncdeck_lib::commands::{self, AppState, Shared};
 use git_syncdeck_lib::config::ConfigStore;
+use git_syncdeck_lib::git;
 use git_syncdeck_lib::model::{SettingsPatch, SyncStatus};
 
 fn fixtures(name: &str) -> PathBuf {
@@ -55,6 +56,20 @@ async fn full_command_flow() {
     assert!(commands::save_settings(app.state(), SettingsPatch { theme: Some("pink".into()), ..Default::default() })
         .await
         .is_err());
+
+    // 联网超时：默认 3 分钟；只接受固定几档；保存后立即生效
+    assert_eq!(s.network_timeout_secs, 180);
+    assert!(commands::save_settings(
+        app.state(),
+        SettingsPatch { network_timeout_secs: Some(42), ..Default::default() }
+    )
+    .await
+    .is_err());
+    let s = commands::save_settings(app.state(), SettingsPatch { network_timeout_secs: Some(600), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(s.network_timeout_secs, 600);
+    assert_eq!(git::network_timeout().as_secs(), 600);
 
     // 扫描：11 个仓库，都没监控
     let scanned = commands::scan_directory(app.state(), repos.to_string_lossy().into()).await.unwrap();
@@ -150,6 +165,7 @@ async fn full_command_flow() {
     assert_eq!(count, 11);
     assert_eq!(theme.as_deref(), Some("dark"));
     assert!(dirty_issue.is_none());
+    assert_eq!(reloaded.read(|c| c.settings.network_timeout_secs), Some(600));
 
     // 取消监控：只改清单，仓库目录还在
     commands::remove_project(app.state(), dirty_id).await.unwrap();

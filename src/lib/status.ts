@@ -219,6 +219,12 @@ function noRemoteReason(p: Project): string {
   return `分支 ${p.branch} 没有设置上游分支，不知道该推到哪里`;
 }
 
+// ---------------- 联网超时 ----------------
+
+/** 联网超时的默认值和可选值（秒），与 src-tauri/src/git.rs 一致 */
+export const DEFAULT_NETWORK_TIMEOUT_SECS = 180;
+export const NETWORK_TIMEOUT_CHOICES = [60, 180, 300, 600] as const;
+
 // ---------------- 自动提交 ----------------
 
 /** 默认的自动提交信息模板（与 src-tauri/src/util.rs 的 DEFAULT_COMMIT_TEMPLATE 一致） */

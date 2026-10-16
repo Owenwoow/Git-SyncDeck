@@ -21,6 +21,8 @@ pub struct StoredSettings {
     pub theme: Option<String>,
     /// 自动提交的提交信息模板；None 表示用默认模板
     pub commit_template: Option<String>,
+    /// 联网超时（秒）；None 表示用默认值
+    pub network_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +100,7 @@ mod tests {
         let c: AppConfig = serde_json::from_str(old).unwrap();
         assert_eq!(c.settings.theme.as_deref(), Some("dark"));
         assert!(c.settings.commit_template.is_none());
+        assert!(c.settings.network_timeout_secs.is_none());
         assert_eq!(c.projects.len(), 1);
         assert!(!c.projects[0].auto_commit);
         assert_eq!(c.projects[0].issue.as_deref(), Some("有改动"));

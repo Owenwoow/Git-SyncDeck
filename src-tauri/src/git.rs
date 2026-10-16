@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -15,8 +16,21 @@ use crate::url::redact;
 
 /// 状态查询类命令（status、config、log……）的超时
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
-/// 联网或写入类命令（fetch、push、pull、add、commit）的超时
-pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
+/// 联网或写入类命令（fetch、push、pull、add、commit）的默认超时，可在设置里改
+pub const DEFAULT_NETWORK_TIMEOUT_SECS: u64 = 180;
+/// 设置里可选的联网超时（秒）：1、3、5、10 分钟
+pub const NETWORK_TIMEOUT_CHOICES: [u64; 4] = [60, 180, 300, 600];
+
+static NETWORK_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_NETWORK_TIMEOUT_SECS);
+
+/// 当前的联网超时（启动时和保存设置时由 `set_network_timeout` 更新）
+pub fn network_timeout() -> Duration {
+    Duration::from_secs(NETWORK_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
+
+pub fn set_network_timeout(secs: u64) {
+    NETWORK_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;

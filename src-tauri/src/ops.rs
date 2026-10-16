@@ -3,14 +3,24 @@
 
 use std::path::Path;
 
-use crate::git::{run_git, GitError, NETWORK_TIMEOUT, STATUS_TIMEOUT};
+use crate::git::{network_timeout, run_git, GitError, STATUS_TIMEOUT};
 use crate::model::{CommitInfo, SyncOutcome, SyncStatus};
 use crate::status::{inspect, issue_text, no_remote_reason, read_config, Inspection, DETACHED};
 use crate::url::sanitize_url;
 
+/// 只 fetch 上游分支（下载量和 pull 一样，分支、标签多的仓库不会因为下载其他分支而超时）。
+/// 上游分支在本地已没有远程跟踪分支，或者按分支 fetch 失败（如云端分支已删除）时，退回 fetch 整个远程；
+/// 超时不退回，免得再等一轮。
 pub async fn fetch(dir: &Path, ins: &Inspection) -> Result<(), GitError> {
     let remote = ins.remote_name.as_deref().unwrap_or("origin");
-    run_git(dir, &["fetch", "--quiet", remote], NETWORK_TIMEOUT).await.map(|_| ())
+    if let (Some(branch), false) = (ins.upstream_branch.as_deref(), ins.upstream_gone) {
+        match run_git(dir, &["fetch", "--quiet", remote, branch], network_timeout()).await {
+            Ok(_) => return Ok(()),
+            Err(e @ GitError::Timeout { .. }) => return Err(e),
+            Err(_) => {}
+        }
+    }
+    run_git(dir, &["fetch", "--quiet", remote], network_timeout()).await.map(|_| ())
 }
 
 /// 推送当前分支到它的上游（显式写出 refspec，不加 +，远程拒绝时不会强推）
@@ -18,7 +28,7 @@ pub async fn push(dir: &Path, ins: &Inspection) -> Result<(), GitError> {
     let remote = ins.remote_name.as_deref().unwrap_or("origin");
     let target = ins.upstream_branch.as_deref().unwrap_or(&ins.branch);
     let refspec = format!("refs/heads/{}:refs/heads/{}", ins.branch, target);
-    run_git(dir, &["push", "--quiet", remote, &refspec], NETWORK_TIMEOUT).await.map(|_| ())
+    run_git(dir, &["push", "--quiet", remote, &refspec], network_timeout()).await.map(|_| ())
 }
 
 /// 只快进拉取。--no-rebase / --no-autostash 防止全局配置（pull.rebase、autostash）让它变成变基或自动 stash
@@ -28,7 +38,7 @@ pub async fn pull_ff_only(dir: &Path, ins: &Inspection) -> Result<(), GitError> 
     run_git(
         dir,
         &["pull", "--ff-only", "--no-rebase", "--no-autostash", "--quiet", remote, target],
-        NETWORK_TIMEOUT,
+        network_timeout(),
     )
     .await
     .map(|_| ())
@@ -169,11 +179,11 @@ async fn auto_commit_and_push(dir: &Path, ins: Inspection, message: &str) -> Syn
         }
     }
 
-    if let Err(e) = run_git(dir, &["add", "-A"], NETWORK_TIMEOUT).await {
+    if let Err(e) = run_git(dir, &["add", "-A"], network_timeout()).await {
         let reason = format!("自动提交失败（暂存改动时出错），未提交任何内容：{}", e.message());
         return SyncOne::failed(reason, Some(reinspect(dir, ins.clone()).await), false);
     }
-    if let Err(e) = run_git(dir, &["commit", "--quiet", "-m", message], NETWORK_TIMEOUT).await {
+    if let Err(e) = run_git(dir, &["commit", "--quiet", "-m", message], network_timeout()).await {
         let reason = format!("自动提交失败，未提交任何内容：{}", e.message());
         return SyncOne::failed(reason, Some(reinspect(dir, ins.clone()).await), false);
     }
@@ -228,10 +238,10 @@ pub async fn commit_and_push(dir: &Path, message: &str) -> Result<Inspection, St
         _ => return Err("这个项目没有需要提交的改动".into()),
     }
 
-    run_git(dir, &["add", "-A"], NETWORK_TIMEOUT)
+    run_git(dir, &["add", "-A"], network_timeout())
         .await
         .map_err(|e| format!("暂存改动失败：{}", e.message()))?;
-    run_git(dir, &["commit", "--quiet", "-m", message], NETWORK_TIMEOUT)
+    run_git(dir, &["commit", "--quiet", "-m", message], network_timeout())
         .await
         .map_err(|e| format!("提交失败：{}", e.message()))?;
 

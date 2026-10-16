@@ -102,10 +102,10 @@ function systemTheme(): Theme {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-type StoredSettings = { defaultCodeDir: string; theme: Theme | null; commitTemplate: string };
+type StoredSettings = Omit<Settings, "theme"> & { theme: Theme | null };
 
 function toSettings(s: StoredSettings): Settings {
-  return { defaultCodeDir: s.defaultCodeDir, theme: s.theme ?? systemTheme(), commitTemplate: s.commitTemplate };
+  return { ...s, theme: s.theme ?? systemTheme() };
 }
 
 export async function getSettings(): Promise<Settings> {
