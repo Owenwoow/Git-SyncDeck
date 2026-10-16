@@ -39,7 +39,7 @@ export function listProjects(): Promise<Project[]> {
   return call("list_projects");
 }
 
-/** git fetch + git status，最多 4 个项目并行 */
+/** git fetch + git status，最多 8 个项目并行 */
 export function refreshStatus(): Promise<Project[]> {
   return call("refresh_status");
 }

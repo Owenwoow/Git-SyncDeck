@@ -20,7 +20,7 @@ export interface SyncState {
   order: string[];
   /** 同步开始时各项目的原始状态（用来显示"正在推送 2 个提交"之类的文字） */
   before: Record<string, Pick<Project, "status" | "ahead" | "behind">>;
-  /** 正在处理的项目（最多 4 个并行） */
+  /** 正在处理的项目（最多 8 个并行） */
   activeIds: string[];
   doneCount: number;
   results: Record<string, SyncItemResult>;

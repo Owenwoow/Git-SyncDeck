@@ -5,8 +5,8 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-/// 同时处理的项目数上限
-pub const CONCURRENCY: usize = 4;
+/// 同时处理的项目数上限（联网检查主要在等网络，常见的项目数基本可以同时进行）
+pub const CONCURRENCY: usize = 8;
 
 /// 并发执行，最多同时 `limit` 个，结果按输入顺序返回
 pub async fn map_limited<T, R, F, Fut>(items: Vec<T>, limit: usize, f: F) -> Vec<R>
