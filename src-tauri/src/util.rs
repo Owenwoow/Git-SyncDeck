@@ -105,10 +105,19 @@ pub fn commit_message_now(template: &str) -> String {
 
 // ---------------- Windows 系统代理 ----------------
 
-/// 读取 Windows 的系统代理（HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings），
-/// 返回 git 能用的代理地址；没开、用了 PAC 或读不到时返回 None
+/// Windows 系统代理
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemProxy {
+    /// git 能用的代理地址
+    pub addr: String,
+    /// 绕过列表（ProxyOverride）转成的 NO_PROXY；转不出来时为 None
+    pub no_proxy: Option<String>,
+}
+
+/// 读取 Windows 的系统代理（HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings）；
+/// 没开、用了 PAC 或读不到时返回 None
 #[cfg(windows)]
-pub fn windows_system_proxy() -> Option<String> {
+pub fn windows_system_proxy() -> Option<SystemProxy> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let key = RegKey::predef(HKEY_CURRENT_USER)
@@ -117,23 +126,30 @@ pub fn windows_system_proxy() -> Option<String> {
     let enable: u32 = key.get_value("ProxyEnable").unwrap_or(0);
     let server: Option<String> = key.get_value("ProxyServer").ok();
     let pac: Option<String> = key.get_value("AutoConfigURL").ok();
-    system_proxy_from(enable, server.as_deref(), pac.as_deref())
+    let bypass: Option<String> = key.get_value("ProxyOverride").ok();
+    system_proxy_from(enable, server.as_deref(), pac.as_deref(), bypass.as_deref())
 }
 
 #[cfg(not(windows))]
-pub fn windows_system_proxy() -> Option<String> {
+pub fn windows_system_proxy() -> Option<SystemProxy> {
     None
 }
 
-/// 由注册表里的三个值决定系统代理：
+/// 由注册表里的几个值决定系统代理：
 /// - 用了 PAC（AutoConfigURL 非空）→ 不支持，当作没有系统代理
 /// - ProxyEnable 不是 1，或 ProxyServer 为空 / 解析不出地址 → 没有
-/// - 否则按 `parse_windows_proxy_server` 转成代理地址
-pub fn system_proxy_from(enable: u32, server: Option<&str>, auto_config_url: Option<&str>) -> Option<String> {
+/// - 否则按 `parse_windows_proxy_server` 转成代理地址，绕过列表（ProxyOverride）转成 NO_PROXY
+pub fn system_proxy_from(
+    enable: u32,
+    server: Option<&str>,
+    auto_config_url: Option<&str>,
+    bypass: Option<&str>,
+) -> Option<SystemProxy> {
     if auto_config_url.is_some_and(|u| !u.trim().is_empty()) || enable != 1 {
         return None;
     }
-    crate::url::parse_windows_proxy_server(server?)
+    let addr = crate::url::parse_windows_proxy_server(server?)?;
+    Some(SystemProxy { addr, no_proxy: bypass.and_then(crate::url::windows_bypass_to_no_proxy) })
 }
 
 #[cfg(test)]
@@ -142,17 +158,27 @@ mod tests {
 
     #[test]
     fn system_proxy_rules() {
+        let addr = |enable, server, pac| system_proxy_from(enable, server, pac, None).map(|p| p.addr);
         let server = Some("127.0.0.1:10808");
-        assert_eq!(system_proxy_from(1, server, None).as_deref(), Some("http://127.0.0.1:10808"));
-        assert_eq!(system_proxy_from(1, server, Some("")).as_deref(), Some("http://127.0.0.1:10808"), "空的 PAC 地址不算");
-        assert_eq!(system_proxy_from(0, server, None), None, "系统代理没开");
-        assert_eq!(system_proxy_from(1, None, None), None, "开了但没填地址");
-        assert_eq!(system_proxy_from(1, Some(""), None), None);
-        assert_eq!(system_proxy_from(1, server, Some("http://127.0.0.1:7890/pac")), None, "用了 PAC 当作没有");
+        assert_eq!(addr(1, server, None).as_deref(), Some("http://127.0.0.1:10808"));
+        assert_eq!(addr(1, server, Some("")).as_deref(), Some("http://127.0.0.1:10808"), "空的 PAC 地址不算");
+        assert_eq!(addr(0, server, None), None, "系统代理没开");
+        assert_eq!(addr(1, None, None), None, "开了但没填地址");
+        assert_eq!(addr(1, Some(""), None), None);
+        assert_eq!(addr(1, server, Some("http://127.0.0.1:7890/pac")), None, "用了 PAC 当作没有");
+        assert_eq!(addr(1, Some("http=127.0.0.1:1;socks=127.0.0.1:2"), None).as_deref(), Some("http://127.0.0.1:1"));
+
+        // 绕过列表转成 NO_PROXY；没有或转不出来时为 None
         assert_eq!(
-            system_proxy_from(1, Some("http=127.0.0.1:1;socks=127.0.0.1:2"), None).as_deref(),
-            Some("http://127.0.0.1:1")
+            system_proxy_from(1, server, None, Some("localhost;192.168.*;*.corp.local;<local>")),
+            Some(SystemProxy {
+                addr: "http://127.0.0.1:10808".into(),
+                no_proxy: Some("localhost,192.168.0.0/16,.corp.local,127.0.0.1,::1".into()),
+            })
         );
+        assert_eq!(system_proxy_from(1, server, None, Some("")).unwrap().no_proxy, None);
+        assert_eq!(system_proxy_from(1, server, None, Some("host:8080")).unwrap().no_proxy, None);
+        assert_eq!(system_proxy_from(0, server, None, Some("localhost")), None);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::git::{
     DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES,
 };
 use crate::ops::GitProxyConfig;
+use crate::util::SystemProxy;
 use crate::url::{display_proxy, validate_proxy_url};
 use crate::{scan, system, util};
 
@@ -198,15 +199,15 @@ pub struct ResolvedProxy {
 /// - `manual`：用手动填写的地址（`manual_url` 为已校验的地址；没有时按自动处理），按网址设置的代理也盖住
 /// - `auto`：git 自己配了代理 → 不覆盖。"git 自己的代理"按 git 的优先级看：`http.proxy`（写成空值表示
 ///   明确不用代理）、https 用的代理环境变量（`env_proxy`）、按网址设置的非空代理。
-///   都没有而系统代理开着（`system_proxy`）→ 用系统代理；都没有 → 不覆盖，也就是不用代理
+///   都没有而系统代理开着（`system_proxy`）→ 用系统代理（连同它的绕过列表）；都没有 → 不覆盖，也就是不用代理
 pub fn decide_proxy(
     mode: &str,
     manual_url: Option<&str>,
     git: &GitProxyConfig,
     env_proxy: Option<&str>,
-    system_proxy: Option<&str>,
+    system_proxy: Option<&SystemProxy>,
 ) -> ResolvedProxy {
-    let plan = |over| ProxyPlan { over, url_scopes: git.url_scopes() };
+    let plan = |over| ProxyPlan { over, url_scopes: git.url_scopes(), no_proxy: None };
     let none = |plan| ResolvedProxy { plan, source: ProxySource::NoProxy, effective: None };
     let own = |effective: String| ResolvedProxy {
         plan: ProxyOverride::Inherit.into(),
@@ -240,9 +241,13 @@ pub fn decide_proxy(
             (None, Some(d), _) => own(d),
             // 用系统代理时不碰按网址的设置：能走到这里，它们都是"这个网址不用代理"
             (None, None, Some(sys)) => ResolvedProxy {
-                plan: ProxyOverride::Use(sys.to_string()).into(),
+                plan: ProxyPlan {
+                    over: ProxyOverride::Use(sys.addr.clone()),
+                    url_scopes: Vec::new(),
+                    no_proxy: sys.no_proxy.clone(),
+                },
                 source: ProxySource::System,
-                effective: Some(display_proxy(sys)),
+                effective: Some(display_proxy(&sys.addr)),
             },
             (None, None, None) => none(ProxyOverride::Inherit.into()),
         },
@@ -269,7 +274,7 @@ async fn refresh_proxy(st: &AppState) -> ResolvedProxy {
     let git = ops::git_proxy_config().await;
     let env_proxy = if auto { proxy_from_env(|k| std::env::var(k).ok()) } else { None };
     let system_proxy = if auto { util::windows_system_proxy() } else { None };
-    let resolved = decide_proxy(mode, manual.as_deref(), &git, env_proxy.as_deref(), system_proxy.as_deref());
+    let resolved = decide_proxy(mode, manual.as_deref(), &git, env_proxy.as_deref(), system_proxy.as_ref());
     set_proxy_plan(resolved.plan.clone());
     resolved
 }
@@ -713,7 +718,12 @@ mod tests {
         };
         let nothing = cfg(None, &[]);
         let git = cfg(Some("socks5://127.0.0.1:10808"), &[]);
-        let sys = Some("http://127.0.0.1:10809");
+        let system = |addr: &str, no_proxy: Option<&str>| SystemProxy {
+            addr: addr.to_string(),
+            no_proxy: no_proxy.map(str::to_string),
+        };
+        let sys_proxy = system("http://127.0.0.1:10809", None);
+        let sys = Some(&sys_proxy);
 
         // 自动：git 自己配了代理 → 不覆盖
         assert_eq!(
@@ -739,7 +749,7 @@ mod tests {
         );
         // 显示的地址去掉账号密码，交给 git 的保留原样
         assert_eq!(
-            decide_proxy("auto", None, &nothing, None, Some("http://u:p@127.0.0.1:1")),
+            decide_proxy("auto", None, &nothing, None, Some(&system("http://u:p@127.0.0.1:1", None))),
             r(ProxyOverride::Use("http://u:p@127.0.0.1:1".into()), ProxySource::System, Some("http://127.0.0.1:1"))
         );
         assert_eq!(
@@ -764,6 +774,21 @@ mod tests {
             decide_proxy("auto", None, &direct_only, None, sys),
             r(ProxyOverride::Use("http://127.0.0.1:10809".into()), ProxySource::System, Some("http://127.0.0.1:10809"))
         );
+
+        // 自动 + 系统代理：系统的绕过列表带进 NO_PROXY
+        let with_bypass = system("http://127.0.0.1:10809", Some("localhost,192.168.0.0/16"));
+        let r_sys = decide_proxy("auto", None, &nothing, None, Some(&with_bypass));
+        assert_eq!(r_sys.plan.over, ProxyOverride::Use("http://127.0.0.1:10809".into()));
+        assert_eq!(r_sys.plan.no_proxy.as_deref(), Some("localhost,192.168.0.0/16"));
+        assert!(r_sys.plan.url_scopes.is_empty());
+        // 手动 / 不用代理 / git 自己的代理时不带系统的绕过列表
+        for r in [
+            decide_proxy("manual", Some("http://127.0.0.1:7890"), &nothing, None, Some(&with_bypass)),
+            decide_proxy("off", None, &nothing, None, Some(&with_bypass)),
+            decide_proxy("auto", None, &git, None, Some(&with_bypass)),
+        ] {
+            assert_eq!(r.plan.no_proxy, None, "{r:?}");
+        }
 
         // 不用代理：不管 git 和系统怎么配，都完全不走代理，按网址配的代理也盖住
         assert_eq!(decide_proxy("off", None, &git, None, sys), r(ProxyOverride::Disable, ProxySource::NoProxy, None));

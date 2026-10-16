@@ -121,6 +121,79 @@ pub fn parse_windows_proxy_server(s: &str) -> Option<String> {
     validate_proxy_url(&url).ok()
 }
 
+/// 把 Windows 系统代理的绕过列表（注册表 ProxyOverride，如 `localhost;127.*;192.168.*;*.corp.local;<local>`）
+/// 尽量转成 git（libcurl）认的 NO_PROXY（逗号分隔）：
+/// - `*.corp.local` → `.corp.local`（后缀匹配）
+/// - `192.168.*`、`10.*.*.*` 这类 IP 前缀 → `192.168.0.0/16`、`10.0.0.0/8`
+/// - `<local>`（不带点的主机名）curl 表达不了，换成 `localhost,127.0.0.1,::1`
+/// - 普通主机名、IP、CIDR 原样保留；单独一个 `*` 表示全部绕过，原样保留
+/// - 其他转不了的（带端口、带协议、通配符在中间等）丢掉
+///
+/// 一条都转不出来时返回 None。
+pub fn windows_bypass_to_no_proxy(list: &str) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    for entry in list.split([';', ',', ' ', '\t', '\r', '\n']).map(str::trim).filter(|e| !e.is_empty()) {
+        let entry = entry.to_ascii_lowercase();
+        if entry == "<local>" {
+            ["localhost", "127.0.0.1", "::1"].into_iter().for_each(|s| push(s.to_string()));
+        } else if let Some(converted) = convert_bypass_entry(&entry) {
+            push(converted);
+        }
+    }
+    (!out.is_empty()).then(|| out.join(","))
+}
+
+fn convert_bypass_entry(entry: &str) -> Option<String> {
+    if entry == "*" {
+        return Some("*".into());
+    }
+    // *.corp.local → .corp.local
+    if let Some(suffix) = entry.strip_prefix("*.") {
+        return is_host_name(suffix).then(|| format!(".{suffix}"));
+    }
+    // 192.168.* → 192.168.0.0/16
+    if entry.contains('*') {
+        let parts: Vec<&str> = entry.split('.').collect();
+        let fixed = parts.iter().take_while(|p| **p != "*").count();
+        let octets_ok = parts[..fixed].iter().all(|p| p.parse::<u8>().is_ok() && !p.starts_with('+'));
+        let rest_all_star = parts[fixed..].iter().all(|p| *p == "*");
+        if parts.len() > 4 || fixed == 0 || !octets_ok || !rest_all_star {
+            return None;
+        }
+        let mut octets: Vec<&str> = parts[..fixed].to_vec();
+        octets.resize(4, "0");
+        return Some(format!("{}/{}", octets.join("."), fixed * 8));
+    }
+    // IPv6（可能带方括号）、IPv4、CIDR
+    let bare = entry.strip_prefix('[').and_then(|e| e.strip_suffix(']')).unwrap_or(entry);
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return Some(bare.to_string());
+    }
+    if let Some((ip, bits)) = bare.split_once('/') {
+        let max = match ip.parse::<std::net::IpAddr>().ok()? {
+            std::net::IpAddr::V4(_) => 32,
+            std::net::IpAddr::V6(_) => 128,
+        };
+        return bits.parse::<u8>().ok().filter(|b| *b <= max).map(|_| bare.to_string());
+    }
+    // 普通主机名（.corp.local 这种前面带点的也行）
+    let host = entry.strip_prefix('.').unwrap_or(entry);
+    is_host_name(host).then(|| entry.to_string())
+}
+
+/// 只由字母、数字、点、连字符、下划线组成的主机名（不带端口、通配符、协议）
+fn is_host_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
 /// 显示用的代理地址：去掉账号密码（带不带协议都处理）
 pub fn display_proxy(addr: &str) -> String {
     let s = redact(addr.trim());
@@ -187,6 +260,30 @@ mod tests {
         for none in ["", " ; ", "ftp=1.1.1.1:21", "127.0.0.1", "https=代理"] {
             assert_eq!(p(none), None, "{none:?}");
         }
+    }
+
+    #[test]
+    fn converts_windows_bypass_list() {
+        let c = |s: &str| windows_bypass_to_no_proxy(s);
+        // 常见代理软件写进注册表的默认绕过列表
+        assert_eq!(
+            c("localhost;127.*;10.*;172.16.*;172.31.*;192.168.*;*.local;<local>").as_deref(),
+            Some("localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/16,172.31.0.0/16,192.168.0.0/16,.local,127.0.0.1,::1")
+        );
+        assert_eq!(c("*.corp.local").as_deref(), Some(".corp.local"));
+        assert_eq!(c("*.Corp.Local").as_deref(), Some(".corp.local"), "统一小写");
+        assert_eq!(c("192.168.1.*").as_deref(), Some("192.168.1.0/24"));
+        assert_eq!(c("10.*.*.*").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(c("<LOCAL>").as_deref(), Some("localhost,127.0.0.1,::1"));
+        assert_eq!(c("git.corp.local; 10.1.2.3 ;.intra").as_deref(), Some("git.corp.local,10.1.2.3,.intra"));
+        assert_eq!(c("10.0.0.0/8;[::1];fd00::/8").as_deref(), Some("10.0.0.0/8,::1,fd00::/8"));
+        assert_eq!(c("*").as_deref(), Some("*"));
+        assert_eq!(c("localhost;127.0.0.1;<local>").as_deref(), Some("localhost,127.0.0.1,::1"), "去重");
+        // 转不了的丢掉
+        for bad in ["", " ; ", "*corp*", "foo.*.com", "*.*.*.*", "192.168.*.1", "300.*", "1.2.3.4.*", "host:8080", "http://git.corp", "*.", "代理.local", "10.0.0.0/33"] {
+            assert_eq!(c(bad), None, "{bad:?}");
+        }
+        assert_eq!(c("host:8080;*.ok.com;192.168.*.1").as_deref(), Some(".ok.com"), "只丢掉转不了的那几条");
     }
 
     #[test]

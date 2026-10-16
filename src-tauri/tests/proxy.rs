@@ -75,6 +75,17 @@ async fn proxy_override_reaches_git() {
     let e = fetch_with(&repo, "禁用", ProxyOverride::Disable.into()).await;
     assert!(no_proxy_used(&e), "不应该走任何代理：{e}");
 
+    // 使用代理 + 绕过列表（系统代理的 ProxyOverride 转来的 NO_PROXY）：命中的地址直连
+    let bypass = |no_proxy: &str| ProxyPlan {
+        over: ProxyOverride::Use("http://127.0.0.1:8".into()),
+        url_scopes: Vec::new(),
+        no_proxy: Some(no_proxy.into()),
+    };
+    let e = fetch_with(&repo, "使用 127.0.0.1:8，绕过 .invalid", bypass("localhost,.invalid")).await;
+    assert!(no_proxy_used(&e), "绕过列表里的地址不应该走代理：{e}");
+    let e = fetch_with(&repo, "使用 127.0.0.1:8，绕过别的地址", bypass("localhost,192.168.0.0/16")).await;
+    assert!(e.contains("127.0.0.1 port 8"), "不在绕过列表里的地址照常走代理：{e}");
+
     // ---------------- git 全局配置里按网址设置了代理（http.<网址>.proxy）----------------
     std::fs::write(&fake_global, format!("[http \"{HOST}\"]\n\tproxy = http://127.0.0.1:7\n")).unwrap();
     let cfg = ops::git_proxy_config().await;
@@ -86,7 +97,7 @@ async fn proxy_override_reaches_git() {
     assert!(e.contains("127.0.0.1 port 7"), "只盖 http.proxy 时仍会走按网址的代理：{e}");
 
     // 把这些网址也盖住
-    let scoped = |over| ProxyPlan { over, url_scopes: cfg.url_scopes() };
+    let scoped = |over| ProxyPlan { over, url_scopes: cfg.url_scopes(), no_proxy: None };
     let e = fetch_with(&repo, "禁用（含按网址的设置）", scoped(ProxyOverride::Disable)).await;
     assert!(no_proxy_used(&e), "不应该走任何代理：{e}");
     let e = fetch_with(&repo, "使用 127.0.0.1:8（含按网址的设置）", scoped(ProxyOverride::Use("http://127.0.0.1:8".into()))).await;

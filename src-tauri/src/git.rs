@@ -69,6 +69,8 @@ pub struct ProxyPlan {
     /// git 配置里单独设了代理的网址（`http.<网址>.proxy` 的 `<网址>`）。按网址的设置比 http.proxy 优先，
     /// 所以 Use / Disable 时对这些网址也要用 `-c http.<网址>.proxy=…` 盖住
     pub url_scopes: Vec<String>,
+    /// 不走代理的地址（curl 的 NO_PROXY 格式），只在 Use 时生效；用系统代理时来自系统的绕过列表
+    pub no_proxy: Option<String>,
 }
 
 impl From<ProxyOverride> for ProxyPlan {
@@ -77,7 +79,8 @@ impl From<ProxyOverride> for ProxyPlan {
     }
 }
 
-static PROXY_PLAN: RwLock<ProxyPlan> = RwLock::new(ProxyPlan { over: ProxyOverride::Inherit, url_scopes: Vec::new() });
+static PROXY_PLAN: RwLock<ProxyPlan> =
+    RwLock::new(ProxyPlan { over: ProxyOverride::Inherit, url_scopes: Vec::new(), no_proxy: None });
 
 pub fn set_proxy_plan(p: ProxyPlan) {
     *PROXY_PLAN.write().unwrap_or_else(|e| e.into_inner()) = p;
@@ -121,6 +124,20 @@ pub fn proxy_env_removals(p: &ProxyPlan) -> &'static [&'static str] {
         ProxyOverride::Disable => &PROXY_ENV_VARS,
         _ => &[],
     }
+}
+
+/// 代理设置要给子进程设置的环境变量：使用代理且有绕过列表时设置 NO_PROXY（git 在配了 http.proxy 时也会读它）。
+/// `existing` 是本进程已有的 NO_PROXY，两者合并，不丢掉用户自己设的。
+pub fn proxy_env_sets(p: &ProxyPlan, existing: Option<String>) -> Vec<(&'static str, String)> {
+    let (ProxyOverride::Use(_), Some(ours)) = (&p.over, &p.no_proxy) else {
+        return Vec::new();
+    };
+    let merged = match existing.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("{e},{ours}"),
+        None => ours.clone(),
+    };
+    // Windows 上环境变量不分大小写，两个名字其实是同一个；别的系统上 curl 先看小写的
+    vec![("NO_PROXY", merged.clone()), ("no_proxy", merged)]
 }
 
 /// 环境变量里给 https 地址用的代理（按 `HTTPS_PROXY_ENV_VARS` 的顺序取第一个非空的）。
@@ -248,6 +265,10 @@ pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<Git
         .kill_on_drop(true);
     for var in proxy_env_removals(&proxy) {
         cmd.env_remove(var);
+    }
+    let existing_no_proxy = std::env::var("no_proxy").or_else(|_| std::env::var("NO_PROXY")).ok();
+    for (var, value) in proxy_env_sets(&proxy, existing_no_proxy) {
+        cmd.env(var, value);
     }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -475,6 +496,7 @@ mod tests {
         let plan = |over: ProxyOverride, urls: &[&str]| ProxyPlan {
             over,
             url_scopes: urls.iter().map(|u| u.to_string()).collect(),
+            no_proxy: None,
         };
         let urls = ["https://github.com", "https://GitLab.Corp"];
 
@@ -510,6 +532,31 @@ mod tests {
             assert!(removed.contains(&var), "禁用代理时应去掉 {var}");
         }
         assert_eq!(removed.len(), PROXY_ENV_VARS.len());
+    }
+
+    #[test]
+    fn no_proxy_env_only_with_system_bypass() {
+        use super::{proxy_env_sets, ProxyOverride, ProxyPlan};
+        let with = |over: ProxyOverride, no_proxy: Option<&str>| ProxyPlan {
+            over,
+            url_scopes: Vec::new(),
+            no_proxy: no_proxy.map(str::to_string),
+        };
+        let use_sys = with(ProxyOverride::Use("http://127.0.0.1:10808".into()), Some("localhost,192.168.0.0/16"));
+        assert_eq!(
+            proxy_env_sets(&use_sys, None),
+            [("NO_PROXY", "localhost,192.168.0.0/16".to_string()), ("no_proxy", "localhost,192.168.0.0/16".to_string())]
+        );
+        // 用户自己设的 NO_PROXY 不丢
+        assert_eq!(
+            proxy_env_sets(&use_sys, Some("git.corp".into()))[0],
+            ("NO_PROXY", "git.corp,localhost,192.168.0.0/16".to_string())
+        );
+        assert_eq!(proxy_env_sets(&use_sys, Some("  ".into()))[0].1, "localhost,192.168.0.0/16");
+        // 没有绕过列表、不覆盖、禁用时都不设
+        assert!(proxy_env_sets(&with(ProxyOverride::Use("http://h:1".into()), None), None).is_empty());
+        assert!(proxy_env_sets(&with(ProxyOverride::Inherit, Some("localhost")), None).is_empty());
+        assert!(proxy_env_sets(&with(ProxyOverride::Disable, Some("localhost")), None).is_empty());
     }
 
     #[test]
