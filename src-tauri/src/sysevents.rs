@@ -1,5 +1,10 @@
 //! Windows 系统事件：锁屏 / 解锁、睡眠 / 唤醒、关机 / 重启 / 注销。
-//! 起一个隐藏的顶层窗口和它自己的消息循环线程（message-only 窗口收不到广播和关机消息）：
+//! 起一个看不见的顶层窗口和它自己的消息循环线程（message-only 窗口收不到广播和关机消息）。
+//! 这个窗口必须"可见"（WS_VISIBLE，但 0×0、不进任务栏和 Alt+Tab、不抢焦点）：Windows 不允许没有可见窗口的
+//! 程序阻止关机，5 秒内不回复 WM_QUERYENDSESSION 就直接结束进程。开机自启（从没弹窗口）或主窗口关到托盘时，
+//! 这是整个进程唯一的可见窗口。
+//!
+//! 监听的事件：
 //! - `WTSRegisterSessionNotification`：锁屏 → 离开；解锁 → 到达
 //! - `WM_POWERBROADCAST`：`PBT_APMSUSPEND` → 离开（Windows 只给几秒，尽力而为，不阻塞）；
 //!   `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` → 到达
@@ -46,8 +51,8 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage,
         ENDSESSION_CLOSEAPP, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WM_ENDSESSION,
-        WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
-        WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+        WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_POPUP, WS_VISIBLE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
     };
 
     use super::{Handlers, SysEvent};
@@ -87,6 +92,16 @@ mod imp {
     }
 
     unsafe fn create_window() -> Result<(), String> {
+        let hwnd = create_event_window()?;
+        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
+            // 收不到锁屏 / 解锁，睡眠和关机照常
+            eprintln!("注册锁屏通知失败：{}", std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// 注册窗口类并创建接收系统事件的窗口（在调用线程里，消息也要在这个线程里取）
+    pub(super) unsafe fn create_event_window() -> Result<HWND, String> {
         let hinstance = GetModuleHandleW(std::ptr::null());
         let class = wide(CLASS_NAME);
         let wc = WNDCLASSW {
@@ -99,12 +114,13 @@ mod imp {
             return Err(format!("注册窗口类失败：{}", std::io::Error::last_os_error()));
         }
         let title = wide("Git SyncDeck 系统事件");
-        // 不带 WS_VISIBLE：顶层窗口但不显示，能收到广播和关机消息
+        // 顶层窗口，能收到广播和关机消息。带 WS_VISIBLE 让系统把它当作可见窗口（这样关机时才允许它阻止关机，
+        // 见文件开头），但 0×0 大小、WS_EX_TOOLWINDOW 不进任务栏和 Alt+Tab、WS_EX_NOACTIVATE 不抢焦点，用户看不到
         let hwnd: HWND = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPED,
+            WS_POPUP | WS_VISIBLE,
             0,
             0,
             0,
@@ -115,13 +131,9 @@ mod imp {
             std::ptr::null(),
         );
         if hwnd.is_null() {
-            return Err(format!("创建隐藏窗口失败：{}", std::io::Error::last_os_error()));
+            return Err(format!("创建系统事件窗口失败：{}", std::io::Error::last_os_error()));
         }
-        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
-            // 收不到锁屏 / 解锁，睡眠和关机照常
-            eprintln!("注册锁屏通知失败：{}", std::io::Error::last_os_error());
-        }
-        Ok(())
+        Ok(hwnd)
     }
 
     unsafe fn message_loop() {
@@ -190,6 +202,31 @@ mod imp {
                 0
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DestroyWindow, GetWindowLongW, GetWindowRect, IsWindowVisible, GWL_EXSTYLE, WS_EX_APPWINDOW,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        };
+
+        /// 系统只允许有可见窗口的程序阻止关机：事件窗口要"可见"，但 0×0、不进任务栏、不抢焦点
+        #[test]
+        fn event_window_counts_as_visible_but_takes_no_space() {
+            unsafe {
+                let hwnd = super::create_event_window().unwrap();
+                assert!(IsWindowVisible(hwnd) != 0, "必须是可见窗口，否则关机时 5 秒就被结束");
+                let mut rect: RECT = std::mem::zeroed();
+                assert!(GetWindowRect(hwnd, &mut rect) != 0);
+                assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (0, 0), "0×0，用户看不到");
+                let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+                assert!(ex & WS_EX_TOOLWINDOW != 0 && ex & WS_EX_APPWINDOW == 0, "不进任务栏和 Alt+Tab");
+                assert!(ex & WS_EX_NOACTIVATE != 0, "不抢焦点");
+                DestroyWindow(hwnd);
+            }
         }
     }
 }
