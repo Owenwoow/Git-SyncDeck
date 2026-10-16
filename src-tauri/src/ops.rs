@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::git::{network_timeout, run_git, GitError, STATUS_TIMEOUT};
+use crate::git::{network_timeout, proxy_from_env, run_git, GitError, STATUS_TIMEOUT};
 use crate::model::{CommitInfo, SyncOutcome, SyncStatus};
 use crate::status::{inspect, issue_text, no_remote_reason, read_config, Inspection, DETACHED};
 use crate::url::sanitize_url;
@@ -315,6 +315,19 @@ pub async fn repo_brief(dir: &Path) -> (String, Option<String>) {
         origin.map(|(_, u)| sanitize_url(u))
     });
     (branch, remote)
+}
+
+/// git 自己的代理：先看全局 / 系统级 git 配置里的 http.proxy（全局优先），没配置再看环境变量。
+/// 返回 Some("") 表示 git 配置里明确写了空值（git 约定为不用代理）。
+pub async fn git_own_proxy() -> Option<String> {
+    let (global, system) = tokio::join!(git_config_proxy("--global"), git_config_proxy("--system"));
+    global.or(system).or_else(|| proxy_from_env(|k| std::env::var(k).ok()))
+}
+
+/// 读 `git config <scope> --get http.proxy`；没配置（退出码 1）或读取失败时为 None
+async fn git_config_proxy(scope: &str) -> Option<String> {
+    let out = run_git(&std::env::temp_dir(), &["config", scope, "--get", "http.proxy"], STATUS_TIMEOUT).await.ok()?;
+    Some(out.stdout.trim().to_string())
 }
 
 /// 检测 git 是否已安装，返回版本号

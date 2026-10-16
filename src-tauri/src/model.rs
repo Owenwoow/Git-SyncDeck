@@ -155,6 +155,30 @@ pub struct Settings {
     pub commit_template: String,
     /// 联网操作（fetch、push、pull）的超时秒数
     pub network_timeout_secs: u64,
+    /// 代理模式："auto"（默认）/ "off"（不用代理）/ "manual"（手动填写）
+    pub proxy_mode: String,
+    /// 手动填写的代理地址（切到其他模式后仍保留，方便切回来）
+    pub proxy_url: Option<String>,
+    /// 只读：SyncDeck 调用的 git 实际用的代理地址（去掉了账号密码）；None 表示不用代理
+    pub effective_proxy: Option<String>,
+    /// 只读：实际生效的代理来自哪里
+    pub proxy_source: ProxySource,
+}
+
+/// 实际生效的代理来自哪里
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxySource {
+    /// git 自己配置的代理（http.proxy 或环境变量），SyncDeck 不覆盖
+    Git,
+    /// Windows 系统代理
+    System,
+    /// 设置里手动填写的代理
+    Manual,
+    /// 不使用代理
+    #[default]
+    #[serde(rename = "none")]
+    NoProxy,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -166,6 +190,10 @@ pub struct SettingsPatch {
     pub commit_template: Option<String>,
     /// 只能是 git::NETWORK_TIMEOUT_CHOICES 之一
     pub network_timeout_secs: Option<u64>,
+    /// "auto" / "off" / "manual"；切到 manual 时必须已有（或同时给出）合法的代理地址
+    pub proxy_mode: Option<String>,
+    /// 手动填写的代理地址；空字符串表示清除
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

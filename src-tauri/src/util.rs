@@ -103,9 +103,57 @@ pub fn commit_message_now(template: &str) -> String {
     render_commit_message(template, &date, &computer_name())
 }
 
+// ---------------- Windows 系统代理 ----------------
+
+/// 读取 Windows 的系统代理（HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings），
+/// 返回 git 能用的代理地址；没开、用了 PAC 或读不到时返回 None
+#[cfg(windows)]
+pub fn windows_system_proxy() -> Option<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        .ok()?;
+    let enable: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+    let server: Option<String> = key.get_value("ProxyServer").ok();
+    let pac: Option<String> = key.get_value("AutoConfigURL").ok();
+    system_proxy_from(enable, server.as_deref(), pac.as_deref())
+}
+
+#[cfg(not(windows))]
+pub fn windows_system_proxy() -> Option<String> {
+    None
+}
+
+/// 由注册表里的三个值决定系统代理：
+/// - 用了 PAC（AutoConfigURL 非空）→ 不支持，当作没有系统代理
+/// - ProxyEnable 不是 1，或 ProxyServer 为空 / 解析不出地址 → 没有
+/// - 否则按 `parse_windows_proxy_server` 转成代理地址
+pub fn system_proxy_from(enable: u32, server: Option<&str>, auto_config_url: Option<&str>) -> Option<String> {
+    if auto_config_url.is_some_and(|u| !u.trim().is_empty()) || enable != 1 {
+        return None;
+    }
+    crate::url::parse_windows_proxy_server(server?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_proxy_rules() {
+        let server = Some("127.0.0.1:10808");
+        assert_eq!(system_proxy_from(1, server, None).as_deref(), Some("http://127.0.0.1:10808"));
+        assert_eq!(system_proxy_from(1, server, Some("")).as_deref(), Some("http://127.0.0.1:10808"), "空的 PAC 地址不算");
+        assert_eq!(system_proxy_from(0, server, None), None, "系统代理没开");
+        assert_eq!(system_proxy_from(1, None, None), None, "开了但没填地址");
+        assert_eq!(system_proxy_from(1, Some(""), None), None);
+        assert_eq!(system_proxy_from(1, server, Some("http://127.0.0.1:7890/pac")), None, "用了 PAC 当作没有");
+        assert_eq!(
+            system_proxy_from(1, Some("http=127.0.0.1:1;socks=127.0.0.1:2"), None).as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+    }
 
     #[test]
     fn renders_placeholders() {

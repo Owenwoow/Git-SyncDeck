@@ -3,11 +3,13 @@
 //! - 不等待任何凭据输入（GIT_TERMINAL_PROMPT=0、GCM_INTERACTIVE=never）
 //! - 中文文件名（core.quotepath=false），输出按 UTF-8 解码
 //! - 超时后终止子进程
+//! - 代理设置（`ProxyOverride`）：只通过命令行 `-c` 和子进程环境变量生效，不改用户的 git 配置
 //! - 安全白名单：只允许本工具需要的子命令和参数，任何可能改写历史或丢失改动的操作一律拒绝
 
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -43,6 +45,63 @@ pub fn refresh_timeout() -> Duration {
 
 fn refresh_timeout_for(network: Duration) -> Duration {
     REFRESH_FETCH_TIMEOUT.min(network)
+}
+
+// ---------------- 代理 ----------------
+
+/// SyncDeck 调用的 git 用什么代理。只体现在子进程的命令行参数和环境变量上，不改用户的 git 配置。
+/// 由 commands 在每轮刷新 / 同步开始前、保存设置时重新解析并设置。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProxyOverride {
+    /// 不覆盖：git 按自己的配置（http.proxy）和环境变量决定
+    #[default]
+    Inherit,
+    /// 用这个代理地址：`-c http.proxy=<地址>`，优先于 git 自己的配置和环境变量
+    Use(String),
+    /// 完全不走代理
+    Disable,
+}
+
+static PROXY_OVERRIDE: RwLock<ProxyOverride> = RwLock::new(ProxyOverride::Inherit);
+
+pub fn set_proxy_override(o: ProxyOverride) {
+    *PROXY_OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = o;
+}
+
+pub fn proxy_override() -> ProxyOverride {
+    PROXY_OVERRIDE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// git（libcurl）认的代理环境变量，按 git 对 https 地址的查找顺序排列（小写优先，HTTP_PROXY 只用于 http 地址）。
+/// Windows 上环境变量本来不分大小写，两种写法都列出来是为了在别的系统上也成立。
+pub const PROXY_ENV_VARS: [&str; 6] = ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY"];
+
+/// 代理覆盖对应的 git 全局参数（放在子命令前面）
+/// - Use：`-c http.proxy=<地址>`
+/// - Disable：`-c http.proxy=`（git 约定空值表示不用代理，此时也不再读环境变量）
+pub fn proxy_args(o: &ProxyOverride) -> Vec<String> {
+    match o {
+        ProxyOverride::Inherit => Vec::new(),
+        ProxyOverride::Use(addr) => vec!["-c".into(), format!("http.proxy={addr}")],
+        ProxyOverride::Disable => vec!["-c".into(), "http.proxy=".into()],
+    }
+}
+
+/// 代理覆盖要从子进程环境里去掉的变量：禁用时把环境变量里的代理也去掉，双保险
+pub fn proxy_env_removals(o: &ProxyOverride) -> &'static [&'static str] {
+    match o {
+        ProxyOverride::Disable => &PROXY_ENV_VARS,
+        _ => &[],
+    }
+}
+
+/// 环境变量里给 git 用的代理（按 `PROXY_ENV_VARS` 的顺序取第一个非空的）。`get` 一般是 `std::env::var(k).ok()`
+pub fn proxy_from_env(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    PROXY_ENV_VARS
+        .iter()
+        .filter_map(|k| get(k))
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
 }
 
 #[cfg(windows)]
@@ -105,8 +164,10 @@ impl std::fmt::Display for GitError {
     }
 }
 
-fn is_version_query(args: &[&str]) -> bool {
-    args == ["--version"]
+/// 不需要在仓库里执行的只读查询：`git --version`，读取全局 / 系统级 git 配置里的 http.proxy。
+/// 只认这几条完整的参数，其余命令都必须在仓库根目录下执行。
+fn runs_outside_repo(args: &[&str]) -> bool {
+    matches!(args, ["--version"] | ["config", "--global" | "--system", "--get", "http.proxy"])
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -125,13 +186,17 @@ pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<Git
     }
     // 项目目录必须自己就是仓库根目录：否则 git 会往上层找仓库，
     // 删掉 .git 的项目会被当成上层仓库来检查甚至推送
-    if !is_version_query(args) && !dir.join(".git").exists() {
+    let outside_repo = runs_outside_repo(args);
+    if !outside_repo && !dir.join(".git").exists() {
         return Err(GitError::NotRepo(dir.display().to_string()));
     }
     let command = args.first().copied().unwrap_or("").to_string();
+    // 代理覆盖只加在仓库里的命令上（读代理配置本身不需要）
+    let proxy = if outside_repo { ProxyOverride::Inherit } else { proxy_override() };
 
     let mut cmd = Command::new("git");
     cmd.args(["-c", "core.quotepath=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        .args(proxy_args(&proxy))
         .args(args)
         .current_dir(dir)
         // 不在终端里提示输入账号密码；Git 凭据管理器也不弹登录窗口，没有已保存的凭据就直接报错
@@ -147,6 +212,9 @@ pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<Git
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for var in proxy_env_removals(&proxy) {
+        cmd.env_remove(var);
+    }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
@@ -364,6 +432,84 @@ mod tests {
             vec!["log", "--output=x.txt"],
         ] {
             assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
+        }
+    }
+
+    #[test]
+    fn proxy_override_args() {
+        use super::{proxy_args, proxy_env_removals, ProxyOverride, PROXY_ENV_VARS};
+        assert!(proxy_args(&ProxyOverride::Inherit).is_empty());
+        assert!(proxy_env_removals(&ProxyOverride::Inherit).is_empty());
+
+        let use_it = ProxyOverride::Use("socks5://127.0.0.1:10808".into());
+        assert_eq!(proxy_args(&use_it), ["-c", "http.proxy=socks5://127.0.0.1:10808"]);
+        assert!(proxy_env_removals(&use_it).is_empty(), "-c 已经优先于环境变量，不用动环境");
+
+        let off = ProxyOverride::Disable;
+        assert_eq!(proxy_args(&off), ["-c", "http.proxy="], "空值表示不用代理");
+        let removed = proxy_env_removals(&off);
+        for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+            assert!(removed.contains(&var), "禁用代理时应去掉 {var}");
+        }
+        assert_eq!(removed.len(), PROXY_ENV_VARS.len());
+    }
+
+    #[test]
+    fn proxy_from_env_order() {
+        use super::proxy_from_env;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(proxy_from_env(env(&[])), None);
+        assert_eq!(proxy_from_env(env(&[("HTTPS_PROXY", "  ")])), None, "空值当作没设置");
+        assert_eq!(proxy_from_env(env(&[("http_proxy", "http://h:1")])).as_deref(), Some("http://h:1"));
+        assert_eq!(
+            proxy_from_env(env(&[("HTTP_PROXY", "http://h:1"), ("ALL_PROXY", "socks5://a:2")])).as_deref(),
+            Some("socks5://a:2"),
+            "https 地址的仓库先看 https_proxy，再看 all_proxy"
+        );
+        assert_eq!(
+            proxy_from_env(env(&[("ALL_PROXY", "socks5://a:2"), ("https_proxy", "http://s:3")])).as_deref(),
+            Some("http://s:3")
+        );
+    }
+
+    /// 白名单里不需要仓库的例外只有这几条完整命令
+    #[test]
+    fn outside_repo_queries_are_narrow() {
+        use super::runs_outside_repo;
+        for args in [
+            vec!["--version"],
+            vec!["config", "--global", "--get", "http.proxy"],
+            vec!["config", "--system", "--get", "http.proxy"],
+        ] {
+            assert!(runs_outside_repo(&args), "{args:?}");
+            assert!(validate(&args).is_ok(), "{args:?}");
+        }
+        for args in [
+            vec!["config", "--get", "http.proxy"], // 不带范围会读到所在目录的仓库配置
+            vec!["config", "--local", "--get", "http.proxy"],
+            vec!["config", "--global", "--get", "user.name"],
+            vec!["config", "--global", "--get-regexp", "http"],
+            vec!["config", "--global", "http.proxy", "x"],
+            vec!["config", "--global", "--get", "http.proxy", "x"],
+            vec!["status"],
+            vec!["fetch", "--quiet", "origin"],
+            vec!["--version", "x"],
+        ] {
+            assert!(!runs_outside_repo(&args), "不应在仓库外执行：{args:?}");
+        }
+        // 写配置仍然被白名单拒绝
+        assert!(validate(&["config", "--global", "http.proxy", "x"]).is_err());
+    }
+
+    /// 读全局代理配置不需要仓库（没配置时 git 返回退出码 1，也不能是"不是仓库"或"被拒绝"）
+    #[tokio::test]
+    async fn reads_global_proxy_outside_repo() {
+        let dir = std::env::temp_dir();
+        match super::run_git(&dir, &["config", "--global", "--get", "http.proxy"], std::time::Duration::from_secs(10)).await {
+            Ok(_) | Err(super::GitError::Failed { code: Some(1), .. }) => {}
+            Err(e) => panic!("{e:?}"),
         }
     }
 

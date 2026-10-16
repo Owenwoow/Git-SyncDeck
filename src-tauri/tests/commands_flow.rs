@@ -13,7 +13,7 @@ use tauri::Manager;
 use git_syncdeck_lib::commands::{self, AppState, Shared};
 use git_syncdeck_lib::config::ConfigStore;
 use git_syncdeck_lib::git;
-use git_syncdeck_lib::model::{SettingsPatch, SyncStatus};
+use git_syncdeck_lib::model::{ProxySource, SettingsPatch, SyncStatus};
 
 fn fixtures(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(name);
@@ -70,6 +70,46 @@ async fn full_command_flow() {
         .unwrap();
     assert_eq!(s.network_timeout_secs, 600);
     assert_eq!(git::network_timeout().as_secs(), 600);
+
+    // 代理：默认自动；手动地址要校验；保存后立即作用到 SyncDeck 调用的 git
+    assert_eq!(s.proxy_mode, "auto");
+    let proxy = |mode: Option<&str>, url: Option<&str>| SettingsPatch {
+        proxy_mode: mode.map(str::to_string),
+        proxy_url: url.map(str::to_string),
+        ..Default::default()
+    };
+    for (mode, url) in [
+        (Some("manual"), None),                        // 手动但没填地址
+        (Some("manual"), Some("127.0.0.1:7890")),      // 没写协议
+        (Some("manual"), Some("ftp://127.0.0.1:21")),  // 不支持的协议
+        (None, Some("http://127.0.0.1")),              // 没有端口
+        (Some("system"), None),                        // 不认识的模式
+    ] {
+        let e = commands::save_settings(app.state(), proxy(mode, url)).await.unwrap_err();
+        println!("  代理设置 {mode:?} {url:?} → {e}");
+    }
+    assert_eq!(commands::get_settings(app.state()).await.unwrap().proxy_mode, "auto", "保存失败时什么都不改");
+    let s = commands::save_settings(app.state(), proxy(Some("manual"), Some(" http://me:pw@127.0.0.1:7890/ ")))
+        .await
+        .unwrap();
+    assert_eq!((s.proxy_mode.as_str(), s.proxy_source), ("manual", ProxySource::Manual));
+    assert_eq!(s.proxy_url.as_deref(), Some("http://me:pw@127.0.0.1:7890"));
+    assert_eq!(s.effective_proxy.as_deref(), Some("http://127.0.0.1:7890"), "显示时去掉账号密码");
+    assert_eq!(git::proxy_override(), git::ProxyOverride::Use("http://me:pw@127.0.0.1:7890".into()));
+    let s = commands::save_settings(app.state(), proxy(Some("off"), None)).await.unwrap();
+    assert_eq!((s.proxy_source, s.effective_proxy.as_deref()), (ProxySource::NoProxy, None));
+    assert_eq!(s.proxy_url.as_deref(), Some("http://me:pw@127.0.0.1:7890"), "切到别的模式后仍保留手动地址");
+    assert_eq!(git::proxy_override(), git::ProxyOverride::Disable);
+    let s = commands::save_settings(app.state(), proxy(Some("manual"), None)).await.unwrap();
+    assert_eq!(s.proxy_source, ProxySource::Manual, "已有地址时可以直接切回手动");
+    let s = commands::save_settings(app.state(), proxy(Some("auto"), None)).await.unwrap();
+    println!("  自动模式下本机的代理：{:?} {:?}", s.proxy_source, s.effective_proxy);
+    assert_eq!(s.proxy_mode, "auto");
+    assert_ne!(s.proxy_source, ProxySource::Manual);
+    assert!(!matches!(git::proxy_override(), git::ProxyOverride::Disable));
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_file).unwrap()).unwrap();
+    assert!(saved["settings"]["proxyMode"].is_null(), "自动模式不单独保存");
+    assert_eq!(saved["settings"]["proxyUrl"], "http://me:pw@127.0.0.1:7890");
 
     // 扫描：11 个仓库，都没监控
     let scanned = commands::scan_directory(app.state(), repos.to_string_lossy().into()).await.unwrap();

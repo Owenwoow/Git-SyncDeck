@@ -1,6 +1,6 @@
 // 扫描目录时会额外发现、但还没有加入监控的假仓库。
 // 加入监控后，它们会以这里的数据出现在主页。
-import type { Project } from "@/types";
+import type { Project, ProxyMode } from "@/types";
 import { DEFAULT_COMMIT_TEMPLATE, DEFAULT_NETWORK_TIMEOUT_SECS } from "@/lib/status";
 import { minutesAgo } from "./projects";
 
@@ -115,4 +115,9 @@ export const defaultSettings = {
   defaultCodeDir: "D:\\code",
   commitTemplate: DEFAULT_COMMIT_TEMPLATE,
   networkTimeoutSecs: DEFAULT_NETWORK_TIMEOUT_SECS,
+  proxyMode: "auto" as ProxyMode,
+  proxyUrl: null as string | null,
 };
+
+/** 演示：自动模式下"探测到"的系统代理 */
+export const demoSystemProxy = "http://127.0.0.1:10808";
