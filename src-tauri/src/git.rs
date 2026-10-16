@@ -172,8 +172,9 @@ pub enum GitError {
     /// 目录还在，但已经不是 Git 仓库（根目录下没有 .git）
     NotRepo(String),
     Timeout { command: String, secs: u64 },
-    /// git 返回非 0 退出码；stderr 为原文（已去掉 URL 里的账号信息）
-    Failed { command: String, code: Option<i32>, stderr: String },
+    /// git 返回非 0 退出码；stderr 为原文（已去掉 URL 里的账号信息）。
+    /// stdout 也保留着：有的命令用退出码 1 表示"有结果"（如 merge-tree 有冲突时），输出仍然有用
+    Failed { command: String, code: Option<i32>, stderr: String, stdout: String },
     Io(String),
     /// 被安全白名单拦截
     Forbidden(String),
@@ -189,7 +190,7 @@ impl GitError {
             GitError::NoDirectory(dir) => format!("找不到目录：{dir}"),
             GitError::NotRepo(dir) => format!("这个文件夹已经不是 Git 仓库（找不到 .git）：{dir}，可以在详情里取消监控"),
             GitError::Timeout { command, secs } => format!("git {command} 超时（{secs} 秒），已终止"),
-            GitError::Failed { command, code, stderr } => {
+            GitError::Failed { command, code, stderr, .. } => {
                 if stderr.trim().is_empty() {
                     let code = code.map_or("未知".to_string(), |c| c.to_string());
                     format!("git {command} 失败（退出码 {code}）")
@@ -291,7 +292,7 @@ pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<Git
             if out.status.success() {
                 Ok(GitOutput { stdout, stderr })
             } else {
-                Err(GitError::Failed { command, code: out.status.code(), stderr })
+                Err(GitError::Failed { command, code: out.status.code(), stderr, stdout })
             }
         }
     }
@@ -323,6 +324,9 @@ const FORBIDDEN_FLAGS: &[&str] = &[
     "--allow-unrelated-histories",
 ];
 
+/// 预演合并（`git merge-tree`）唯一允许的选项：只在内存里算出合并结果，输出冲突文件名，不碰工作区和分支
+pub const MERGE_TREE_FLAGS: [&str; 4] = ["--write-tree", "--name-only", "-z", "--no-messages"];
+
 /// 安全白名单。除了下面列出的子命令和用法，一律拒绝。
 /// 刻意不包含 reset、rebase、stash、clean、checkout、restore、switch、rm、gc、branch -D 等命令。
 pub fn validate(args: &[&str]) -> Result<(), String> {
@@ -334,7 +338,7 @@ pub fn validate(args: &[&str]) -> Result<(), String> {
     let mut i = 0;
     while i < rest.len() {
         let a = rest[i];
-        if a == "-m" && sub == "commit" {
+        if a == "-m" && (sub == "commit" || sub == "merge") {
             i += 2; // 提交说明原样交给 git，不参与检查
             continue;
         }
@@ -422,6 +426,22 @@ pub fn validate(args: &[&str]) -> Result<(), String> {
                 Err("remote 只允许 get-url".into())
             }
         }
+        // 只允许 merge-tree --write-tree --name-only -z --no-messages <本地> <云端>（预演合并，不碰工作区）
+        "merge-tree" => match rest {
+            [a, b, c, d, ours, theirs]
+                if [*a, *b, *c, *d] == MERGE_TREE_FLAGS && !ours.starts_with('-') && !theirs.starts_with('-') =>
+            {
+                Ok(())
+            }
+            _ => Err("merge-tree 只允许 merge-tree --write-tree --name-only -z --no-messages <本地> <云端>".into()),
+        },
+        // 只允许两种：merge --no-edit -m <说明> <上游提交>（预演无冲突后的正式合并），merge --abort（合并失败时撤销）。
+        // 不许 --squash、-s、-X、--allow-unrelated-histories、--continue 等其他选项，也不许一次合并多个提交
+        "merge" => match rest {
+            ["--abort"] => Ok(()),
+            ["--no-edit", "-m", _, target] if !target.starts_with('-') => Ok(()),
+            _ => Err("merge 只允许 merge --no-edit -m <说明> <上游提交> 或 merge --abort".into()),
+        },
         other => Err(format!("不允许的 git 子命令：{other}")),
     }
 }
@@ -485,6 +505,62 @@ mod tests {
             vec!["symbolic-ref", "HEAD", "refs/heads/x"],
             vec!["remote", "add", "x", "y"],
             vec!["log", "--output=x.txt"],
+        ] {
+            assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
+        }
+    }
+
+    /// 预演合并和正式合并只允许固定的几种写法
+    #[test]
+    fn merge_whitelist() {
+        let flags = super::MERGE_TREE_FLAGS;
+        let preview = |ours: &'static str, theirs: &'static str| {
+            let mut v = vec!["merge-tree"];
+            v.extend(flags);
+            v.extend([ours, theirs]);
+            v
+        };
+        for args in [
+            preview("HEAD", "abc123"),
+            preview("0123abcd", "refs/remotes/origin/main"),
+            vec!["merge", "--no-edit", "-m", "自动合并：来自 DESKTOP-1", "abc123"],
+            // 提交说明里出现的危险字样不算参数
+            vec!["merge", "--no-edit", "-m", "--force -s ours --squash", "abc123"],
+            vec!["merge", "--abort"],
+        ] {
+            assert!(validate(&args).is_ok(), "应当允许：{args:?}");
+        }
+        for args in [
+            // merge-tree：旧的三参数用法、缺选项、多选项、选项顺序不对、参数个数不对
+            vec!["merge-tree", "base", "HEAD", "abc"],
+            vec!["merge-tree", "--write-tree", "HEAD", "abc"],
+            vec!["merge-tree", "--write-tree", "--name-only", "HEAD", "abc"],
+            vec!["merge-tree", "--name-only", "--write-tree", "-z", "--no-messages", "HEAD", "abc"],
+            vec!["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", "HEAD"],
+            vec!["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", "HEAD", "abc", "def"],
+            vec!["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", "--merge-base=x", "HEAD", "abc"],
+            vec!["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", "HEAD", "--stdin"],
+            vec!["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", "--allow-unrelated-histories", "HEAD"],
+            vec!["merge-tree", "--stdin"],
+            // merge：没有 --no-edit / -m、合并策略、压缩合并、无关历史、一次合并多个、继续 / 退出
+            vec!["merge", "abc123"],
+            vec!["merge", "--no-edit", "abc123"],
+            vec!["merge", "-m", "x", "abc123"],
+            vec!["merge", "--no-edit", "-m", "x"],
+            vec!["merge", "--no-edit", "-m", "x", "abc", "def"],
+            vec!["merge", "--squash", "abc123"],
+            vec!["merge", "--no-edit", "-m", "x", "--squash"],
+            vec!["merge", "--no-edit", "-m", "x", "-s", "ours", "abc123"],
+            vec!["merge", "-s", "ours", "--no-edit", "-m", "x", "abc123"],
+            vec!["merge", "--no-edit", "-m", "x", "-Xtheirs", "abc123"],
+            vec!["merge", "-X", "theirs", "--no-edit", "-m", "x", "abc"],
+            vec!["merge", "--no-edit", "-m", "x", "--allow-unrelated-histories", "abc123"],
+            vec!["merge", "--allow-unrelated-histories", "--no-edit", "-m", "x", "abc"],
+            vec!["merge", "--no-ff", "--no-edit", "-m", "x", "abc123"],
+            vec!["merge", "--continue"],
+            vec!["merge", "--quit"],
+            vec!["merge", "--abort", "x"],
+            vec!["merge"],
         ] {
             assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
         }

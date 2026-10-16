@@ -68,12 +68,13 @@ export type SyncOutcome =
   | "pulled" // 已拉取
   | "up-to-date" // 已是最新
   | "committed" // 已自动提交并推送（项目打开了"自动提交"）
+  | "merged" // 分叉时预演合并没有冲突，已自动合并并推送（设置里打开了"无冲突时自动合并"）
   | "failed"; // 异常，需要手动处理
 
 export interface SyncItemResult {
   projectId: string;
   outcome: SyncOutcome;
-  /** 推送或拉取的提交数（committed 时为推送的提交数，含自动提交的那一个） */
+  /** 推送或拉取的提交数（committed 时为推送的提交数，含自动提交的那一个；merged 时含合并提交） */
   commits: number;
   /** 异常原因，仅 outcome 为 failed 时有值 */
   reason: string | null;
@@ -108,6 +109,17 @@ export interface CommitInfo {
   subject: string;
 }
 
+/** 生成诊断文本、「复制给 AI」提示词用的信息（不含任何文件内容） */
+export interface DiagnosticInfo {
+  project: Project;
+  /** 本地最近 3 次提交 */
+  recentCommits: CommitInfo[];
+  /** 分叉时预演合并算出的冲突文件；不是分叉、没有冲突或无法预演时为空 */
+  conflictFiles: string[];
+  /** 云端（上游分支）最近 3 次提交；没有上游时为空 */
+  recentRemoteCommits: CommitInfo[];
+}
+
 export type Theme = "light" | "dark";
 
 export interface Settings {
@@ -126,6 +138,12 @@ export interface Settings {
   effectiveProxy: string | null;
   /** 只读：实际生效的代理来自哪里 */
   proxySource: ProxySource;
+  /** 分叉时先预演合并，没有冲突就自动合并并推送（默认开） */
+  autoMerge: boolean;
+  /** 自动提交前检查大文件和疑似密钥文件（默认开；手动"提交并推送"不检查） */
+  precommitCheck: boolean;
+  /** 提交前检查的单个文件大小上限（MB），1 ~ MAX_BIG_FILE_LIMIT_MB，默认 50 */
+  bigFileLimitMb: number;
 }
 
 /** 代理模式：auto 自动（git 自己配了代理就用 git 的，否则用 Windows 系统代理）/ off 不用代理 / manual 手动填写 */

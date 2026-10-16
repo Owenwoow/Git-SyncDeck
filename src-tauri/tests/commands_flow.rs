@@ -111,10 +111,10 @@ async fn full_command_flow() {
     assert!(saved["settings"]["proxyMode"].is_null(), "自动模式不单独保存");
     assert_eq!(saved["settings"]["proxyUrl"], "http://me:pw@127.0.0.1:7890");
 
-    // 扫描：11 个仓库，都没监控
+    // 扫描：14 个仓库，都没监控
     let scanned = commands::scan_directory(app.state(), repos.to_string_lossy().into()).await.unwrap();
     println!("扫描到 {} 个仓库", scanned.len());
-    assert_eq!(scanned.len(), 11);
+    assert_eq!(scanned.len(), 14);
     assert!(scanned.iter().all(|r| !r.monitored));
     let detached = scanned.iter().find(|r| r.name == "detached").unwrap();
     assert_eq!(detached.branch, "(detached HEAD)");
@@ -122,7 +122,7 @@ async fn full_command_flow() {
     // 添加全部（重复添加会被忽略）
     let paths: Vec<String> = scanned.iter().map(|r| r.path.clone()).collect();
     let added = commands::add_projects(app.state(), paths.clone()).await.unwrap();
-    assert_eq!(added.len(), 11);
+    assert_eq!(added.len(), 14);
     assert_eq!(commands::add_projects(app.state(), paths).await.unwrap().len(), 0);
     let rescanned = commands::scan_directory(app.state(), repos.to_string_lossy().into()).await.unwrap();
     assert!(rescanned.iter().all(|r| r.monitored && r.project_id.is_some()));
@@ -139,11 +139,11 @@ async fn full_command_flow() {
     let list = commands::refresh_status(app.state(), channel).await.unwrap();
     let refresh_events = refresh_events.lock().unwrap().clone();
     println!("\n== 刷新状态（{} 个进度事件）==", refresh_events.len());
-    assert_eq!(refresh_events.len(), 11, "每个项目各发一次");
-    assert!(refresh_events.iter().all(|e| e["type"] == "done" && e["total"] == 11));
+    assert_eq!(refresh_events.len(), 14, "每个项目各发一次");
+    assert!(refresh_events.iter().all(|e| e["type"] == "done" && e["total"] == 14));
     let mut idx: Vec<u64> = refresh_events.iter().map(|e| e["index"].as_u64().unwrap()).collect();
     idx.sort();
-    assert_eq!(idx, (0..11).collect::<Vec<_>>(), "index 是完成顺序 0..10");
+    assert_eq!(idx, (0..14).collect::<Vec<_>>(), "index 是完成顺序 0..13");
     // 事件里的项目和最终返回的列表一一对应、内容一致
     let mut from_events: Vec<serde_json::Value> = refresh_events.iter().map(|e| e["project"].clone()).collect();
     let mut from_list: Vec<serde_json::Value> = list.iter().map(|p| serde_json::to_value(p).unwrap()).collect();
@@ -178,17 +178,25 @@ async fn full_command_flow() {
     let starts = events.iter().filter(|e| e["type"] == "start").count();
     let dones: Vec<_> = events.iter().filter(|e| e["type"] == "done").collect();
     println!("\n== 一键同步 ==\n  进度事件：{starts} 个 start，{} 个 done；已同步 {}，异常 {}", dones.len(), result.synced_count, result.failed_count);
-    assert_eq!(starts, 11);
-    assert_eq!(dones.len(), 11);
-    // done 的 index 是完成顺序 0..10，界面据此计算进度
+    assert_eq!(starts, 14);
+    assert_eq!(dones.len(), 14);
+    // done 的 index 是完成顺序 0..13，界面据此计算进度
     let mut idx: Vec<u64> = dones.iter().map(|e| e["index"].as_u64().unwrap()).collect();
     idx.sort();
-    assert_eq!(idx, (0..11).collect::<Vec<_>>());
+    assert_eq!(idx, (0..14).collect::<Vec<_>>());
     // 事件里的字段名是 camelCase，和前端类型一致
     assert!(dones[0]["result"]["projectId"].is_string());
     assert!(dones[0]["project"]["checkError"].is_null() || dones[0]["project"]["checkError"].is_string());
-    assert_eq!(result.synced_count, 3);
-    assert_eq!(result.failed_count, 8);
+    // 已同步 4 个：synced、ahead、behind，以及默认打开自动合并后无冲突的 diverged；
+    // 其余 10 个（有改动但没开自动提交、预演有冲突、未关联云端、检查失败）记为异常
+    let outcome_of = |name: &str| {
+        let id = by_name(&list, name).id;
+        dones.iter().find(|e| e["result"]["projectId"] == id.as_str()).unwrap()["result"]["outcome"].clone()
+    };
+    assert_eq!(outcome_of("diverged"), "merged", "默认打开自动合并，无冲突的分叉应自动合并并推送");
+    assert_eq!(outcome_of("diverged-conflict"), "failed");
+    assert_eq!(result.synced_count, 4);
+    assert_eq!(result.failed_count, 10);
 
     // 异常原因已持久化；成功的项目有上次同步时间
     let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_file).unwrap()).unwrap();
@@ -196,13 +204,13 @@ async fn full_command_flow() {
     let with_issue = saved_projects.iter().filter(|p| p["issue"].is_string()).count();
     let with_time = saved_projects.iter().filter(|p| p["lastSyncAt"].is_string()).count();
     println!("  配置文件：{with_issue} 个项目保存了异常原因，{with_time} 个项目有上次同步时间");
-    assert_eq!(with_issue, 8);
-    assert_eq!(with_time, 3);
+    assert_eq!(with_issue, 10);
+    assert_eq!(with_time, 4);
 
     // 同步进行中不能再开一轮
     // （这里同步已结束，标记应已清除，再同步一次应该可以执行）
     let again = commands::sync_all(app.state(), Channel::new(|_| Ok(()))).await.unwrap();
-    assert_eq!(again.synced_count, 3);
+    assert_eq!(again.synced_count, 4);
 
     // 提交并推送 dirty：成功后异常清除
     let dirty_id = by_name(&list, "dirty").id;
@@ -223,14 +231,14 @@ async fn full_command_flow() {
         (c.projects.len(), c.projects.iter().find(|p| p.id == dirty_id).unwrap().issue.clone(), c.settings.theme.clone())
     });
     println!("  重启后：{count} 个项目，主题 {theme:?}，dirty 的异常 {dirty_issue:?}");
-    assert_eq!(count, 11);
+    assert_eq!(count, 14);
     assert_eq!(theme.as_deref(), Some("dark"));
     assert!(dirty_issue.is_none());
     assert_eq!(reloaded.read(|c| c.settings.network_timeout_secs), Some(600));
 
     // 取消监控：只改清单，仓库目录还在
     commands::remove_project(app.state(), dirty_id).await.unwrap();
-    assert_eq!(commands::list_projects(app.state()).await.unwrap().len(), 10);
+    assert_eq!(commands::list_projects(app.state()).await.unwrap().len(), 13);
     assert!(repos.join("dirty").join(".git").exists(), "取消监控不能删除仓库");
-    println!("  取消监控后剩 10 个项目，仓库目录仍在");
+    println!("  取消监控后剩 13 个项目，仓库目录仍在");
 }

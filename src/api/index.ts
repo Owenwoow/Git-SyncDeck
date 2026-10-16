@@ -29,6 +29,7 @@ export const {
   syncAll,
   commitAndPush,
   getDiagnosticText,
+  getAiPromptText,
   openInTerminal,
   openInEditor,
   getSettings,

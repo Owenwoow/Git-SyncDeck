@@ -1,7 +1,7 @@
 // 扫描目录时会额外发现、但还没有加入监控的假仓库。
 // 加入监控后，它们会以这里的数据出现在主页。
 import type { Project, ProxyMode } from "@/types";
-import { DEFAULT_COMMIT_TEMPLATE, DEFAULT_NETWORK_TIMEOUT_SECS } from "@/lib/status";
+import { DEFAULT_BIG_FILE_LIMIT_MB, DEFAULT_COMMIT_TEMPLATE, DEFAULT_NETWORK_TIMEOUT_SECS } from "@/lib/status";
 import { minutesAgo } from "./projects";
 
 const GH = "https://github.com/Owenwoow";
@@ -117,6 +117,9 @@ export const defaultSettings = {
   networkTimeoutSecs: DEFAULT_NETWORK_TIMEOUT_SECS,
   proxyMode: "auto" as ProxyMode,
   proxyUrl: null as string | null,
+  autoMerge: true,
+  precommitCheck: true,
+  bigFileLimitMb: DEFAULT_BIG_FILE_LIMIT_MB,
 };
 
 /** 演示：自动模式下"探测到"的系统代理 */

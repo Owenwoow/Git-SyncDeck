@@ -106,6 +106,8 @@ pub enum SyncOutcome {
     /// 已自动提交并推送
     Committed,
     Failed,
+    /// 分叉时预演合并没有冲突，已自动合并并推送（commits 为推送的提交数，含合并提交）
+    Merged,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +165,12 @@ pub struct Settings {
     pub effective_proxy: Option<String>,
     /// 只读：实际生效的代理来自哪里
     pub proxy_source: ProxySource,
+    /// 分叉时先预演合并，没有冲突就自动合并并推送（默认开）
+    pub auto_merge: bool,
+    /// 自动提交前检查大文件和疑似密钥文件（默认开）
+    pub precommit_check: bool,
+    /// 提交前检查的单个文件大小上限（MB，默认 50）
+    pub big_file_limit_mb: u64,
 }
 
 /// 实际生效的代理来自哪里
@@ -194,6 +202,10 @@ pub struct SettingsPatch {
     pub proxy_mode: Option<String>,
     /// 手动填写的代理地址；空字符串表示清除
     pub proxy_url: Option<String>,
+    pub auto_merge: Option<bool>,
+    pub precommit_check: Option<bool>,
+    /// 只能在 1 ~ ops::MAX_BIG_FILE_LIMIT_MB 之间
+    pub big_file_limit_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,4 +226,8 @@ pub struct CommitInfo {
 pub struct DiagnosticInfo {
     pub project: Project,
     pub recent_commits: Vec<CommitInfo>,
+    /// 分叉时用 merge-tree 预演合并算出的冲突文件；不是分叉、没有冲突或无法预演时为空
+    pub conflict_files: Vec<String>,
+    /// 云端（上游分支）最近 3 次提交；没有上游时为空
+    pub recent_remote_commits: Vec<CommitInfo>,
 }

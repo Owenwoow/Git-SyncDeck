@@ -1,6 +1,12 @@
-// 初始监控中的 12 个假项目。每种状态（同步中除外）至少出现一次。
+// 初始监控中的 13 个假项目。每种状态（同步中除外）至少出现一次。
 // "同步中"只在一键同步过程中出现，点一键同步即可看到。
+// 分叉的有两个：tauri-playground 预演合并会冲突（见 mockConflicts），obsidian-vault 没有冲突、会自动合并。
 import type { Project } from "@/types";
+
+/** 演示：分叉项目预演合并时会冲突的文件（没列出的分叉项目预演无冲突） */
+export const mockConflicts: Record<string, string[]> = {
+  "p-tauri-playground": ["README.md", "src-tauri/src/main.rs"],
+};
 
 const GH = "https://github.com/Owenwoow";
 
@@ -66,6 +72,22 @@ export const initialProjects: Project[] = [
     behind: 2,
     changes: [],
     lastSyncAt: minutesAgo(26 * HOUR),
+    issue: null,
+    checkError: null,
+    autoCommit: false,
+  },
+  {
+    id: "p-obsidian-vault",
+    name: "obsidian-vault",
+    path: "D:\\code\\obsidian-vault",
+    branch: "main",
+    remoteUrl: `${GH}/obsidian-vault.git`,
+    upstream: "origin/main",
+    status: "diverged",
+    ahead: 2,
+    behind: 1,
+    changes: [],
+    lastSyncAt: minutesAgo(2 * DAY + 7 * HOUR),
     issue: null,
     checkError: null,
     autoCommit: false,

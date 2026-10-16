@@ -6,7 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import type {
-  CommitInfo,
+  DiagnosticInfo,
   GitInfo,
   Project,
   RefreshProgressEvent,
@@ -18,7 +18,7 @@ import type {
   UpdateInfo,
   UpdateProgress,
 } from "@/types";
-import { buildDiagnosticText } from "@/lib/diagnostic";
+import { buildAiPrompt, buildDiagnosticText } from "@/lib/diagnostic";
 
 /** Rust 端返回的错误是字符串，这里统一包成 Error，界面可以直接用 e.message */
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -85,8 +85,13 @@ export function commitAndPush(projectId: string, message: string): Promise<Proje
 }
 
 export async function getDiagnosticText(projectId: string): Promise<string> {
-  const info = await call<{ project: Project; recentCommits: CommitInfo[] }>("get_diagnostic_info", { projectId });
+  const info = await call<DiagnosticInfo>("get_diagnostic_info", { projectId });
   return buildDiagnosticText(info.project, info.recentCommits);
+}
+
+/** 「复制给 AI」的提示词：分叉时后端会预演一次合并（不联网、不碰工作区），列出会冲突的文件 */
+export async function getAiPromptText(projectId: string): Promise<string> {
+  return buildAiPrompt(await call<DiagnosticInfo>("get_diagnostic_info", { projectId }));
 }
 
 // ---------------- 系统 ----------------

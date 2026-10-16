@@ -117,9 +117,10 @@ export function isAbnormal(status: SyncStatus): boolean {
   return STATUS_META[status].abnormal;
 }
 
-/** 一键同步时会自动提交并推送：有未提交改动、打开了自动提交、有上游、本地和云端没有分叉 */
+/** 一键同步时会自动提交：有未提交改动、打开了自动提交、有上游。
+ *  先在本地提交；云端也有新提交时再按分叉处理（预演合并，没有冲突才合并），所以落后、分叉时也会提交 */
 export function willAutoCommit(p: Project): boolean {
-  return p.status === "dirty" && p.autoCommit && !!p.upstream && !(p.ahead > 0 && p.behind > 0);
+  return p.status === "dirty" && p.autoCommit && !!p.upstream;
 }
 
 /** 需要处理的排在前面；同权重按名称 */
@@ -166,8 +167,9 @@ export function describeIssue(p: Project): string {
   }
 }
 
-/** 详情抽屉里的状态说明：这个状态是什么意思、一键同步会怎么做 */
-export function describeStatus(p: Project): string {
+/** 详情抽屉里的状态说明：这个状态是什么意思、一键同步会怎么做。
+ *  autoMerge 是设置里的"无冲突时自动合并"（默认开） */
+export function describeStatus(p: Project, autoMerge = true): string {
   switch (p.status) {
     case "synced":
       return "本地与 GitHub 完全一致，不需要任何操作。";
@@ -176,13 +178,19 @@ export function describeStatus(p: Project): string {
     case "behind":
       return `GitHub 上有 ${p.behind} 个新提交还没拉到本地。一键同步会自动拉取。`;
     case "dirty":
-      if (willAutoCommit(p))
-        return `工作区有 ${p.changes.length} 个文件改动还没提交。已打开自动提交，一键同步会自动提交并推送${p.behind ? "（先拉取云端的新提交）" : ""}。`;
-      if (p.autoCommit && p.ahead > 0 && p.behind > 0)
-        return `工作区有 ${p.changes.length} 个文件改动还没提交，而且本地和云端各有新提交。即使打开了自动提交，一键同步也不会处理，需要先合并。`;
+      if (willAutoCommit(p)) {
+        const then = !p.behind
+          ? "再推送"
+          : autoMerge
+            ? "云端也有新提交，提交后会先预演合并，没有冲突就自动合并并推送"
+            : "云端也有新提交，而自动合并已关闭，提交后会停在分叉，需要手动合并";
+        return `工作区有 ${p.changes.length} 个文件改动还没提交。已打开自动提交，一键同步会先在本地提交，${then}。`;
+      }
       return `工作区有 ${p.changes.length} 个文件改动还没提交。一键同步不会处理，可以在下方直接提交并推送。`;
     case "diverged":
-      return `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。一键同步不会处理，需要先合并。`;
+      return autoMerge
+        ? `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。一键同步会先预演合并，没有冲突就自动合并。`
+        : `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。一键同步不会处理，需要先合并。`;
     case "no-remote":
       if (!p.remoteUrl)
         return "这个仓库还没有关联任何远程仓库，一键同步无法处理，需要先在 GitHub 上建仓库并关联。";
@@ -203,7 +211,7 @@ export function commitPushDisabledReason(p: Project): string | null {
     if (!p.upstream) return "当前分支没有上游分支，无法直接推送";
     return null;
   }
-  if (p.status === "diverged") return "分叉需要先合并，建议复制诊断文本交给 AI 处理";
+  if (p.status === "diverged") return "分叉需要先合并，可以「复制给 AI」，让 AI 一步一步教你处理";
   if (p.status === "no-remote") return noRemoteReason(p);
   return "没有需要提交的改动";
 }
@@ -229,6 +237,15 @@ export const NETWORK_TIMEOUT_CHOICES = [60, 180, 300, 600] as const;
 
 /** 默认的自动提交信息模板（与 src-tauri/src/util.rs 的 DEFAULT_COMMIT_TEMPLATE 一致） */
 export const DEFAULT_COMMIT_TEMPLATE = "自动同步：{date} 来自 {host}";
+
+// ---------------- 冲突与提交检查 ----------------
+
+/** 自动合并的提交信息模板（与 src-tauri/src/ops.rs 的 MERGE_MESSAGE_TEMPLATE 一致） */
+export const MERGE_MESSAGE_TEMPLATE = "自动合并：来自 {host}";
+
+/** 提交前检查的大文件上限（MB）：默认值和最大值，与 src-tauri/src/ops.rs 一致 */
+export const DEFAULT_BIG_FILE_LIMIT_MB = 50;
+export const MAX_BIG_FILE_LIMIT_MB = 2048;
 
 /** 按模板生成提交信息（与 src-tauri/src/util.rs 的 render_commit_message 一致）：
  *  {date} → 本地时间 YYYY-MM-DD HH:mm，{host} → 电脑名；模板为空时用默认模板 */
