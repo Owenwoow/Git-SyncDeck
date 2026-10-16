@@ -18,9 +18,10 @@ use crate::util::{
     DEFAULT_COMMIT_TEMPLATE,
 };
 use crate::git::{
-    refresh_timeout, set_network_timeout, set_proxy_override, ProxyOverride, DEFAULT_NETWORK_TIMEOUT_SECS,
-    NETWORK_TIMEOUT_CHOICES,
+    proxy_from_env, refresh_timeout, set_network_timeout, set_proxy_plan, ProxyOverride, ProxyPlan,
+    DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES,
 };
+use crate::ops::GitProxyConfig;
 use crate::url::{display_proxy, validate_proxy_url};
 use crate::{scan, system, util};
 
@@ -184,46 +185,66 @@ async fn remote_project(st: &AppState, sp: &StoredProject) -> Option<Project> {
 /// 设置里的代理模式
 const PROXY_MODES: [&str; 3] = ["auto", "off", "manual"];
 
-/// 解析出的代理：交给 run_git 的覆盖方式，以及设置页显示的来源和地址（已去掉账号密码）
+/// 解析出的代理：交给 run_git 的代理设置，以及设置页显示的来源和地址（已去掉账号密码）
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedProxy {
-    pub over: ProxyOverride,
+    pub plan: ProxyPlan,
     pub source: ProxySource,
     pub effective: Option<String>,
 }
 
 /// 按代理模式决定 SyncDeck 调用的 git 用什么代理。纯函数，探测结果由调用方传入：
-/// - `off`：完全不走代理
-/// - `manual`：用手动填写的地址（`manual_url` 为已校验的地址；没有时按自动处理）
-/// - `auto`：git 自己配了代理（`git_proxy`，Some("") 表示 git 配置成了不用代理）→ 不覆盖；
-///   没配而系统代理开着（`system_proxy`）→ 用系统代理；都没有 → 不覆盖，也就是不用代理
+/// - `off`：完全不走代理；git 配置里按网址设置的代理（`http.<网址>.proxy`）也一并盖住
+/// - `manual`：用手动填写的地址（`manual_url` 为已校验的地址；没有时按自动处理），按网址设置的代理也盖住
+/// - `auto`：git 自己配了代理 → 不覆盖。"git 自己的代理"按 git 的优先级看：`http.proxy`（写成空值表示
+///   明确不用代理）、https 用的代理环境变量（`env_proxy`）、按网址设置的非空代理。
+///   都没有而系统代理开着（`system_proxy`）→ 用系统代理；都没有 → 不覆盖，也就是不用代理
 pub fn decide_proxy(
     mode: &str,
     manual_url: Option<&str>,
-    git_proxy: Option<&str>,
+    git: &GitProxyConfig,
+    env_proxy: Option<&str>,
     system_proxy: Option<&str>,
 ) -> ResolvedProxy {
-    let none = |over| ResolvedProxy { over, source: ProxySource::NoProxy, effective: None };
+    let plan = |over| ProxyPlan { over, url_scopes: git.url_scopes() };
+    let none = |plan| ResolvedProxy { plan, source: ProxySource::NoProxy, effective: None };
+    let own = |effective: String| ResolvedProxy {
+        plan: ProxyOverride::Inherit.into(),
+        source: ProxySource::Git,
+        effective: Some(effective),
+    };
     match (mode, manual_url) {
-        ("off", _) => none(ProxyOverride::Disable),
-        ("manual", Some(url)) => ResolvedProxy {
-            over: ProxyOverride::Use(url.to_string()),
-            source: ProxySource::Manual,
-            effective: Some(display_proxy(url)),
-        },
-        _ => match (git_proxy.map(str::trim), system_proxy) {
-            (Some(""), _) => none(ProxyOverride::Inherit),
-            (Some(own), _) => ResolvedProxy {
-                over: ProxyOverride::Inherit,
-                source: ProxySource::Git,
-                effective: Some(display_proxy(own)),
-            },
-            (None, Some(sys)) => ResolvedProxy {
-                over: ProxyOverride::Use(sys.to_string()),
+        ("off", _) => return none(plan(ProxyOverride::Disable)),
+        ("manual", Some(url)) => {
+            return ResolvedProxy {
+                plan: plan(ProxyOverride::Use(url.to_string())),
+                source: ProxySource::Manual,
+                effective: Some(display_proxy(url)),
+            }
+        }
+        _ => {}
+    }
+
+    // 只给某些网址配的代理：显示成"地址（仅 网址）"
+    let scoped: Vec<_> = git.url_proxies.iter().filter(|(_, v)| !v.is_empty()).collect();
+    let scoped_display = scoped.first().map(|(url, value)| match scoped.len() {
+        1 => format!("{}（仅 {url}）", display_proxy(value)),
+        n => format!("{}（仅 {url} 等 {n} 个网址）", display_proxy(value)),
+    });
+    let env_proxy = env_proxy.map(str::trim).filter(|v| !v.is_empty());
+    match git.proxy.as_deref().map(str::trim) {
+        Some("") => scoped_display.map_or_else(|| none(ProxyOverride::Inherit.into()), own),
+        Some(p) => own(display_proxy(p)),
+        None => match (env_proxy, scoped_display, system_proxy) {
+            (Some(e), _, _) => own(display_proxy(e)),
+            (None, Some(d), _) => own(d),
+            // 用系统代理时不碰按网址的设置：能走到这里，它们都是"这个网址不用代理"
+            (None, None, Some(sys)) => ResolvedProxy {
+                plan: ProxyOverride::Use(sys.to_string()).into(),
                 source: ProxySource::System,
                 effective: Some(display_proxy(sys)),
             },
-            (None, None) => none(ProxyOverride::Inherit),
+            (None, None, None) => none(ProxyOverride::Inherit.into()),
         },
     }
 }
@@ -244,10 +265,12 @@ async fn refresh_proxy(st: &AppState) -> ResolvedProxy {
     let (mode, url) = st.config.read(|c| (proxy_mode_of(c), c.settings.proxy_url.clone()));
     let manual = url.as_deref().and_then(|u| validate_proxy_url(u).ok());
     let auto = mode == "auto" || (mode == "manual" && manual.is_none());
-    let git_proxy = if auto { ops::git_own_proxy().await } else { None };
-    let system_proxy = if auto && git_proxy.is_none() { util::windows_system_proxy() } else { None };
-    let resolved = decide_proxy(mode, manual.as_deref(), git_proxy.as_deref(), system_proxy.as_deref());
-    set_proxy_override(resolved.over.clone());
+    // git 自己的代理配置每次都读：不用代理 / 手动模式也要知道哪些网址单独配了代理，好把它们盖住
+    let git = ops::git_proxy_config().await;
+    let env_proxy = if auto { proxy_from_env(|k| std::env::var(k).ok()) } else { None };
+    let system_proxy = if auto { util::windows_system_proxy() } else { None };
+    let resolved = decide_proxy(mode, manual.as_deref(), &git, env_proxy.as_deref(), system_proxy.as_deref());
+    set_proxy_plan(resolved.plan.clone());
     resolved
 }
 
@@ -680,46 +703,85 @@ mod tests {
     #[test]
     fn proxy_decisions() {
         let r = |over: ProxyOverride, source: ProxySource, effective: Option<&str>| ResolvedProxy {
-            over,
+            plan: over.into(),
             source,
             effective: effective.map(str::to_string),
         };
-        let git = Some("socks5://127.0.0.1:10808");
+        let cfg = |proxy: Option<&str>, urls: &[(&str, &str)]| GitProxyConfig {
+            proxy: proxy.map(str::to_string),
+            url_proxies: urls.iter().map(|(u, v)| (u.to_string(), v.to_string())).collect(),
+        };
+        let nothing = cfg(None, &[]);
+        let git = cfg(Some("socks5://127.0.0.1:10808"), &[]);
         let sys = Some("http://127.0.0.1:10809");
 
         // 自动：git 自己配了代理 → 不覆盖
         assert_eq!(
-            decide_proxy("auto", None, git, sys),
+            decide_proxy("auto", None, &git, None, sys),
             r(ProxyOverride::Inherit, ProxySource::Git, Some("socks5://127.0.0.1:10808"))
         );
         // 自动：git 没配，系统代理开着 → 用系统代理
         assert_eq!(
-            decide_proxy("auto", None, None, sys),
+            decide_proxy("auto", None, &nothing, None, sys),
             r(ProxyOverride::Use("http://127.0.0.1:10809".into()), ProxySource::System, Some("http://127.0.0.1:10809"))
         );
         // 自动：都没有 → 不覆盖、不用代理
-        assert_eq!(decide_proxy("auto", None, None, None), r(ProxyOverride::Inherit, ProxySource::NoProxy, None));
-        // 自动：git 配置成空值（明确不用代理）→ 尊重 git 的配置，不套系统代理
-        assert_eq!(decide_proxy("auto", None, Some(""), sys), r(ProxyOverride::Inherit, ProxySource::NoProxy, None));
+        assert_eq!(decide_proxy("auto", None, &nothing, None, None), r(ProxyOverride::Inherit, ProxySource::NoProxy, None));
+        // 自动：git 配置成空值（明确不用代理）→ 尊重 git 的配置，不套系统代理，也不看环境变量
+        assert_eq!(
+            decide_proxy("auto", None, &cfg(Some(""), &[]), Some("http://127.0.0.1:3"), sys),
+            r(ProxyOverride::Inherit, ProxySource::NoProxy, None)
+        );
+        // 自动：环境变量里给 https 用的代理也算 git 自己的
+        assert_eq!(
+            decide_proxy("auto", None, &nothing, Some("http://127.0.0.1:3"), sys),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("http://127.0.0.1:3"))
+        );
         // 显示的地址去掉账号密码，交给 git 的保留原样
         assert_eq!(
-            decide_proxy("auto", None, None, Some("http://u:p@127.0.0.1:1")),
+            decide_proxy("auto", None, &nothing, None, Some("http://u:p@127.0.0.1:1")),
             r(ProxyOverride::Use("http://u:p@127.0.0.1:1".into()), ProxySource::System, Some("http://127.0.0.1:1"))
         );
         assert_eq!(
-            decide_proxy("auto", None, Some("user:pw@127.0.0.1:2"), None),
+            decide_proxy("auto", None, &nothing, Some("user:pw@127.0.0.1:2"), None),
             r(ProxyOverride::Inherit, ProxySource::Git, Some("127.0.0.1:2"))
         );
 
-        // 不用代理：不管 git 和系统怎么配，都完全不走代理
-        assert_eq!(decide_proxy("off", None, git, sys), r(ProxyOverride::Disable, ProxySource::NoProxy, None));
-
-        // 手动：用填写的地址
+        // 自动：只按网址配了代理（http.https://github.com.proxy）→ 也算 git 自己配了代理，不覆盖
+        let github = cfg(None, &[("https://github.com", "socks5://127.0.0.1:10808")]);
         assert_eq!(
-            decide_proxy("manual", Some("http://127.0.0.1:7890"), git, sys),
+            decide_proxy("auto", None, &github, None, sys),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("socks5://127.0.0.1:10808（仅 https://github.com）"))
+        );
+        let two = cfg(Some(""), &[("https://a.example", ""), ("https://github.com", "http://h:1"), ("https://gitlab.com", "http://h:2")]);
+        assert_eq!(
+            decide_proxy("auto", None, &two, None, sys),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("http://h:1（仅 https://github.com 等 2 个网址）"))
+        );
+        // 自动：按网址的设置只有"这个网址不用代理"→ 不算，照常用系统代理，而且不去盖这些网址的设置
+        let direct_only = cfg(None, &[("https://git.corp.local", "")]);
+        assert_eq!(
+            decide_proxy("auto", None, &direct_only, None, sys),
+            r(ProxyOverride::Use("http://127.0.0.1:10809".into()), ProxySource::System, Some("http://127.0.0.1:10809"))
+        );
+
+        // 不用代理：不管 git 和系统怎么配，都完全不走代理，按网址配的代理也盖住
+        assert_eq!(decide_proxy("off", None, &git, None, sys), r(ProxyOverride::Disable, ProxySource::NoProxy, None));
+        let off = decide_proxy("off", None, &two, None, sys);
+        assert_eq!(off.plan.over, ProxyOverride::Disable);
+        assert_eq!(off.plan.url_scopes, ["https://a.example", "https://github.com", "https://gitlab.com"]);
+
+        // 手动：用填写的地址，按网址配的代理也盖住
+        assert_eq!(
+            decide_proxy("manual", Some("http://127.0.0.1:7890"), &git, None, sys),
             r(ProxyOverride::Use("http://127.0.0.1:7890".into()), ProxySource::Manual, Some("http://127.0.0.1:7890"))
         );
+        let manual = decide_proxy("manual", Some("http://127.0.0.1:7890"), &github, None, sys);
+        assert_eq!(manual.plan.url_scopes, ["https://github.com"]);
         // 手动但没有可用的地址（配置被手动改坏）→ 按自动处理
-        assert_eq!(decide_proxy("manual", None, None, sys), decide_proxy("auto", None, None, sys));
+        assert_eq!(
+            decide_proxy("manual", None, &nothing, None, sys),
+            decide_proxy("auto", None, &nothing, None, sys)
+        );
     }
 }

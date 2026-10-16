@@ -268,7 +268,9 @@ function ProxyCard() {
         />
       )}
       <p className="mt-3 text-sm break-all">{current ? describeProxy(current) : "当前：正在检测…"}</p>
-      <p className="mt-1 text-xs text-muted-foreground">只影响 https 地址的仓库，SSH 地址的仓库不受影响</p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        只影响 https 地址的仓库，SSH 地址的仓库不受影响；仓库里单独配置的 remote.&lt;远程名&gt;.proxy 也不受这里影响
+      </p>
     </div>
   );
 }
