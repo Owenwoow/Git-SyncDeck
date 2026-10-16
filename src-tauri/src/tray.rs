@@ -3,8 +3,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use chrono::Local;
+use chrono::{DateTime, Local};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -147,7 +148,17 @@ pub struct Tray {
     icons: Vec<Image<'static>>,
     /// 已经排队等主线程更新，期间的其他更新请求合并掉
     pending: AtomicBool,
+    /// 上次显示的（颜色、悬停文字、菜单是否显示"恢复自动同步"）
     last: Mutex<Option<(TrayColor, String, bool)>>,
+    /// 已经安排了在这个时间（暂停到期）刷新一次托盘
+    expiry_timer: Mutex<Option<DateTime<Local>>>,
+}
+
+/// 点菜单里"暂停 / 恢复"后要保存的暂停时间：按菜单上**当前显示**的文字办事——
+/// 显示"恢复自动同步"就恢复（None），否则暂停到明天 00:00。
+/// 不能按此刻是否还在暂停中判断：暂停刚过期、菜单还没来得及刷新时，用户点"恢复"会被反过来暂停到下一个午夜
+pub fn pause_menu_target(shows_resume: bool, now: &DateTime<Local>) -> Option<DateTime<Local>> {
+    (!shows_resume).then(|| autosync::next_midnight(now))
 }
 
 /// 创建托盘。`host` 用于托盘"立即同步"后发事件和通知
@@ -186,7 +197,14 @@ pub fn create(app: &AppHandle, st: Shared, host: Arc<dyn Host>) -> tauri::Result
         })
         .build(app)?;
 
-    app.manage(Tray { icon, pause_item: pause, icons, pending: AtomicBool::new(false), last: Mutex::new(None) });
+    app.manage(Tray {
+        icon,
+        pause_item: pause,
+        icons,
+        pending: AtomicBool::new(false),
+        last: Mutex::new(None),
+        expiry_timer: Mutex::new(None),
+    });
     request_update(app);
     Ok(())
 }
@@ -196,9 +214,11 @@ fn on_menu(app: &AppHandle, id: &str, st: &Shared, host: &Arc<dyn Host>) {
         MENU_SYNC_NOW => autosync::spawn(st.clone(), host.clone(), AutoSyncTrigger::Manual),
         MENU_SHOW => show_main_window(app),
         MENU_PAUSE => {
-            let now = Local::now();
-            let paused = st.config.read(|c| autosync::active_pause(&c.settings, &now)).is_some();
-            let until = (!paused).then(|| autosync::next_midnight(&now));
+            let shows_resume = app
+                .try_state::<Tray>()
+                .and_then(|t| t.last.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|l| l.2))
+                .unwrap_or(false);
+            let until = pause_menu_target(shows_resume, &Local::now());
             if let Err(e) = commands::set_auto_sync_pause(st, until) {
                 eprintln!("保存暂停状态失败：{e}");
                 return;
@@ -263,6 +283,26 @@ fn apply(app: &AppHandle, tray: &Tray) {
     if prev.as_ref().map(|p| p.2) != Some(next.2) {
         let _ = tray.pause_item.set_text(if next.2 { RESUME_TEXT } else { PAUSE_TEXT });
     }
+    if let Some(until) = paused {
+        schedule_expiry_refresh(app, tray, until);
+    }
+}
+
+/// 暂停到期时刷新一次托盘（菜单文字变回"暂停自动同步"、悬停文字去掉暂停那一行）。
+/// 同一个到期时间只安排一次；睡过了头也没关系，唤醒后的同步会触发刷新，而且菜单按显示的文字办事
+fn schedule_expiry_refresh(app: &AppHandle, tray: &Tray, until: DateTime<Local>) {
+    let mut scheduled = tray.expiry_timer.lock().unwrap_or_else(|e| e.into_inner());
+    if *scheduled == Some(until) {
+        return;
+    }
+    *scheduled = Some(until);
+    drop(scheduled);
+    let wait = (until - Local::now()).to_std().unwrap_or_default() + Duration::from_secs(1);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(wait).await;
+        request_update(&app);
+    });
 }
 
 #[cfg(test)]
@@ -322,6 +362,17 @@ mod tests {
             s(&list, false),
             TraySummary { color: TrayColor::Red, text: "3 个项目需要处理，2 个项目待推送或有改动".into() }
         );
+    }
+
+    #[test]
+    fn pause_menu_follows_what_it_shows() {
+        let now = Local::now();
+        // 菜单显示"恢复自动同步"：不管此刻暂停是否已经过期，点了就是恢复
+        assert_eq!(pause_menu_target(true, &now), None);
+        // 菜单显示"暂停自动同步（到明天）"：暂停到明天 00:00
+        let until = pause_menu_target(false, &now).unwrap();
+        assert_eq!(until, autosync::next_midnight(&now));
+        assert!(until > now);
     }
 
     #[test]
