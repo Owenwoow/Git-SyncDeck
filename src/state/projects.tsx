@@ -46,8 +46,10 @@ interface ProjectsContextValue {
   projects: Project[];
   loading: boolean;
   refreshing: boolean;
+  /** 本轮刷新里还没检查完的项目 id（每个项目检查完就移出） */
+  checkingIds: ReadonlySet<string>;
   reload: () => Promise<void>;
-  /** 联网刷新所有项目的状态，返回刷新后的列表 */
+  /** 联网刷新所有项目的状态（每个项目检查完就更新对应行），返回刷新后的列表 */
   refresh: () => Promise<Project[]>;
   commitAndPush: (id: string, message: string) => Promise<Project>;
   /** 打开 / 关闭"一键同步时自动提交" */
@@ -66,12 +68,38 @@ function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+const NO_IDS: ReadonlySet<string> = new Set();
+
+/** 用刷新结果更新列表：只更新列表里还在的项目（刷新途中取消监控的不再加回来），
+ *  一键同步已经开始处理的项目保留"同步中"，等同步结果覆盖 */
+function applyChecked(list: Project[], checked: Project[]): Project[] {
+  const byId = new Map(checked.map((p) => [p.id, p]));
+  return list.map((p) => {
+    const next = byId.get(p.id);
+    return next && p.status !== "syncing" ? next : p;
+  });
+}
+
 export function ProjectsProvider({ children }: { children: ReactNode }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  /** 本轮刷新里已经检查完的项目；null 表示没在刷新 */
+  const [checkedIds, setCheckedIds] = useState<ReadonlySet<string> | null>(null);
+  /** 刷新轮次：连续触发两次刷新时，只有最后一轮结束才算刷新结束 */
+  const refreshRound = useRef(0);
   const [sync, setSync] = useState<SyncState>(idleSync);
   const started = useRef(false);
+  // 一键同步开始处理某个项目时读取它的最新状态（可能是刷新途中点的一键同步）
+  const projectsRef = useRef(projects);
+  useEffect(() => {
+    projectsRef.current = projects;
+  }, [projects]);
+
+  const checkingIds = useMemo<ReadonlySet<string>>(
+    () => (checkedIds ? new Set(projects.filter((p) => !checkedIds.has(p.id)).map((p) => p.id)) : NO_IDS),
+    [projects, checkedIds],
+  );
 
   const replaceProject = useCallback((next: Project) => {
     setProjects((list) => list.map((p) => (p.id === next.id ? next : p)));
@@ -92,13 +120,21 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refresh = useCallback(async () => {
+    const round = ++refreshRound.current;
     setRefreshing(true);
+    setCheckedIds(new Set());
     try {
-      const list = await api.refreshStatus();
-      setProjects(list);
+      const list = await api.refreshStatus((p) => {
+        setProjects((cur) => applyChecked(cur, [p]));
+        if (refreshRound.current === round) setCheckedIds((ids) => (ids ? new Set(ids).add(p.id) : ids));
+      });
+      setProjects((cur) => applyChecked(cur, list));
       return list;
     } finally {
-      setRefreshing(false);
+      if (refreshRound.current === round) {
+        setRefreshing(false);
+        setCheckedIds(null);
+      }
     }
   }, []);
 
@@ -134,8 +170,17 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     try {
       await api.syncAll((e) => {
         if (e.type === "start") {
+          // 刷新途中点的一键同步：后端等刷新结束才开始，这时用刷新后的状态显示"正在推送 N 个提交"
+          const latest = projectsRef.current.find((p) => p.id === e.projectId);
           setStatus(e.projectId, "syncing");
-          setSync((s) => ({ ...s, activeIds: [...s.activeIds, e.projectId] }));
+          setSync((s) => ({
+            ...s,
+            activeIds: [...s.activeIds, e.projectId],
+            before:
+              latest && latest.status !== "syncing"
+                ? { ...s.before, [e.projectId]: { status: latest.status, ahead: latest.ahead, behind: latest.behind } }
+                : s.before,
+          }));
         } else {
           replaceProject(e.project);
           setSync((s) => ({
@@ -199,6 +244,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       projects,
       loading,
       refreshing,
+      checkingIds,
       reload,
       refresh,
       commitAndPush,
@@ -209,7 +255,21 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       closeSync,
       skipInSync,
     }),
-    [projects, loading, refreshing, reload, refresh, commitAndPush, setAutoCommit, removeProject, sync, startSync, closeSync, skipInSync],
+    [
+      projects,
+      loading,
+      refreshing,
+      checkingIds,
+      reload,
+      refresh,
+      commitAndPush,
+      setAutoCommit,
+      removeProject,
+      sync,
+      startSync,
+      closeSync,
+      skipInSync,
+    ],
   );
 
   return <ProjectsContext.Provider value={value}>{children}</ProjectsContext.Provider>;

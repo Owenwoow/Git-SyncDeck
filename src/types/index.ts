@@ -84,6 +84,9 @@ export type SyncProgressEvent =
   | { type: "start"; projectId: string; index: number; total: number }
   | { type: "done"; result: SyncItemResult; project: Project; index: number; total: number };
 
+/** 刷新状态的进度事件：每个项目检查完立即发一次，index 为完成顺序（从 0 开始） */
+export type RefreshProgressEvent = { type: "done"; project: Project; index: number; total: number };
+
 export interface SyncResult {
   startedAt: string;
   finishedAt: string;

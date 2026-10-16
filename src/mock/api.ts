@@ -31,9 +31,27 @@ export async function listProjects(): Promise<Project[]> {
   return clone(db.monitoredProjects());
 }
 
-export async function refreshStatus(): Promise<Project[]> {
-  await delay(800);
-  return clone(db.monitoredProjects());
+/** 正在进行的刷新；一键同步要等它结束（和真实实现一样，联网操作互斥） */
+let refreshing: Promise<unknown> | null = null;
+
+/** 演示：每个项目各自"联网"一段时间，检查完就回调一次 */
+export async function refreshStatus(onProgress?: (p: Project) => void): Promise<Project[]> {
+  const run = (async () => {
+    await Promise.all(
+      db.monitoredProjects().map(async (p) => {
+        await delay(jitter(400, 2600));
+        const latest = db.getRepo(p.id);
+        if (latest && db.isMonitored(p.id)) onProgress?.(clone(latest));
+      }),
+    );
+    return clone(db.monitoredProjects());
+  })();
+  refreshing = run;
+  try {
+    return await run;
+  } finally {
+    if (refreshing === run) refreshing = null;
+  }
 }
 
 export async function addProjects(paths: string[]): Promise<Project[]> {
@@ -92,6 +110,8 @@ export async function scanDirectory(dir: string): Promise<ScannedRepo[]> {
 
 export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promise<SyncResult> {
   const startedAt = new Date().toISOString();
+  // 刷新进行中时先等它结束，再复用刚检查过的结果
+  await refreshing?.catch(() => undefined);
   const queue = sortProjects(db.monitoredProjects());
   const total = queue.length;
   const items: SyncItemResult[] = [];

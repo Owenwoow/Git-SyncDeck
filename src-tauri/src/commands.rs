@@ -172,15 +172,28 @@ pub async fn list_projects(state: State<'_, Shared>) -> Result<Vec<Project>, Str
     .await)
 }
 
+/// 联网刷新所有项目：每个项目检查完就通过 `on_event` 发一次 Done，最后仍返回完整列表
 #[tauri::command]
-pub async fn refresh_status(state: State<'_, Shared>) -> Result<Vec<Project>, String> {
+pub async fn refresh_status(
+    state: State<'_, Shared>,
+    on_event: Channel<RefreshProgressEvent>,
+) -> Result<Vec<Project>, String> {
     let st = state.inner().clone();
     let _net = st.net_lock.lock().await;
     let stored = st.config.read(|c| c.projects.clone());
+    let total = stored.len();
+    let finished = Arc::new(AtomicUsize::new(0));
     let st2 = st.clone();
     Ok(map_limited(stored, CONCURRENCY, move |sp| {
         let st = st2.clone();
-        async move { remote_project(&st, &sp).await }
+        let on_event = on_event.clone();
+        let finished = finished.clone();
+        async move {
+            let project = remote_project(&st, &sp).await;
+            let index = finished.fetch_add(1, Ordering::SeqCst);
+            let _ = on_event.send(RefreshProgressEvent::Done { project: project.clone(), index, total });
+            project
+        }
     })
     .await)
 }

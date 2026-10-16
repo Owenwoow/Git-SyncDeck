@@ -9,6 +9,7 @@ import type {
   CommitInfo,
   GitInfo,
   Project,
+  RefreshProgressEvent,
   ScannedRepo,
   Settings,
   SyncProgressEvent,
@@ -39,9 +40,11 @@ export function listProjects(): Promise<Project[]> {
   return call("list_projects");
 }
 
-/** git fetch + git status，最多 8 个项目并行 */
-export function refreshStatus(): Promise<Project[]> {
-  return call("refresh_status");
+/** git fetch + git status，最多 8 个项目并行；每个项目检查完就通过 onProgress 回调一次，最后返回完整列表 */
+export function refreshStatus(onProgress?: (p: Project) => void): Promise<Project[]> {
+  const onEvent = new Channel<RefreshProgressEvent>();
+  if (onProgress) onEvent.onmessage = (e) => onProgress(e.project);
+  return call("refresh_status", { onEvent });
 }
 
 export function addProjects(paths: string[]): Promise<Project[]> {

@@ -1,4 +1,4 @@
-import { AlertTriangle, GitBranch, GitCommitHorizontal } from "lucide-react";
+import { AlertTriangle, GitBranch, GitCommitHorizontal, Loader2 } from "lucide-react";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { repoShortName } from "@/lib/status";
@@ -6,18 +6,21 @@ import { formatDateTime, formatRelative } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import type { Project } from "@/types";
 
-// 列宽：窄窗口时隐藏"GitHub 仓库"列（容器查询，见 App 里 main 的 @container）
+// 列宽：窄窗口时隐藏"GitHub 仓库"列（容器查询，见 App 里 main 的 @container）；状态列留出刷新时小转圈的位置
 const GRID =
-  "grid grid-cols-[minmax(0,1fr)_7.5rem_5.5rem] @3xl:grid-cols-[minmax(0,1fr)_minmax(0,12rem)_7.5rem_5.5rem] items-center gap-4";
+  "grid grid-cols-[minmax(0,1fr)_8.25rem_5.5rem] @3xl:grid-cols-[minmax(0,1fr)_minmax(0,12rem)_8.25rem_5.5rem] items-center gap-4";
 
 export function ProjectList({
   projects,
   selectedId,
   onSelect,
+  checkingIds,
 }: {
   projects: Project[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  /** 刷新时还没检查完的项目，状态旁显示小转圈 */
+  checkingIds?: ReadonlySet<string>;
 }) {
   return (
     <div className="overflow-hidden rounded-lg border bg-card">
@@ -30,7 +33,12 @@ export function ProjectList({
       <ul className="divide-y">
         {projects.map((p) => (
           <li key={p.id}>
-            <ProjectRow project={p} selected={p.id === selectedId} onClick={() => onSelect(p.id)} />
+            <ProjectRow
+              project={p}
+              selected={p.id === selectedId}
+              checking={checkingIds?.has(p.id) ?? false}
+              onClick={() => onSelect(p.id)}
+            />
           </li>
         ))}
       </ul>
@@ -41,10 +49,12 @@ export function ProjectList({
 function ProjectRow({
   project: p,
   selected,
+  checking,
   onClick,
 }: {
   project: Project;
   selected: boolean;
+  checking: boolean;
   onClick: () => void;
 }) {
   const repo = repoShortName(p.remoteUrl);
@@ -100,7 +110,12 @@ function ProjectRow({
         )}
       </div>
 
-      <StatusBadge status={p.status} />
+      <div className="flex min-w-0 items-center gap-1.5">
+        <StatusBadge status={p.status} />
+        {checking && (
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" aria-label="正在检查" />
+        )}
+      </div>
 
       <span
         className="text-right text-xs text-muted-foreground tabular-nums"

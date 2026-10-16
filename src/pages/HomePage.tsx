@@ -12,7 +12,7 @@ import { useProjects } from "@/state/projects";
 
 /** 主页：监控中的项目 */
 export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
-  const { projects, loading, refreshing, refresh, sync, startSync } = useProjects();
+  const { projects, loading, refreshing, checkingIds, refresh, sync, startSync } = useProjects();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -50,7 +50,8 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
             <RefreshCw className={refreshing ? "animate-spin" : undefined} />
             {refreshing ? "正在刷新…" : "刷新状态"}
           </Button>
-          <Button onClick={startSync} disabled={syncing || refreshing || loading || projects.length === 0}>
+          {/* 刷新途中也可以点：后端会等这一轮检查结束，再复用刚检查过的结果 */}
+          <Button onClick={startSync} disabled={syncing || loading || projects.length === 0}>
             <ArrowUpDown />
             一键同步
           </Button>
@@ -72,9 +73,8 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
             onFilterChange={setFilter}
           />
           {visible.length ? (
-            <div className={refreshing ? "pointer-events-none opacity-60 transition-opacity" : "transition-opacity"}>
-              <ProjectList projects={visible} selectedId={selectedId} onSelect={setSelectedId} />
-            </div>
+            // 刷新时不再整体变灰：每个项目检查完就更新那一行，没检查完的行在状态旁转圈
+            <ProjectList projects={visible} selectedId={selectedId} onSelect={setSelectedId} checkingIds={checkingIds} />
           ) : (
             <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed py-12 text-sm text-muted-foreground">
               <SearchX className="size-6" />

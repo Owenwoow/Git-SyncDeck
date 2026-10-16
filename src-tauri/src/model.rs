@@ -127,6 +127,14 @@ pub enum SyncProgressEvent {
     Done { result: SyncItemResult, project: Project, index: usize, total: usize },
 }
 
+/// 刷新状态的进度事件：每个项目检查完立即发一次，index 为完成顺序（0 起）
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum RefreshProgressEvent {
+    #[serde(rename_all = "camelCase")]
+    Done { project: Project, index: usize, total: usize },
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncResult {

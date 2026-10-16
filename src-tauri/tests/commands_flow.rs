@@ -1,5 +1,5 @@
 //! 命令层端到端测试：用 Tauri 的模拟运行时直接调用前端会调用的命令，
-//! 覆盖 扫描 → 添加 → 刷新 → 一键同步（进度通道）→ 提交并推送 → 持久化 → 取消监控。
+//! 覆盖 扫描 → 添加 → 刷新（进度通道）→ 一键同步（进度通道）→ 提交并推送 → 持久化 → 取消监控。
 //! 只使用临时测试仓库和临时配置目录。
 //! 运行：cd src-tauri && cargo test --test commands_flow -- --nocapture
 
@@ -87,9 +87,30 @@ async fn full_command_flow() {
     let rescanned = commands::scan_directory(app.state(), repos.to_string_lossy().into()).await.unwrap();
     assert!(rescanned.iter().all(|r| r.monitored && r.project_id.is_some()));
 
-    // 刷新：fetch + status
-    let list = commands::refresh_status(app.state()).await.unwrap();
-    println!("\n== 刷新状态 ==");
+    // 刷新：fetch + status，每个项目检查完就通过 Channel 发一次 done
+    let refresh_events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let sink = refresh_events.clone();
+    let channel = Channel::new(move |body| {
+        if let InvokeResponseBody::Json(s) = body {
+            sink.lock().unwrap().push(serde_json::from_str(&s).unwrap());
+        }
+        Ok(())
+    });
+    let list = commands::refresh_status(app.state(), channel).await.unwrap();
+    let refresh_events = refresh_events.lock().unwrap().clone();
+    println!("\n== 刷新状态（{} 个进度事件）==", refresh_events.len());
+    assert_eq!(refresh_events.len(), 11, "每个项目各发一次");
+    assert!(refresh_events.iter().all(|e| e["type"] == "done" && e["total"] == 11));
+    let mut idx: Vec<u64> = refresh_events.iter().map(|e| e["index"].as_u64().unwrap()).collect();
+    idx.sort();
+    assert_eq!(idx, (0..11).collect::<Vec<_>>(), "index 是完成顺序 0..10");
+    // 事件里的项目和最终返回的列表一一对应、内容一致
+    let mut from_events: Vec<serde_json::Value> = refresh_events.iter().map(|e| e["project"].clone()).collect();
+    let mut from_list: Vec<serde_json::Value> = list.iter().map(|p| serde_json::to_value(p).unwrap()).collect();
+    let by_id = |a: &serde_json::Value, b: &serde_json::Value| a["id"].as_str().cmp(&b["id"].as_str());
+    from_events.sort_by(by_id);
+    from_list.sort_by(by_id);
+    assert_eq!(from_events, from_list);
     for p in &list {
         println!(
             "  {:<13} {:<6} {}",
