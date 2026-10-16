@@ -2,6 +2,8 @@
 // 函数签名必须与 src/api/tauri.ts 完全一致。
 import { toast } from "sonner";
 import type {
+  AutoSyncEvent,
+  AutoSyncState,
   CommitInfo,
   GitInfo,
   Project,
@@ -11,6 +13,7 @@ import type {
   SyncItemResult,
   SyncProgressEvent,
   SyncResult,
+  Unlisten,
   UpdateInfo,
   UpdateProgress,
 } from "@/types";
@@ -18,7 +21,7 @@ import { buildDiagnosticText } from "@/lib/diagnostic";
 import { DEFAULT_COMMIT_TEMPLATE, NETWORK_TIMEOUT_CHOICES, describeIssue, isAbnormal, sortProjects, willAutoCommit } from "@/lib/status";
 import { formatDateTime } from "@/lib/time";
 import { clone, db, delay, jitter } from "./db";
-import { defaultSettings, demoSystemProxy, pickableDirs } from "./repos";
+import { defaultSettings, demoHostName, demoSystemProxy, pickableDirs } from "./repos";
 
 // ---------------- 项目 ----------------
 
@@ -218,8 +221,8 @@ export async function openInEditor(projectId: string): Promise<string> {
 
 const SETTINGS_KEY = "syncdeck.settings";
 
-/** 保存在 localStorage 里的部分（实际生效的代理是每次读取时算出来的） */
-type StoredSettings = Omit<Settings, "effectiveProxy" | "proxySource">;
+/** 保存在 localStorage 里的部分（实际生效的代理、系统电脑名是每次读取时算出来的） */
+type StoredSettings = Omit<Settings, "effectiveProxy" | "proxySource" | "defaultHostName">;
 
 const PROXY_MODES: readonly ProxyMode[] = ["auto", "off", "manual"];
 const PROXY_FORMAT_HINT =
@@ -235,13 +238,31 @@ function normalizeProxyUrl(input: string): string {
   return `${m[1].toLowerCase()}://${m[2]}`;
 }
 
-/** 演示：按代理模式算出"当前实际使用的代理"（自动模式假装探测到了系统代理） */
-function withProxy(s: StoredSettings): Settings {
+/** 演示：按代理模式算出"当前实际使用的代理"（自动模式假装探测到了系统代理）；补上系统电脑名，去掉已过期的暂停 */
+function withProxy(stored: StoredSettings): Settings {
+  const paused = stored.autoSyncPausedUntil && Date.parse(stored.autoSyncPausedUntil) > Date.now();
+  const s = { ...stored, defaultHostName: demoHostName, autoSyncPausedUntil: paused ? stored.autoSyncPausedUntil : null };
   if (s.proxyMode === "off") return { ...s, effectiveProxy: null, proxySource: "none" };
   if (s.proxyMode === "manual" && s.proxyUrl) {
     return { ...s, effectiveProxy: s.proxyUrl.replace(/:\/\/[^@/]*@/, "://"), proxySource: "manual" };
   }
   return { ...s, effectiveProxy: demoSystemProxy, proxySource: "system" };
+}
+
+/** 和真实实现（commands.rs 的 validate_host_name）规则一致 */
+function normalizeHostName(input: string): string {
+  const name = input.trim();
+  if (/[\u0000-\u001f\u007f]/.test(name)) throw new Error("本机名称不能包含换行等控制字符");
+  if ([...name].length > 40) throw new Error("本机名称最多 40 个字");
+  return name;
+}
+
+function writeSettings(s: StoredSettings) {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  } catch {
+    // 存储不可用时只在本次会话生效
+  }
 }
 
 function systemTheme(): Settings["theme"] {
@@ -280,6 +301,7 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
     proxyUrl = url ? normalizeProxyUrl(url) : null;
   }
   if (proxyMode === "manual" && !proxyUrl) throw new Error("选择手动填写时，请先填好代理地址");
+  const hostName = patch.hostName !== undefined ? normalizeHostName(patch.hostName) : cur.hostName;
 
   const next: StoredSettings = {
     defaultCodeDir: patch.defaultCodeDir ?? cur.defaultCodeDir,
@@ -289,13 +311,64 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
     networkTimeoutSecs: patch.networkTimeoutSecs ?? cur.networkTimeoutSecs,
     proxyMode,
     proxyUrl,
+    hostName,
+    launchAtLogin: patch.launchAtLogin ?? cur.launchAtLogin,
+    closeToTray: patch.closeToTray ?? cur.closeToTray,
+    syncOnShutdown: patch.syncOnShutdown ?? cur.syncOnShutdown,
+    syncOnLock: patch.syncOnLock ?? cur.syncOnLock,
+    syncOnSleep: patch.syncOnSleep ?? cur.syncOnSleep,
+    syncOnStartup: patch.syncOnStartup ?? cur.syncOnStartup,
+    syncOnResume: patch.syncOnResume ?? cur.syncOnResume,
+    syncOnUnlock: patch.syncOnUnlock ?? cur.syncOnUnlock,
+    periodicCheck: patch.periodicCheck ?? cur.periodicCheck,
+    notifyOnSuccess: patch.notifyOnSuccess ?? cur.notifyOnSuccess,
+    notifyOnError: patch.notifyOnError ?? cur.notifyOnError,
+    // 只读：暂停只能通过 pauseAutoSync / resumeAutoSync 修改
+    autoSyncPausedUntil: cur.autoSyncPausedUntil,
   };
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
-  } catch {
-    // 存储不可用时只在本次会话生效
-  }
+  writeSettings(next);
   return withProxy(next);
+}
+
+/** 演示：没有托盘，不会推送设置变化 */
+export async function onSettingsChanged(_cb: (s: Settings) => void): Promise<Unlisten> {
+  return () => {};
+}
+
+// ---------------- 换电脑自动同步（演示：没有后台同步，只能暂停 / 恢复）----------------
+
+/** 演示：暂停到本地时间明天 00:00 */
+export async function pauseAutoSync(): Promise<Settings> {
+  await delay(100);
+  const midnight = new Date();
+  midnight.setHours(24, 0, 0, 0);
+  const next = { ...readSettings(), autoSyncPausedUntil: midnight.toISOString() };
+  writeSettings(next);
+  return withProxy(next);
+}
+
+export async function resumeAutoSync(): Promise<Settings> {
+  await delay(100);
+  const next = { ...readSettings(), autoSyncPausedUntil: null };
+  writeSettings(next);
+  return withProxy(next);
+}
+
+export async function getAutoSyncState(): Promise<AutoSyncState> {
+  await delay(30);
+  return { running: null, startupSync: false };
+}
+
+/** 演示：没有后台同步，不会推送 */
+export async function onProjectsChanged(_cb: (list: Project[]) => void): Promise<Unlisten> {
+  return () => {};
+}
+
+export async function onAutoSync(_handlers: {
+  started: (e: AutoSyncEvent) => void;
+  finished: (e: AutoSyncEvent) => void;
+}): Promise<Unlisten> {
+  return () => {};
 }
 
 // ---------------- 应用更新（演示）----------------

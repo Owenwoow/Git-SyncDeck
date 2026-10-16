@@ -11,7 +11,7 @@ import {
 import { toast } from "sonner";
 import * as api from "@/api";
 import { sortProjects } from "@/lib/status";
-import type { Project, SyncItemResult, SyncStatus } from "@/types";
+import type { AutoSyncEvent, Project, SyncItemResult, SyncStatus } from "@/types";
 
 export interface SyncState {
   phase: "idle" | "running" | "done";
@@ -60,6 +60,8 @@ interface ProjectsContextValue {
   startSync: () => Promise<void>;
   closeSync: () => void;
   skipInSync: (id: string) => void;
+  /** 正在进行的后台自动同步（锁屏、解锁、托盘立即同步……）；null 表示没有 */
+  autoSync: AutoSyncEvent | null;
 }
 
 const ProjectsContext = createContext<ProjectsContextValue | null>(null);
@@ -81,6 +83,15 @@ function applyChecked(list: Project[], checked: Project[]): Project[] {
   });
 }
 
+/** 用后台检查 / 同步推来的列表更新：只更新列表里还在的项目，一键同步正在处理的保留"同步中" */
+function applyBackground(list: Project[], incoming: Project[]): Project[] {
+  const byId = new Map(incoming.map((p) => [p.id, p]));
+  return list.map((p) => {
+    const next = byId.get(p.id);
+    return next && p.status !== "syncing" ? next : p;
+  });
+}
+
 export function ProjectsProvider({ children }: { children: ReactNode }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
@@ -90,6 +101,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
   /** 刷新轮次：连续触发两次刷新时，只有最后一轮结束才算刷新结束 */
   const refreshRound = useRef(0);
   const [sync, setSync] = useState<SyncState>(idleSync);
+  const [autoSync, setAutoSync] = useState<AutoSyncEvent | null>(null);
   const started = useRef(false);
   // 一键同步开始处理某个项目时读取它的最新状态（可能是刷新途中点的一键同步）
   const projectsRef = useRef(projects);
@@ -139,11 +151,18 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // 启动：检测 git → 先显示本地状态（不联网）→ 后台自动联网刷新一次
+  // 启动：挂上后台事件的监听 → 检测 git → 先显示本地状态（不联网）→ 联网刷新一次。
+  // 打开了"启动时同步"时，启动的到达同步由后端做：前端只显示本地状态，等后端推结果，避免同时跑两轮。
+  // 监听在整个应用期间都有效（这个 Provider 不会卸载），所以不取消
   useEffect(() => {
     if (started.current) return; // 开发模式下 StrictMode 会执行两次 effect，避免重复 fetch
     started.current = true;
     (async () => {
+      // 先挂监听再读列表：后台同步刚好在这之间结束也不会漏掉结果
+      await Promise.all([
+        api.onProjectsChanged((list) => setProjects((cur) => applyBackground(cur, list))),
+        api.onAutoSync({ started: setAutoSync, finished: () => setAutoSync(null) }),
+      ]).catch(() => undefined);
       const git = await api.checkGit().catch(() => ({ installed: false, version: null }));
       if (!git.installed) {
         toast.error("未检测到 Git", {
@@ -152,7 +171,9 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
         });
       }
       await reload();
-      if (git.installed) await refresh().catch(() => undefined);
+      const auto = await api.getAutoSyncState().catch(() => ({ running: null, startupSync: false }));
+      setAutoSync((cur) => cur ?? auto.running);
+      if (git.installed && !auto.startupSync) await refresh().catch(() => undefined);
     })();
   }, [reload, refresh]);
 
@@ -255,6 +276,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       startSync,
       closeSync,
       skipInSync,
+      autoSync,
     }),
     [
       projects,
@@ -270,6 +292,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       startSync,
       closeSync,
       skipInSync,
+      autoSync,
     ],
   );
 
