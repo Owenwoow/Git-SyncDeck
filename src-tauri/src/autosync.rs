@@ -243,11 +243,17 @@ where
     }
 }
 
-/// 离开时要同步的项目（只看本地检查的结果，不联网）：待推送的；有未提交改动且打开了自动提交的
-pub fn pick_departure(projects: &[Project]) -> Vec<String> {
+/// 离开时要同步的项目（只看本地检查的结果，不联网）：待推送的；有未提交改动且打开了自动提交的；
+/// 打开了自动合并时还有分叉的（本地也有没推上去的提交，预演无冲突就能合并后推送）
+pub fn pick_departure(projects: &[Project], auto_merge: bool) -> Vec<String> {
     projects
         .iter()
-        .filter(|p| p.status == SyncStatus::Ahead || (p.status == SyncStatus::Dirty && p.auto_commit))
+        .filter(|p| match p.status {
+            SyncStatus::Ahead => true,
+            SyncStatus::Dirty => p.auto_commit,
+            SyncStatus::Diverged => auto_merge,
+            _ => false,
+        })
         .map(|p| p.id.clone())
         .collect()
 }
@@ -532,7 +538,7 @@ async fn execute(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger, force: 
 /// 离开：先本地检查所有项目（不联网），只同步有东西要推的；一个都没有就完全不联网
 async fn departure(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> Outcome {
     let local = commands::local_projects(st).await;
-    let ids = pick_departure(&local);
+    let ids = pick_departure(&local, st.config.read(commands::auto_merge_of));
     if ids.is_empty() {
         host.projects_changed(st.snapshot());
         host.finished(trigger, None);
@@ -774,8 +780,9 @@ mod tests {
             project("diverged", SyncStatus::Diverged, true),
             project("no-remote", SyncStatus::NoRemote, true),
         ];
-        assert_eq!(pick_departure(&list), ["ahead", "dirty-auto"]);
-        assert!(pick_departure(&[project("a", SyncStatus::Synced, false)]).is_empty(), "没有要推的就不联网");
+        assert_eq!(pick_departure(&list, false), ["ahead", "dirty-auto"]);
+        assert_eq!(pick_departure(&list, true), ["ahead", "dirty-auto", "diverged"], "打开自动合并时分叉的也要试着推");
+        assert!(pick_departure(&[project("a", SyncStatus::Synced, false)], true).is_empty(), "没有要推的就不联网");
     }
 
     fn result(items: &[(&str, SyncOutcome)]) -> SyncResult {

@@ -8,6 +8,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { ProjectActions } from "@/components/projects/ProjectActions";
 import { cn } from "@/lib/utils";
 import { useProjects, type SyncState } from "@/state/projects";
+import { useSettings } from "@/state/settings";
 import type { Project, SyncItemResult } from "@/types";
 
 /** 一键同步对话框：进行中显示逐个进度，结束后显示结果与异常处理 */
@@ -69,10 +70,11 @@ function ProgressRow({ project: p, sync }: { project: Project; sync: SyncState }
   const result = sync.results[p.id];
   const active = sync.activeIds.includes(p.id) && !result;
   const before = sync.before[p.id];
+  const autoMerge = useSettings().settings?.autoMerge ?? true;
 
   let text: React.ReactNode;
   if (result) text = <OutcomeText result={result} />;
-  else if (active) text = <span className="text-status-syncing">{activeText(before, p.autoCommit)}</span>;
+  else if (active) text = <span className="text-status-syncing">{activeText(before, p.autoCommit, autoMerge)}</span>;
   else
     text = (
       <span className="inline-flex items-center gap-1 text-muted-foreground">
@@ -93,7 +95,11 @@ function ProgressRow({ project: p, sync }: { project: Project; sync: SyncState }
   );
 }
 
-function activeText(before: SyncState["before"][string] | undefined, autoCommit: boolean): string {
+function activeText(
+  before: SyncState["before"][string] | undefined,
+  autoCommit: boolean,
+  autoMerge: boolean,
+): string {
   switch (before?.status) {
     case "dirty":
       return autoCommit ? "正在自动提交并推送…" : "正在检查…";
@@ -103,6 +109,8 @@ function activeText(before: SyncState["before"][string] | undefined, autoCommit:
       return `正在拉取 ${before.behind} 个提交…`;
     case "synced":
       return "正在检查云端…";
+    case "diverged":
+      return autoMerge ? "正在预演合并…" : "正在检查…";
     default:
       return "正在检查…";
   }
@@ -118,6 +126,8 @@ function OutcomeText({ result }: { result: SyncItemResult }) {
       return <span className="text-muted-foreground">已是最新</span>;
     case "committed":
       return <span className="text-status-synced">已自动提交并推送 {result.commits} 个提交</span>;
+    case "merged":
+      return <span className="text-status-synced">已自动合并并推送 {result.commits} 个提交</span>;
     case "failed":
       return <span className="text-status-dirty">需要手动处理</span>;
   }

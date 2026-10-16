@@ -106,6 +106,8 @@ pub enum SyncOutcome {
     /// 已自动提交并推送
     Committed,
     Failed,
+    /// 分叉时预演合并没有冲突，已自动合并并推送（commits 为推送的提交数，含合并提交）
+    Merged,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +193,12 @@ pub struct Settings {
     pub notify_on_error: bool,
     /// 只读：自动同步暂停到什么时候（RFC 3339，带时区）；None 表示没暂停。用 pause_auto_sync / resume_auto_sync 修改
     pub auto_sync_paused_until: Option<String>,
+    /// 分叉时先预演合并，没有冲突就自动合并并推送（默认开）
+    pub auto_merge: bool,
+    /// 自动提交前检查大文件和疑似密钥文件（默认开）
+    pub precommit_check: bool,
+    /// 提交前检查的单个文件大小上限（MB，默认 50）
+    pub big_file_limit_mb: u64,
 }
 
 /// 实际生效的代理来自哪里
@@ -235,6 +243,10 @@ pub struct SettingsPatch {
     pub periodic_check: Option<bool>,
     pub notify_on_success: Option<bool>,
     pub notify_on_error: Option<bool>,
+    pub auto_merge: Option<bool>,
+    pub precommit_check: Option<bool>,
+    /// 只能在 1 ~ ops::MAX_BIG_FILE_LIMIT_MB 之间
+    pub big_file_limit_mb: Option<u64>,
 }
 
 /// 自动同步的触发原因。离开：关机 / 锁屏 / 睡眠；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端
@@ -292,4 +304,8 @@ pub struct CommitInfo {
 pub struct DiagnosticInfo {
     pub project: Project,
     pub recent_commits: Vec<CommitInfo>,
+    /// 分叉时用 merge-tree 预演合并算出的冲突文件；不是分叉、没有冲突或无法预演时为空
+    pub conflict_files: Vec<String>,
+    /// 云端（上游分支）最近 3 次提交；没有上游时为空
+    pub recent_remote_commits: Vec<CommitInfo>,
 }

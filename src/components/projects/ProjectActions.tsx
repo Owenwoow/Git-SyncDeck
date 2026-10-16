@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, Code2, Copy, ExternalLink, SkipForward, SquareTerminal, Upload } from "lucide-react";
+import { Bot, ChevronDown, Code2, Copy, ExternalLink, SkipForward, SquareTerminal, Upload } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,7 @@ import type { Project } from "@/types";
 /**
  * 异常项目的操作按钮组。一键同步结果和详情抽屉共用。
  * 详情抽屉里不传 onSkip，就不显示"本次跳过"。
+ * 分叉（含自动合并预演出冲突）的项目多一个「复制给 AI」：复制一段现成的提示词，让 AI 教用户解决冲突。
  */
 export function ProjectActions({ project, onSkip }: { project: Project; onSkip?: () => void }) {
   const [commitOpen, setCommitOpen] = useState(false);
@@ -27,6 +28,15 @@ export function ProjectActions({ project, onSkip }: { project: Project; onSkip?:
     try {
       await copyText(await api.getDiagnosticText(project.id));
       toast.success("诊断文本已复制", { description: "可以直接粘贴给 AI" });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "复制失败");
+    }
+  }
+
+  async function copyAiPrompt() {
+    try {
+      await copyText(await api.getAiPromptText(project.id));
+      toast.success("已复制，粘贴给 AI 即可");
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "复制失败");
     }
@@ -49,6 +59,12 @@ export function ProjectActions({ project, onSkip }: { project: Project; onSkip?:
 
   return (
     <div className="flex flex-wrap items-center gap-2">
+      {project.status === "diverged" && (
+        <Button variant="outline" size="sm" onClick={copyAiPrompt} title="复制一段提示词：冲突文件、两边最近的提交，要求不用 force push、reset 或 rebase">
+          <Bot />
+          复制给 AI
+        </Button>
+      )}
       <Button variant="outline" size="sm" onClick={copyDiagnostic}>
         <Copy />
         复制诊断文本

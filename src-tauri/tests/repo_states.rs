@@ -50,6 +50,9 @@ async fn states_sync_and_commit() {
         ("detached", SyncStatus::NoRemote),
         ("dirty-behind", SyncStatus::Dirty),
         ("dirty-conflict", SyncStatus::Dirty),
+        ("diverged-conflict", SyncStatus::Diverged),
+        ("dirty-env", SyncStatus::Dirty),
+        ("dirty-bigfile", SyncStatus::Dirty),
     ];
     for (name, want) in expected {
         match ops::check(&repo(name), network_timeout()).await {
@@ -86,8 +89,21 @@ async fn states_sync_and_commit() {
 
     // ---------------- 2. 一键同步 ----------------
     println!("\n== 一键同步 ==");
-    // 这里都没打开自动提交，有未提交改动的项目一律记为异常
-    let untouchable =["dirty", "diverged", "no-remote", "no-upstream", "detached", "fetch-fail", "dirty-behind", "dirty-conflict"];
+    // 这里用默认选项：没打开自动提交，有未提交改动的项目一律记为异常；也没打开自动合并，分叉照旧记为异常
+    // （自动合并见 tests/auto_merge.rs）
+    let untouchable = [
+        "dirty",
+        "diverged",
+        "no-remote",
+        "no-upstream",
+        "detached",
+        "fetch-fail",
+        "dirty-behind",
+        "dirty-conflict",
+        "diverged-conflict",
+        "dirty-env",
+        "dirty-bigfile",
+    ];
     let before: Vec<(&str, String, String)> = untouchable
         .iter()
         .map(|n| (*n, head(&repo(n)), git(&repo(n), &["status", "--porcelain"])))
@@ -105,6 +121,9 @@ async fn states_sync_and_commit() {
         ("fetch-fail", SyncOutcome::Failed),
         ("dirty-behind", SyncOutcome::Failed),
         ("dirty-conflict", SyncOutcome::Failed),
+        ("diverged-conflict", SyncOutcome::Failed),
+        ("dirty-env", SyncOutcome::Failed),
+        ("dirty-bigfile", SyncOutcome::Failed),
     ];
     for (name, want) in cases {
         let r = ops::sync_one(&repo(name), &SyncOptions::default()).await;
@@ -129,7 +148,7 @@ async fn states_sync_and_commit() {
         assert_eq!(&head(&repo(name)), h, "{name} 的 HEAD 被改动了");
         assert_eq!(&git(&repo(name), &["status", "--porcelain"]), st, "{name} 的工作区被改动了");
     }
-    println!("  ✓ 8 个异常项目的 HEAD 和工作区均未改动");
+    println!("  ✓ {} 个异常项目的 HEAD 和工作区均未改动", before.len());
 
     // ---------------- 3. 提交并推送 ----------------
     println!("\n== 提交并推送 ==");

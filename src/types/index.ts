@@ -68,12 +68,13 @@ export type SyncOutcome =
   | "pulled" // 已拉取
   | "up-to-date" // 已是最新
   | "committed" // 已自动提交并推送（项目打开了"自动提交"）
+  | "merged" // 分叉时预演合并没有冲突，已自动合并并推送（设置里打开了"无冲突时自动合并"）
   | "failed"; // 异常，需要手动处理
 
 export interface SyncItemResult {
   projectId: string;
   outcome: SyncOutcome;
-  /** 推送或拉取的提交数（committed 时为推送的提交数，含自动提交的那一个） */
+  /** 推送或拉取的提交数（committed 时为推送的提交数，含自动提交的那一个；merged 时含合并提交） */
   commits: number;
   /** 异常原因，仅 outcome 为 failed 时有值 */
   reason: string | null;
@@ -106,6 +107,17 @@ export interface CommitInfo {
   hash: string;
   date: string;
   subject: string;
+}
+
+/** 生成诊断文本、「复制给 AI」提示词用的信息（不含任何文件内容） */
+export interface DiagnosticInfo {
+  project: Project;
+  /** 本地最近 3 次提交 */
+  recentCommits: CommitInfo[];
+  /** 分叉时预演合并算出的冲突文件；不是分叉、没有冲突或无法预演时为空 */
+  conflictFiles: string[];
+  /** 云端（上游分支）最近 3 次提交；没有上游时为空 */
+  recentRemoteCommits: CommitInfo[];
 }
 
 export type Theme = "light" | "dark";
@@ -154,6 +166,12 @@ export interface Settings {
   notifyOnError: boolean;
   /** 只读：自动同步暂停到的时间（ISO，带时区）；null 表示没暂停。用 pauseAutoSync / resumeAutoSync 修改 */
   autoSyncPausedUntil: string | null;
+  /** 分叉时先预演合并，没有冲突就自动合并并推送（默认开） */
+  autoMerge: boolean;
+  /** 自动提交前检查大文件和疑似密钥文件（默认开；手动"提交并推送"不检查） */
+  precommitCheck: boolean;
+  /** 提交前检查的单个文件大小上限（MB），1 ~ MAX_BIG_FILE_LIMIT_MB，默认 50 */
+  bigFileLimitMb: number;
 }
 
 /** 自动同步的触发原因。离开：关机 / 锁屏 / 睡眠；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端 */

@@ -562,10 +562,16 @@ pub fn should_skip_fetch(last_checked: Option<Instant>, now: Instant) -> bool {
 
 /// 一键同步时单个项目的选项。**唯一的构造入口**：`sync_all` 只通过这里拿选项，以后加选项也只改这里。
 /// `commit_message` 是本轮共用的自动提交信息，只给打开了自动提交的项目用。
+/// 自动合并的提交信息"自动合并：来自 {host}"里的 `{host}` 和自动提交信息用同一个取电脑名的来源。
 fn sync_options_for(st: &AppState, sp: &StoredProject, commit_message: &str) -> ops::SyncOptions {
+    let (auto_merge, precommit_check, big_file_limit_mb) =
+        st.config.read(|c| (auto_merge_of(c), precommit_check_of(c), big_file_limit_of(c)));
     ops::SyncOptions {
         auto_commit: sp.auto_commit.then(|| commit_message.to_string()),
         skip_fetch: should_skip_fetch(st.last_checked(&sp.id), Instant::now()),
+        auto_merge,
+        merge_message: ops::merge_message(&util::computer_name()),
+        precommit: precommit_check.then_some(ops::PrecommitCheck { big_file_limit_mb }),
     }
 }
 
@@ -641,7 +647,15 @@ pub async fn get_diagnostic_info(state: State<'_, Shared>, project_id: String) -
         Err(e) => with_error(prev, &sp, e.message()),
     };
     let recent_commits = ops::recent_commits(&dir).await;
-    Ok(DiagnosticInfo { project, recent_commits })
+    // 分叉时预演一次合并（只在内存里算，不联网、不碰工作区），列出会冲突的文件，给「复制给 AI」用
+    let conflict_files = if project.status == SyncStatus::Diverged {
+        ops::preview_conflicts(&dir).await
+    } else {
+        Vec::new()
+    };
+    let recent_remote_commits =
+        if project.upstream.is_some() { ops::recent_upstream_commits(&dir).await } else { Vec::new() };
+    Ok(DiagnosticInfo { project, recent_commits, conflict_files, recent_remote_commits })
 }
 
 #[tauri::command]
@@ -687,7 +701,28 @@ fn settings_of(c: &AppConfig, proxy: &ResolvedProxy) -> Settings {
         notify_on_success: sw.notify_on_success,
         notify_on_error: sw.notify_on_error,
         auto_sync_paused_until: autosync::active_pause(&c.settings, &Local::now()).map(|d| d.to_rfc3339()),
+        auto_merge: auto_merge_of(c),
+        precommit_check: precommit_check_of(c),
+        big_file_limit_mb: big_file_limit_of(c),
     }
+}
+
+/// 分叉时无冲突就自动合并：没设置过时默认开
+pub(crate) fn auto_merge_of(c: &AppConfig) -> bool {
+    c.settings.auto_merge.unwrap_or(true)
+}
+
+/// 自动提交前检查：没设置过时默认开
+fn precommit_check_of(c: &AppConfig) -> bool {
+    c.settings.precommit_check.unwrap_or(true)
+}
+
+/// 提交前检查的大文件上限（MB）：没设置过或配置文件里的值超出范围时用默认值
+fn big_file_limit_of(c: &AppConfig) -> u64 {
+    c.settings
+        .big_file_limit_mb
+        .filter(|mb| (1..=ops::MAX_BIG_FILE_LIMIT_MB).contains(mb))
+        .unwrap_or(ops::DEFAULT_BIG_FILE_LIMIT_MB)
 }
 
 /// 本机名称最长多少个字
@@ -741,6 +776,11 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
     if let Some(secs) = patch.network_timeout_secs {
         if !NETWORK_TIMEOUT_CHOICES.contains(&secs) {
             return Err(format!("不支持的联网超时：{secs} 秒"));
+        }
+    }
+    if let Some(mb) = patch.big_file_limit_mb {
+        if !(1..=ops::MAX_BIG_FILE_LIMIT_MB).contains(&mb) {
+            return Err(format!("大文件上限要在 1 ~ {} MB 之间：{mb} MB", ops::MAX_BIG_FILE_LIMIT_MB));
         }
     }
     // 代理：先算出保存后的模式和地址并校验，不合法时什么都不改
@@ -798,6 +838,16 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
         }
         if let Some(secs) = patch.network_timeout_secs {
             c.settings.network_timeout_secs = (secs != DEFAULT_NETWORK_TIMEOUT_SECS).then_some(secs);
+        }
+        // 和其他设置一样，等于默认值时不单独保存
+        if let Some(on) = patch.auto_merge {
+            c.settings.auto_merge = (!on).then_some(false);
+        }
+        if let Some(on) = patch.precommit_check {
+            c.settings.precommit_check = (!on).then_some(false);
+        }
+        if let Some(mb) = patch.big_file_limit_mb {
+            c.settings.big_file_limit_mb = (mb != ops::DEFAULT_BIG_FILE_LIMIT_MB).then_some(mb);
         }
         set_network_timeout(network_timeout_of(c));
     })?;

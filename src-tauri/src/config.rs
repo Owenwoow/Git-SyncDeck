@@ -43,6 +43,12 @@ pub struct StoredSettings {
     pub notify_on_error: Option<bool>,
     /// 自动同步暂停到的时间（RFC 3339，带时区）；None 表示没暂停
     pub auto_sync_paused_until: Option<String>,
+    /// 分叉时无冲突就自动合并；None 表示默认（开）
+    pub auto_merge: Option<bool>,
+    /// 自动提交前检查大文件和疑似密钥文件；None 表示默认（开）
+    pub precommit_check: Option<bool>,
+    /// 提交前检查的大文件上限（MB）；None 表示默认值
+    pub big_file_limit_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +132,10 @@ mod tests {
         assert!(c.settings.host_name.is_none() && c.settings.auto_sync_paused_until.is_none());
         assert!(c.settings.launch_at_login.is_none() && c.settings.periodic_check.is_none());
         assert_eq!(crate::autosync::Switches::from_stored(&c.settings), crate::autosync::Switches::DEFAULT);
+        // 没有"冲突与提交检查"的设置时都是默认值
+        assert!(c.settings.auto_merge.is_none());
+        assert!(c.settings.precommit_check.is_none());
+        assert!(c.settings.big_file_limit_mb.is_none());
         assert_eq!(c.projects.len(), 1);
         assert!(!c.projects[0].auto_commit);
         assert_eq!(c.projects[0].issue.as_deref(), Some("有改动"));
@@ -137,13 +147,18 @@ mod tests {
         c.settings.host_name = Some("家里台式机".into());
         c.settings.sync_on_lock = Some(false);
         c.settings.periodic_check = Some(true);
+        c.settings.auto_merge = Some(false);
+        c.settings.big_file_limit_mb = Some(10);
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"syncOnLock\":false") && json.contains("\"hostName\""), "{json}");
+        assert!(json.contains("\"autoMerge\":false") && json.contains("\"bigFileLimitMb\":10"), "{json}");
         let back: AppConfig = serde_json::from_str(&json).unwrap();
         assert!(back.projects[0].auto_commit);
         assert_eq!(back.settings.commit_template.as_deref(), Some("同步 {date}"));
         assert_eq!(back.settings.host_name.as_deref(), Some("家里台式机"));
         let sw = crate::autosync::Switches::from_stored(&back.settings);
         assert!(!sw.sync_on_lock && sw.periodic_check && sw.sync_on_unlock);
+        assert_eq!(back.settings.auto_merge, Some(false));
+        assert_eq!(back.settings.big_file_limit_mb, Some(10));
     }
 }

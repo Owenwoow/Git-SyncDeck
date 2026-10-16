@@ -3,10 +3,19 @@ import { Check, CircleAlert, Download, FolderSearch, Loader2, Pause, Play, Refre
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
-import { DEFAULT_COMMIT_TEMPLATE, NETWORK_TIMEOUT_CHOICES, renderCommitMessage } from "@/lib/status";
+import {
+  DEFAULT_BIG_FILE_LIMIT_MB,
+  DEFAULT_COMMIT_TEMPLATE,
+  MAX_BIG_FILE_LIMIT_MB,
+  MERGE_MESSAGE_TEMPLATE,
+  NETWORK_TIMEOUT_CHOICES,
+  renderCommitMessage,
+} from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { activePause, describePauseUntil, useSettings } from "@/state/settings";
 import type { ProxyMode, Settings, Theme, UpdateInfo, UpdateProgress } from "@/types";
@@ -57,6 +66,11 @@ export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateI
       <section className="space-y-3">
         <h2 className="text-sm font-medium text-muted-foreground">自动提交</h2>
         <CommitTemplateCard />
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">冲突与提交检查</h2>
+        <MergeAndCheckCard />
       </section>
 
       <section className="space-y-3">
@@ -572,6 +586,107 @@ function CommitTemplateCard() {
         <span className="font-mono break-all select-text">
           {renderCommitMessage(draft, new Date(), hostPreview)}
         </span>
+      </div>
+    </div>
+  );
+}
+
+/** 冲突与提交检查：无冲突时自动合并、自动提交前检查、大文件上限。勾选即保存；上限失焦或回车保存 */
+function MergeAndCheckCard() {
+  const { settings, updateSettings } = useSettings();
+  const savedLimit = settings?.bigFileLimitMb ?? DEFAULT_BIG_FILE_LIMIT_MB;
+  const [limitDraft, setLimitDraft] = useState(String(savedLimit));
+  useEffect(() => setLimitDraft(String(savedLimit)), [savedLimit]);
+
+  async function save(patch: Partial<Settings>, success: string) {
+    try {
+      await updateSettings(patch);
+      toast.success(success);
+    } catch (e) {
+      toast.error("保存失败", { description: e instanceof Error ? e.message : String(e) });
+      // updateSettings 会先乐观更新，失败时重新读回已保存的值
+      await updateSettings({}).catch(() => undefined);
+    }
+  }
+
+  async function saveLimit() {
+    const text = limitDraft.trim();
+    const mb = Number(text);
+    if (text === String(savedLimit)) return;
+    if (!/^\d+$/.test(text) || mb < 1 || mb > MAX_BIG_FILE_LIMIT_MB) {
+      toast.error("保存失败", { description: `大文件上限要填 1 ~ ${MAX_BIG_FILE_LIMIT_MB} 之间的整数（MB）` });
+      setLimitDraft(String(savedLimit));
+      return;
+    }
+    await save({ bigFileLimitMb: mb }, `大文件上限已改为 ${mb} MB`);
+  }
+
+  const autoMerge = settings?.autoMerge ?? true;
+  const precommitCheck = settings?.precommitCheck ?? true;
+
+  return (
+    <div className="divide-y rounded-lg border bg-card">
+      <div className="flex gap-2.5 p-4">
+        <Checkbox
+          id="setting-auto-merge"
+          checked={autoMerge}
+          disabled={!settings}
+          onCheckedChange={(c) =>
+            save({ autoMerge: c === true }, c === true ? "已打开无冲突时自动合并" : "已关闭自动合并")
+          }
+          className="mt-px"
+        />
+        <div className="min-w-0 space-y-1">
+          <Label htmlFor="setting-auto-merge" className="cursor-pointer">
+            无冲突时自动合并
+          </Label>
+          <p className="text-xs text-muted-foreground">
+            本地和云端分叉时，一键同步先在内存里预演合并（不碰工作区）：没有冲突就自动合并并推送；有冲突就什么都不动，项目标红，可以在详情里「复制给
+            AI」。关掉后分叉照旧记为异常。
+          </p>
+          <p className="text-xs text-muted-foreground">
+            合并提交信息：
+            <span className="font-mono text-foreground/80 select-text">
+              {MERGE_MESSAGE_TEMPLATE.split("{host}").join(HOST_PREVIEW)}
+            </span>
+          </p>
+        </div>
+      </div>
+
+      <div className="flex gap-2.5 p-4">
+        <Checkbox
+          id="setting-precommit-check"
+          checked={precommitCheck}
+          disabled={!settings}
+          onCheckedChange={(c) =>
+            save({ precommitCheck: c === true }, c === true ? "已打开提交前检查" : "已关闭提交前检查")
+          }
+          className="mt-px"
+        />
+        <div className="min-w-0 space-y-1">
+          <Label htmlFor="setting-precommit-check" className="cursor-pointer">
+            提交前检查
+          </Label>
+          <p className="text-xs text-muted-foreground">
+            自动提交前检查要提交的文件：有超过上限的大文件，或者没被 .gitignore 忽略的疑似密钥文件（.env、*.pem、*.key、id_rsa
+            等），这次就不提交，记为异常并列出文件。手动"提交并推送"不检查。
+          </p>
+          <div className="flex items-center gap-2 pt-2">
+            <Label htmlFor="setting-big-file-limit" className="text-xs font-normal text-muted-foreground">
+              大文件上限（MB）
+            </Label>
+            <Input
+              id="setting-big-file-limit"
+              inputMode="numeric"
+              value={limitDraft}
+              onChange={(e) => setLimitDraft(e.target.value)}
+              onBlur={() => void saveLimit()}
+              onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+              disabled={!settings || !precommitCheck}
+              className="h-8 w-24 font-mono"
+            />
+          </div>
+        </div>
       </div>
     </div>
   );

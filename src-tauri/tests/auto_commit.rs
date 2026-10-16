@@ -1,6 +1,9 @@
 //! 一键同步时的自动提交（按项目开关）：用 Tauri 的模拟运行时调用命令，
-//! 覆盖 提交信息模板设置 → 打开开关 → 一键同步自动提交并推送，以及各种不该提交的情况。
-//! 只使用 scripts/make-test-repos.mjs 生成的临时仓库和临时配置目录。
+//! 覆盖 提交信息模板设置 → 打开开关 → 一键同步自动提交并推送；落后于云端时先在本地提交，
+//! 再预演合并（没有冲突就合并并推送，有冲突就停在分叉、云端不变）。
+//! 只使用 scripts/make-test-repos.mjs 生成的临时仓库和临时配置目录；
+//! 用 GIT_CONFIG_GLOBAL / GIT_CONFIG_NOSYSTEM 把 git 的全局配置换成空的临时文件，合并结果不受本机配置影响。
+//! 这个文件里只有一个测试，因为它要改本进程的环境变量。
 //! 运行：cd src-tauri && cargo test --test auto_commit -- --nocapture
 
 use std::collections::HashMap;
@@ -14,9 +17,30 @@ use tauri::Manager;
 use git_syncdeck_lib::commands::{self, AppState, Shared};
 use git_syncdeck_lib::config::ConfigStore;
 use git_syncdeck_lib::model::{Project, SettingsPatch, SyncItemResult, SyncOutcome, SyncResult, SyncStatus};
+use git_syncdeck_lib::ops;
 use git_syncdeck_lib::util::{computer_name, DEFAULT_COMMIT_TEMPLATE};
 
 const TEMPLATE: &str = "测试自动同步：{date} 来自 {host}";
+
+/// 让本进程（以及它启动的 git、node）用一份空的全局 git 配置，不读系统级配置
+fn isolate_git_config() {
+    let dir = std::env::temp_dir().join("syncdeck-auto-gitconfig");
+    let _ = std::fs::remove_dir_all(&dir); // 测试自己的临时目录
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("gitconfig");
+    std::fs::write(&file, "").unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", &file);
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+fn has_merge_head(dir: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success()
+}
 
 fn fixtures(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(name);
@@ -105,6 +129,7 @@ fn print_items(title: &str, items: &HashMap<String, SyncItemResult>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_commit_on_sync() {
+    isolate_git_config();
     let root = fixtures("syncdeck-auto-test");
     let repos = root.join("repos");
     let repo = |name: &str| repos.join(name);
@@ -198,18 +223,28 @@ async fn auto_commit_on_sync() {
     assert_eq!((&now.head, &now.remote, &now.porcelain), (&was.head, &was.remote, &was.porcelain), "dirty-behind 不应被改动");
     assert!(done_projects["dirty-behind"].issue.is_some());
 
-    // ④ 打开了开关、落后且改了同一个文件的 dirty-conflict：拉取被拒绝 → 异常，没有新提交，本地改动还在
+    // ④ 打开了开关、落后且改了同一个文件的 dirty-conflict：先在本地提交，预演合并发现冲突 →
+    //    异常；本地多了一个自动提交，项目变为分叉，云端没变，工作区干净，没有进行中的合并
     let r = &items["dirty-conflict"];
     assert_eq!(r.outcome, SyncOutcome::Failed);
     let reason = r.reason.clone().unwrap_or_default();
-    assert!(reason.contains("未提交任何内容"), "原因应说明未提交：{reason}");
+    assert!(reason.starts_with("已自动提交到本地（还没推送）"), "原因应说明已提交但没推送：{reason}");
+    assert!(reason.contains("自动合并会冲突：README.md"), "原因应列出冲突文件：{reason}");
+    let local = repo("dirty-conflict");
     let now = snapshot(&root, "dirty-conflict");
     let was = &before["dirty-conflict"];
-    assert_eq!((&now.head, &now.remote, &now.porcelain), (&was.head, &was.remote, &was.porcelain), "dirty-conflict 不应被改动");
-    let readme = std::fs::read_to_string(repo("dirty-conflict").join("README.md")).unwrap();
-    assert!(readme.contains("台式机上没提交的改动"), "本地改动应保留");
-    assert_eq!(done_projects["dirty-conflict"].issue.as_deref(), Some(reason.as_str()));
-    println!("  ✓ dirty-behind、dirty-conflict 的 HEAD、云端和工作区均未改动");
+    assert_eq!(now.remote, was.remote, "云端不应改动");
+    assert_eq!(git(&local, &["rev-parse", "HEAD~1"]), was.head, "本地应多了一个自动提交");
+    assert!(matches_template(&git(&local, &["log", "-1", "--format=%s"])));
+    assert_eq!(now.porcelain, "", "改动已提交，工作区干净");
+    assert!(!has_merge_head(&local), "不应留下进行中的合并");
+    let readme = std::fs::read_to_string(local.join("README.md")).unwrap();
+    assert!(readme.contains("台式机上没提交的改动"), "本地改动应保留（在新提交里）");
+    let p = &done_projects["dirty-conflict"];
+    assert_eq!((p.status, p.ahead, p.behind), (SyncStatus::Diverged, 1, 1));
+    assert_eq!(p.issue.as_deref(), Some(reason.as_str()));
+    println!("  ✓ dirty-behind 原样未动；dirty-conflict 只多了一个本地提交，云端未改动");
+    let dirty_conflict_head = now.head.clone();
 
     // ---------------- 第二轮：打开 dirty-behind 的开关 ----------------
     commands::set_auto_commit(app.state(), id_of["dirty-behind"].clone(), true).await.unwrap();
@@ -222,23 +257,30 @@ async fn auto_commit_on_sync() {
     assert_eq!(result.failed_count, 1);
     assert_eq!(items["dirty"].outcome, SyncOutcome::UpToDate);
 
-    // ③ dirty-behind（改的不是同一个文件）：先快进拉取，再提交并推送
+    // ③ dirty-behind（改的不是同一个文件）：先在本地提交，再预演合并（没有冲突）→ 合并并推送
     let r = &items["dirty-behind"];
-    assert_eq!(r.outcome, SyncOutcome::Committed, "dirty-behind 应先拉取再提交推送：{:?}", r.reason);
-    assert_eq!(r.commits, 1);
+    assert_eq!(r.outcome, SyncOutcome::Merged, "dirty-behind 应先提交再合并推送：{:?}", r.reason);
+    assert_eq!(r.commits, 2, "推送自动提交和合并提交");
     let local = repo("dirty-behind");
-    assert_eq!(remote_main(&root, "dirty-behind"), git(&local, &["rev-parse", "HEAD"]));
-    assert_eq!(git(&local, &["rev-parse", "HEAD~1"]), old_remote, "应先快进到云端，再在其上提交（没有合并提交）");
-    assert_eq!(git(&local, &["rev-list", "--parents", "-n", "1", "HEAD"]).split(' ').count(), 2);
-    assert!(local.join("laptop.md").exists(), "云端的新文件应已拉下来");
+    let head = git(&local, &["rev-parse", "HEAD"]);
+    assert_eq!(remote_main(&root, "dirty-behind"), head, "合并结果应已推送");
+    let parents: Vec<String> =
+        git(&local, &["rev-list", "--parents", "-n", "1", "HEAD"]).split(' ').skip(1).map(str::to_string).collect();
+    assert_eq!(parents.len(), 2, "最新提交应是合并提交");
+    assert_eq!(parents[1], old_remote, "合并进来的是云端原来的最新提交");
+    assert_eq!(git(&local, &["rev-parse", "HEAD^1~1"]), before["dirty-behind"].head, "自动提交直接接在原 HEAD 后");
+    assert!(matches_template(&git(&local, &["log", "-1", "--format=%s", "HEAD^1"])), "第一个父提交是自动提交");
+    assert_eq!(remote_subject(&root, "dirty-behind"), ops::merge_message(&computer_name()));
+    assert!(local.join("laptop.md").exists(), "云端的新文件应已合并进来");
     assert_eq!(git(&local, &["status", "--porcelain"]), "");
-    assert!(matches_template(&remote_subject(&root, "dirty-behind")));
 
-    // dirty-conflict 仍然是异常、仍然没动
-    assert_eq!(items["dirty-conflict"].outcome, SyncOutcome::Failed);
+    // dirty-conflict 现在是分叉：预演仍然冲突 → 仍然是异常，和第一轮结束时一样没动
+    let r = &items["dirty-conflict"];
+    assert_eq!(r.outcome, SyncOutcome::Failed);
+    assert!(r.reason.as_deref().unwrap_or("").contains("自动合并会冲突：README.md"), "{:?}", r.reason);
     let now = snapshot(&root, "dirty-conflict");
-    let was = &before["dirty-conflict"];
-    assert_eq!((&now.head, &now.remote, &now.porcelain), (&was.head, &was.remote, &was.porcelain));
+    assert_eq!((&now.head, &now.remote, now.porcelain.as_str()), (&dirty_conflict_head, &before["dirty-conflict"].remote, ""));
+    assert!(!has_merge_head(&repo("dirty-conflict")));
 
     // 模拟重启：开关和模板都在
     let reloaded = ConfigStore::load(cfg_file);
