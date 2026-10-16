@@ -20,6 +20,7 @@ import { STATUS_META, describeStatus } from "@/lib/status";
 import { formatDateTime, formatRelative } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { useProjects } from "@/state/projects";
+import { useSettings } from "@/state/settings";
 import type { Project } from "@/types";
 
 /** 点击主页某一行后，从右侧滑出的项目详情 */
@@ -45,6 +46,8 @@ export function ProjectDetailSheet({
 function DetailBody({ project: p }: { project: Project }) {
   const meta = STATUS_META[p.status];
   const Icon = meta.icon;
+  // 设置还没读到时按默认（自动合并开）显示
+  const autoMerge = useSettings().settings?.autoMerge ?? true;
 
   return (
     <>
@@ -60,7 +63,7 @@ function DetailBody({ project: p }: { project: Project }) {
         {/* 状态说明 */}
         <div className={cn("flex gap-2.5 rounded-lg px-3 py-2.5 text-sm", meta.badgeClass, "ring-1 ring-inset")}>
           <Icon className={cn("mt-0.5 size-4 shrink-0", p.status === "syncing" && "animate-spin")} />
-          <p className="leading-relaxed text-foreground/90">{describeStatus(p)}</p>
+          <p className="leading-relaxed text-foreground/90">{describeStatus(p, autoMerge)}</p>
         </div>
 
         {p.checkError && (

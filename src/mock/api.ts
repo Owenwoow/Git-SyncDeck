@@ -3,6 +3,7 @@
 import { toast } from "sonner";
 import type {
   CommitInfo,
+  DiagnosticInfo,
   GitInfo,
   Project,
   ProxyMode,
@@ -14,10 +15,19 @@ import type {
   UpdateInfo,
   UpdateProgress,
 } from "@/types";
-import { buildDiagnosticText } from "@/lib/diagnostic";
-import { DEFAULT_COMMIT_TEMPLATE, NETWORK_TIMEOUT_CHOICES, describeIssue, isAbnormal, sortProjects, willAutoCommit } from "@/lib/status";
+import { buildAiPrompt, buildDiagnosticText } from "@/lib/diagnostic";
+import {
+  DEFAULT_COMMIT_TEMPLATE,
+  MAX_BIG_FILE_LIMIT_MB,
+  NETWORK_TIMEOUT_CHOICES,
+  describeIssue,
+  isAbnormal,
+  sortProjects,
+  willAutoCommit,
+} from "@/lib/status";
 import { formatDateTime } from "@/lib/time";
 import { clone, db, delay, jitter } from "./db";
+import { mockConflicts } from "./projects";
 import { defaultSettings, demoSystemProxy, pickableDirs } from "./repos";
 
 // ---------------- 项目 ----------------
@@ -109,6 +119,11 @@ export async function scanDirectory(dir: string): Promise<ScannedRepo[]> {
 
 // ---------------- 同步 ----------------
 
+/** 预演合并发现冲突时的原因（与 src-tauri/src/ops.rs 的 conflict_reason 文案一致） */
+function mergeConflictReason(files: string[]): string {
+  return `本地和云端改了同一处，自动合并会冲突：${files.join("、")}。没有改动任何文件，可在详情里「复制给 AI」`;
+}
+
 export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promise<SyncResult> {
   const startedAt = new Date().toISOString();
   // 刷新进行中时先等它结束，再复用刚检查过的结果
@@ -116,21 +131,25 @@ export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promi
   const queue = sortProjects(db.monitoredProjects());
   const total = queue.length;
   const items: SyncItemResult[] = [];
+  const { autoMerge } = readSettings();
 
   for (const [index, original] of queue.entries()) {
     db.updateRepo(original.id, { status: "syncing" });
     onProgress({ type: "start", projectId: original.id, index, total });
 
     const abnormal = isAbnormal(original.status);
-    // 打开了自动提交的"有未提交改动"项目：演示自动提交并推送
+    // 打开了自动提交的"有未提交改动"项目：演示先在本地提交，再推送（云端也有新提交时按分叉处理）
     const autoCommit = willAutoCommit(original);
-    const needsWork = original.status === "ahead" || original.status === "behind" || autoCommit;
+    // 分叉且打开了自动合并：演示预演合并，mockConflicts 里有的会冲突，其余自动合并并推送
+    const merge = autoMerge && (original.status === "diverged" || (autoCommit && original.behind > 0));
+    const conflicts = merge ? (mockConflicts[original.id] ?? []) : [];
+    const needsWork = original.status === "ahead" || original.status === "behind" || autoCommit || merge;
     await delay(needsWork ? jitter(800, 1200) : jitter(350, 600));
 
-    let result: SyncItemResult;
-    let updated: Project;
-    if (autoCommit) {
-      updated = db.updateRepo(original.id, {
+    /** 同步成功：自动提交 / 自动合并并推送后和云端一致 */
+    const done = (outcome: "committed" | "merged", commits: number): [SyncItemResult, Project] => [
+      { projectId: original.id, outcome, commits, reason: null },
+      db.updateRepo(original.id, {
         status: "synced",
         changes: [],
         ahead: 0,
@@ -138,12 +157,35 @@ export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promi
         lastSyncAt: new Date().toISOString(),
         issue: null,
         checkError: null,
-      });
-      result = { projectId: original.id, outcome: "committed", commits: original.ahead + 1, reason: null };
+      }),
+    ];
+    /** 记为异常；patch 是处理过程中已经发生的变化（如已经在本地提交了） */
+    const fail = (reason: string, patch: Partial<Project> = {}): [SyncItemResult, Project] => [
+      { projectId: original.id, outcome: "failed", commits: 0, reason },
+      db.updateRepo(original.id, { status: original.status, ...patch, issue: reason }),
+    ];
+
+    let result: SyncItemResult;
+    let updated: Project;
+    if (autoCommit && original.behind > 0) {
+      // 先在本地提交：本地多了一个提交，和云端分叉，再按分叉处理
+      const committed: Partial<Project> = { status: "diverged", changes: [], ahead: original.ahead + 1 };
+      if (!autoMerge) {
+        [result, updated] = fail(
+          `已自动提交到本地，但云端也有新提交（领先 ${original.ahead + 1}、落后 ${original.behind}），自动合并已关闭，没有推送，需要先合并`,
+          committed,
+        );
+      } else if (conflicts.length) {
+        [result, updated] = fail(`已自动提交到本地（还没推送）。${mergeConflictReason(conflicts)}`, committed);
+      } else {
+        [result, updated] = done("merged", original.ahead + 2);
+      }
+    } else if (autoCommit) {
+      [result, updated] = done("committed", original.ahead + 1);
+    } else if (merge) {
+      [result, updated] = conflicts.length ? fail(mergeConflictReason(conflicts)) : done("merged", original.ahead + 1);
     } else if (abnormal) {
-      const reason = describeIssue(original);
-      updated = db.updateRepo(original.id, { status: original.status, issue: reason });
-      result = { projectId: original.id, outcome: "failed", commits: 0, reason };
+      [result, updated] = fail(describeIssue(original));
     } else {
       updated = db.updateRepo(original.id, {
         status: "synced",
@@ -189,17 +231,36 @@ export async function commitAndPush(projectId: string, message: string): Promise
 }
 
 const FAKE_SUBJECTS = ["更新 README", "修复路径里含空格时的问题", "初始化项目"];
+const FAKE_REMOTE_SUBJECTS = ["笔记本上改了 README", "调整窗口默认大小", "初始化项目"];
 
-export async function getDiagnosticText(projectId: string): Promise<string> {
-  await delay(120);
-  const p = db.getRepo(projectId);
-  if (!p) throw new Error("项目不存在");
-  const commits: CommitInfo[] = FAKE_SUBJECTS.map((subject, i) => ({
-    hash: (0x1a2b3c4 + i * 0x111111).toString(16).slice(0, 7),
+function fakeCommits(subjects: string[], seed: number): CommitInfo[] {
+  return subjects.map((subject, i) => ({
+    hash: (seed + i * 0x111111).toString(16).slice(0, 7),
     date: formatDateTime(new Date(Date.now() - (i + 1) * 26 * 3_600_000)),
     subject,
   }));
-  return buildDiagnosticText(p, commits);
+}
+
+async function diagnosticInfo(projectId: string): Promise<DiagnosticInfo> {
+  await delay(120);
+  const p = db.getRepo(projectId);
+  if (!p) throw new Error("项目不存在");
+  return {
+    project: clone(p),
+    recentCommits: fakeCommits(FAKE_SUBJECTS, 0x1a2b3c4),
+    // 和真实实现一样：只有分叉时才预演合并、列出冲突文件
+    conflictFiles: p.status === "diverged" ? [...(mockConflicts[p.id] ?? [])] : [],
+    recentRemoteCommits: p.upstream ? fakeCommits(FAKE_REMOTE_SUBJECTS, 0x5e6f7a8) : [],
+  };
+}
+
+export async function getDiagnosticText(projectId: string): Promise<string> {
+  const info = await diagnosticInfo(projectId);
+  return buildDiagnosticText(info.project, info.recentCommits);
+}
+
+export async function getAiPromptText(projectId: string): Promise<string> {
+  return buildAiPrompt(await diagnosticInfo(projectId));
 }
 
 // ---------------- 系统 ----------------
@@ -268,6 +329,10 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
   if (patch.networkTimeoutSecs !== undefined && !(NETWORK_TIMEOUT_CHOICES as readonly number[]).includes(patch.networkTimeoutSecs)) {
     throw new Error(`不支持的联网超时：${patch.networkTimeoutSecs} 秒`);
   }
+  const mb = patch.bigFileLimitMb;
+  if (mb !== undefined && !(Number.isInteger(mb) && mb >= 1 && mb <= MAX_BIG_FILE_LIMIT_MB)) {
+    throw new Error(`大文件上限要在 1 ~ ${MAX_BIG_FILE_LIMIT_MB} MB 之间：${mb} MB`);
+  }
   const cur = readSettings();
   // 代理：和真实实现一致，先校验，不合法时什么都不改
   if (patch.proxyMode !== undefined && !PROXY_MODES.includes(patch.proxyMode)) {
@@ -289,6 +354,9 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
     networkTimeoutSecs: patch.networkTimeoutSecs ?? cur.networkTimeoutSecs,
     proxyMode,
     proxyUrl,
+    autoMerge: patch.autoMerge ?? cur.autoMerge,
+    precommitCheck: patch.precommitCheck ?? cur.precommitCheck,
+    bigFileLimitMb: patch.bigFileLimitMb ?? cur.bigFileLimitMb,
   };
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
