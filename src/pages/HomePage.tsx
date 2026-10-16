@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { FolderPlus, RefreshCw, SearchX, ArrowUpDown } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { FolderPlus, RefreshCw, SearchX, ArrowUpDown, Loader2, PauseCircle, Play } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -9,10 +9,11 @@ import { ProjectList } from "@/components/projects/ProjectList";
 import { ProjectDetailSheet } from "@/components/projects/ProjectDetailSheet";
 import { sortProjects } from "@/lib/status";
 import { useProjects } from "@/state/projects";
+import { activePause, describePauseUntil, useSettings } from "@/state/settings";
 
 /** 主页：监控中的项目 */
 export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
-  const { projects, loading, refreshing, checkingIds, refresh, sync, startSync } = useProjects();
+  const { projects, loading, refreshing, checkingIds, refresh, sync, startSync, autoSync } = useProjects();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -25,7 +26,8 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
   }, [projects, query, filter]);
 
   const selected = projects.find((p) => p.id === selectedId) ?? null;
-  const syncing = sync.phase === "running";
+  // 后台自动同步进行中时也不能再点一键同步 / 刷新（后端同一时间只跑一轮）
+  const syncing = sync.phase === "running" || autoSync !== null;
 
   async function handleRefresh() {
     try {
@@ -43,7 +45,16 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">监控中的项目</h1>
-          <p className="mt-0.5 text-sm text-muted-foreground">离开这台电脑前点一次"一键同步"，到另一台电脑再点一次。</p>
+          {autoSync ? (
+            <p className="mt-0.5 flex items-center gap-1.5 text-sm text-muted-foreground" role="status">
+              <Loader2 className="size-3.5 animate-spin" />
+              正在后台{autoSync.label}…
+            </p>
+          ) : (
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              离开和回到这台电脑时会在后台自动同步（可在设置里调整），也可以随时点"一键同步"。
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" onClick={handleRefresh} disabled={refreshing || syncing || loading}>
@@ -57,6 +68,8 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
           </Button>
         </div>
       </header>
+
+      <PausedNotice />
 
       {loading ? (
         <LoadingSkeleton />
@@ -95,6 +108,48 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
       )}
 
       <ProjectDetailSheet project={selected} onClose={() => setSelectedId(null)} />
+    </div>
+  );
+}
+
+/** 自动同步暂停中："自动同步已暂停到 明天 00:00"和「恢复」；到点自动消失 */
+function PausedNotice() {
+  const { settings, resumeAutoSync } = useSettings();
+  const [now, setNow] = useState(() => Date.now());
+  const [busy, setBusy] = useState(false);
+  const until = activePause(settings, now);
+
+  // 到了暂停结束的时间重新渲染一次，提示自动消失
+  useEffect(() => {
+    if (!until) return;
+    const timer = window.setTimeout(() => setNow(Date.now()), Math.min(until.getTime() - Date.now() + 500, 2 ** 31 - 1));
+    return () => window.clearTimeout(timer);
+  }, [until?.getTime()]);
+
+  if (!until) return null;
+
+  async function resume() {
+    setBusy(true);
+    try {
+      await resumeAutoSync();
+      toast.success("已恢复自动同步");
+    } catch (e) {
+      toast.error("恢复失败", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-lg border bg-muted/40 px-4 py-2.5 text-sm" role="status">
+      <span className="flex min-w-0 items-center gap-2">
+        <PauseCircle className="size-4 shrink-0 text-muted-foreground" />
+        自动同步已暂停到 {describePauseUntil(until)}
+      </span>
+      <Button variant="outline" size="sm" onClick={resume} disabled={busy}>
+        {busy ? <Loader2 className="animate-spin" /> : <Play />}
+        恢复
+      </Button>
     </div>
   );
 }
