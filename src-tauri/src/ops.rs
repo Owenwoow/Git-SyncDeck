@@ -280,8 +280,11 @@ async fn push_merged(dir: &Path, merged: Inspection) -> SyncOne {
 
 /// 把上游合并进当前分支（只在本地，不推送），返回合并后的状态：
 /// 1. 工作区必须干净，且没有未完成的 merge / cherry-pick / revert
-/// 2. `merge-tree --write-tree` 在内存里预演（git 要不低于 2.38）；有冲突或预演失败 → 什么都不动，返回原因
-/// 3. 无冲突 → `merge --no-edit -m <说明> <上游提交>`；万一失败 → 有 MERGE_HEAD 就 `merge --abort`，返回原因
+/// 2. 分支配置了 `branch.<分支>.mergeoptions` → 不自动合并（git merge 会把它加进命令行，白名单管不到，
+///    比如 `-s ours` 会悄悄丢掉云端的改动，`--no-commit` / `--squash` 会停在合并到一半）
+/// 3. `merge-tree --write-tree` 在内存里预演（git 要不低于 2.38）；有冲突或预演失败 → 什么都不动，返回原因
+/// 4. 无冲突 → `merge --no-edit -m <说明> <上游提交>`；万一失败 → 有 MERGE_HEAD 就 `merge --abort`，返回原因
+/// 5. 合并后、推送前核对结果和预演一致（见 `verify_merge`）；不一致就不推送（有 MERGE_HEAD 就 `merge --abort`），返回原因
 ///
 /// 预演和正式合并用的是同一个上游提交（先解析成哈希），中途远程跟踪分支变了也不会合进没预演过的提交
 async fn merge_upstream(dir: &Path, ins: &Inspection, message: &str) -> Result<Inspection, String> {
@@ -293,36 +296,105 @@ async fn merge_upstream(dir: &Path, ins: &Inspection, message: &str) -> Result<I
         Ok(Some(op)) => return Err(format!("仓库正在{op}，还没完成，不会自动合并，请先手动完成或中止")),
         Err(e) => return Err(format!("无法确认仓库是否正在合并，没有自动合并：{}", e.message())),
     }
+    match branch_merge_options(dir, &ins.branch).await {
+        Ok(None) => {}
+        Ok(Some(value)) => {
+            return Err(format!(
+                "分支配置了 branch.{}.mergeoptions（{value}），git merge 会自动带上这些选项，合并结果可能和预演不一样，\
+                 没有自动合并，也没有改动任何文件。可以去掉这个配置后再同步，或者手动合并",
+                ins.branch
+            ))
+        }
+        Err(e) => return Err(format!("读取分支的合并配置失败，没有自动合并：{}", e.message())),
+    }
     let (ours, theirs) = merge_sides(dir)
         .await
         .map_err(|e| format!("读取本地和云端的最新提交失败，没有自动合并：{}", e.message()))?;
-    match preview_merge(dir, &ours, &theirs).await? {
+    let tree = match preview_merge(dir, &ours, &theirs).await? {
         MergePreview::Conflicts(files) => return Err(conflict_reason(&files)),
-        MergePreview::Clean => {}
-    }
+        MergePreview::Clean { tree } => tree,
+    };
 
     let message = if message.trim().is_empty() { FALLBACK_MERGE_MESSAGE } else { message };
     if let Err(e) = run_git(dir, &["merge", "--no-edit", "-m", message, &theirs], network_timeout()).await {
-        return Err(undo_failed_merge(dir, &e).await);
+        let undo = abort_if_merging(dir).await;
+        return Err(match undo {
+            Abort::NotMerging => format!("自动合并失败，没有合并：{}", e.message()),
+            Abort::Aborted => {
+                format!("自动合并失败，已撤销这次合并（merge --abort），项目恢复到合并前的样子：{}", e.message())
+            }
+            Abort::Failed(e2) => {
+                format!("自动合并失败，撤销合并（merge --abort）也失败了，请手动检查这个项目：{}\n{e2}", e.message())
+            }
+        });
+    }
+    // git merge 退出码是 0 也不代表合并结果就是预演的那样：核对一遍，不一致就不推送
+    if let Err(detail) = verify_merge(dir, &ours, &theirs, &tree).await {
+        let undo = match abort_if_merging(dir).await {
+            Abort::NotMerging => "合并结果留在本地，请先检查这个项目，确认没问题再手动推送".to_string(),
+            Abort::Aborted => "已撤销这次合并（merge --abort），项目恢复到合并前的样子".to_string(),
+            Abort::Failed(e) => format!("撤销合并（merge --abort）也失败了，请手动检查这个项目：{e}"),
+        };
+        return Err(format!("已在本地合并，但结果和预演不一致，没有推送：{detail}。{undo}"));
     }
     inspect(dir)
         .await
         .map_err(|e| format!("已在本地自动合并，但读取状态失败，没有推送：{}", e.message()))
 }
 
-/// 正式合并失败后：正在合并（有 MERGE_HEAD）就 `merge --abort` 恢复原样，返回给界面的原因
-async fn undo_failed_merge(dir: &Path, error: &GitError) -> String {
-    let merging = run_git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], STATUS_TIMEOUT).await.is_ok();
-    if !merging {
-        return format!("自动合并失败，没有合并：{}", error.message());
+/// 分支配置的 `branch.<分支>.mergeoptions`（所有层级的 git 配置都算）；没配或是空值时为 None
+async fn branch_merge_options(dir: &Path, branch: &str) -> Result<Option<String>, GitError> {
+    let key = format!("branch.{branch}.mergeoptions");
+    match run_git(dir, &["config", "--get", &key], STATUS_TIMEOUT).await {
+        Ok(out) => Ok(Some(out.stdout.trim().to_string()).filter(|v| !v.is_empty())),
+        // 退出码 1 表示没有这个配置
+        Err(GitError::Failed { code: Some(1), .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 合并后、推送前核对结果和预演一致，返回第一处不一致的说明：
+/// 没有 MERGE_HEAD（合并已完成）；HEAD^1 是本地原来的提交；HEAD^2 是预演用的云端提交；HEAD 的树就是预演算出的树
+pub async fn verify_merge(dir: &Path, ours: &str, theirs: &str, tree: &str) -> Result<(), String> {
+    if merge_in_progress(dir).await {
+        return Err("合并没有完成（留下了 MERGE_HEAD）".into());
+    }
+    for (rev, want, what) in [
+        ("HEAD^1", ours, "合并提交的第一个父提交不是本地原来的提交"),
+        ("HEAD^2", theirs, "合并提交的第二个父提交不是预演用的云端提交"),
+        ("HEAD^{tree}", tree, "合并后的文件和预演算出的不一样"),
+    ] {
+        let got = run_git(dir, &["rev-parse", "-q", "--verify", rev], STATUS_TIMEOUT).await;
+        if got.as_ref().ok().map(|o| o.stdout.trim()) != Some(want) {
+            return Err(what.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// 是否有进行中的合并（MERGE_HEAD）
+async fn merge_in_progress(dir: &Path) -> bool {
+    run_git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], STATUS_TIMEOUT).await.is_ok()
+}
+
+/// `abort_if_merging` 的结果
+enum Abort {
+    /// 没有进行中的合并，不需要撤销
+    NotMerging,
+    /// 已 `merge --abort`
+    Aborted,
+    /// `merge --abort` 失败（git 的报错）
+    Failed(String),
+}
+
+/// 有进行中的合并（MERGE_HEAD）就 `merge --abort`，把项目恢复到合并前的样子
+async fn abort_if_merging(dir: &Path) -> Abort {
+    if !merge_in_progress(dir).await {
+        return Abort::NotMerging;
     }
     match run_git(dir, &["merge", "--abort"], network_timeout()).await {
-        Ok(_) => format!("自动合并失败，已撤销这次合并（merge --abort），项目恢复到合并前的样子：{}", error.message()),
-        Err(e) => format!(
-            "自动合并失败，撤销合并（merge --abort）也失败了，请手动检查这个项目：{}\n{}",
-            error.message(),
-            e.message()
-        ),
+        Ok(_) => Abort::Aborted,
+        Err(e) => Abort::Failed(e.message()),
     }
 }
 
@@ -336,8 +408,8 @@ async fn merge_sides(dir: &Path) -> Result<(String, String), GitError> {
 /// 预演合并的结果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergePreview {
-    /// 没有冲突，可以自动合并
-    Clean,
+    /// 没有冲突，可以自动合并；tree 是预演算出的合并结果（树的哈希），正式合并后用它核对
+    Clean { tree: String },
     /// 会冲突的文件
     Conflicts(Vec<String>),
 }
@@ -369,7 +441,7 @@ pub fn parse_merge_tree(exit_code: i32, stdout: &str) -> Option<MergePreview> {
         return None;
     }
     match exit_code {
-        0 => Some(MergePreview::Clean),
+        0 => Some(MergePreview::Clean { tree: tree.to_string() }),
         1 => {
             let mut seen = HashSet::new();
             let files = records
@@ -751,7 +823,7 @@ mod tests {
     fn parses_merge_tree_output() {
         let tree = "58017f32555d8cced875cce658b2ffd75d47a68b";
         // 实测的输出：没有冲突时只有树的哈希；有冲突时后面跟着冲突文件名
-        assert_eq!(parse_merge_tree(0, &format!("{tree}\0")), Some(MergePreview::Clean));
+        assert_eq!(parse_merge_tree(0, &format!("{tree}\0")), Some(MergePreview::Clean { tree: tree.into() }));
         assert_eq!(
             parse_merge_tree(1, &format!("{tree}\0README.md\0中文 文件.md\0README.md\0")),
             Some(MergePreview::Conflicts(vec!["README.md".into(), "中文 文件.md".into()]))
@@ -761,7 +833,8 @@ mod tests {
         assert_eq!(parse_merge_tree(1, "fatal: x\0"), None);
         assert_eq!(parse_merge_tree(128, &format!("{tree}\0")), None);
         // SHA-256 仓库的哈希是 64 位
-        assert_eq!(parse_merge_tree(0, &format!("{}\0", "a".repeat(64))), Some(MergePreview::Clean));
+        let tree256 = "a".repeat(64);
+        assert_eq!(parse_merge_tree(0, &format!("{tree256}\0")), Some(MergePreview::Clean { tree: tree256 }));
     }
 
     #[test]
