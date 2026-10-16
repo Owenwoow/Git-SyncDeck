@@ -254,13 +254,17 @@ pub fn pick_departure(projects: &[Project]) -> Vec<String> {
 
 /// 后台同步结束后的系统通知（标题、正文）；不需要通知时为 None。
 /// 有项目失败 → "2 个项目需要处理：A、B"（"出错或冲突时通知"打开时）；
-/// 都成功且确实推送 / 拉取 / 提交了东西 → "已同步 2 个项目：A、B"（"同步成功时通知"打开时）
+/// 都成功且确实推送 / 拉取 / 提交了东西 → "已同步 2 个项目：A、B"（"同步成功时通知"打开时）。
+/// 关机和睡眠前的同步不通知：关机后没人看得到；睡眠前的同步常被睡眠打断而失败，唤醒后的同步会补上并照常通知
 pub fn notification_text(
     trigger: AutoSyncTrigger,
     result: &SyncResult,
     name_of: &HashMap<String, String>,
     switches: &Switches,
 ) -> Option<(String, String)> {
+    if matches!(trigger, AutoSyncTrigger::Shutdown | AutoSyncTrigger::Sleep) {
+        return None;
+    }
     let names = |pick: &dyn Fn(SyncOutcome) -> bool| -> Vec<String> {
         result
             .items
@@ -390,7 +394,7 @@ impl Drop for RunningGuard<'_> {
 pub trait Host: Send + Sync {
     /// 开始联网同步
     fn started(&self, _trigger: AutoSyncTrigger) {}
-    /// 一轮结束。`result` 为 None：没有要同步的项目（没联网）、定时检查、或同步没能开始
+    /// 一轮同步结束（定时检查不算）。`result` 为 None：没有要同步的项目（没联网），或同步没能开始
     fn finished(&self, _trigger: AutoSyncTrigger, _result: Option<&SyncResult>) {}
     /// 最新的项目列表（后台检查 / 同步之后）
     fn projects_changed(&self, _projects: Vec<Project>) {}
@@ -417,9 +421,19 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// 唤醒后最多等多久"睡眠前那一轮"结束（它被睡眠打断，唤醒后接着跑完）
+pub const WAIT_SLEEP_LEFTOVER: Duration = Duration::from_secs(120);
+
 /// 处理一次触发（锁屏、解锁、唤醒、托盘立即同步、定时检查……）。关机走 `shutdown`。
-/// 已经有一轮同步在跑时直接跳过，也不记时间。
+/// 已经有一轮同步在跑时直接跳过，也不记时间。例外：睡眠前的离开同步被睡眠打断、唤醒后还在跑时，
+/// 到达类先等它结束（最多 2 分钟）再做，免得唤醒后的同步被它挡掉
 pub async fn handle(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> Outcome {
+    if trigger.kind() == Kind::Arrival && st.auto.running() == Some(AutoSyncTrigger::Sleep) {
+        let deadline = Instant::now() + WAIT_SLEEP_LEFTOVER;
+        while st.auto.running() == Some(AutoSyncTrigger::Sleep) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
     if st.is_syncing() || st.auto.running().is_some() {
         return Outcome::Busy;
     }
@@ -495,21 +509,22 @@ pub async fn periodic_loop(st: Shared, host: Arc<dyn Host>) {
 
 /// 已经决定要做之后的执行部分
 async fn execute(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger, force: bool) -> Outcome {
+    if trigger.kind() == Kind::Check {
+        // 定时检查只是看一眼（不拉取、不推送），不占"正在后台同步"：
+        // 期间来的到达同步照常开始，靠 net_lock 排在它后面
+        let checked = commands::run_refresh(st, Arc::new(|_| {})).await.len();
+        host.projects_changed(st.snapshot());
+        return Outcome::Checked(checked);
+    }
     let Some(_running) = st.auto.begin(trigger, force) else {
         return Outcome::Busy;
     };
     match trigger.kind() {
         Kind::Departure => departure(st, host, trigger).await,
-        Kind::Arrival => {
-            // 开机、唤醒后网络可能还没连上：联网失败的项目等一会儿再试一次
+        // 开机、唤醒后网络可能还没连上：联网失败的项目等一会儿再试一次
+        _ => {
             let retry = matches!(trigger, AutoSyncTrigger::Startup | AutoSyncTrigger::Resume);
             sync_and_report(st, host, trigger, None, retry).await
-        }
-        Kind::Check => {
-            let checked = commands::run_refresh(st, Arc::new(|_| {})).await.len();
-            host.projects_changed(st.snapshot());
-            host.finished(trigger, None);
-            Outcome::Checked(checked)
         }
     }
 }
@@ -802,6 +817,11 @@ mod tests {
         assert_eq!(notification_text(Manual, &good, &names, &both).unwrap().1, "已同步 3 个项目：项目A、项目C、项目D");
         let nothing = result(&[("a", UpToDate)]);
         assert!(notification_text(Manual, &nothing, &names, &both).is_none());
+
+        // 关机、睡眠前的同步不通知（关机后看不到；睡眠常打断同步，唤醒后会补上）
+        assert!(notification_text(Shutdown, &bad, &names, &both).is_none());
+        assert!(notification_text(Sleep, &bad, &names, &both).is_none());
+        assert!(notification_text(Lock, &bad, &names, &both).is_some());
     }
 
     #[test]

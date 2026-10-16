@@ -161,7 +161,11 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       // 先挂监听再读列表：后台同步刚好在这之间结束也不会漏掉结果
       await Promise.all([
         api.onProjectsChanged((list) => setProjects((cur) => applyBackground(cur, list))),
-        api.onAutoSync({ started: setAutoSync, finished: () => setAutoSync(null) }),
+        api.onAutoSync({
+          started: setAutoSync,
+          // 只清掉同一轮的（关机同步可能顶掉正在进行的那一轮）
+          finished: (e) => setAutoSync((cur) => (cur && cur.trigger !== e.trigger ? cur : null)),
+        }),
       ]).catch(() => undefined);
       const git = await api.checkGit().catch(() => ({ installed: false, version: null }));
       if (!git.installed) {

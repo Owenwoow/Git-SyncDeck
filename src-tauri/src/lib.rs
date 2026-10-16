@@ -46,8 +46,7 @@ impl Host for AppHost {
 
     fn finished(&self, trigger: AutoSyncTrigger, result: Option<&SyncResult>) {
         let _ = self.app.emit(EVENT_AUTO_SYNC_FINISHED, Self::event(trigger, result));
-        // 关机前同步完就关机了，通知没人看得到
-        let Some(result) = result.filter(|_| trigger != AutoSyncTrigger::Shutdown) else { return };
+        let Some(result) = result else { return };
         let st = self.app.state::<commands::Shared>();
         let switches = st.config.read(|c| Switches::from_stored(&c.settings));
         let names = st.snapshot().into_iter().map(|p| (p.id, p.name)).collect();
