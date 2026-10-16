@@ -116,7 +116,7 @@ expected["synced"] = "synced";
   expected["dirty"] = "dirty";
 }
 
-// 5. 分叉：本地和云端各有 1 个新提交
+// 5. 分叉：本地和云端各有 1 个新提交，改的是不同文件（预演合并没有冲突，打开自动合并时一键同步会合并并推送）
 {
   const { local, other } = setup("diverged");
   commit(local, "desktop.md", "台式机\n", "台式机上的改动");
@@ -156,7 +156,9 @@ expected["synced"] = "synced";
   expected["fetch-fail"] = "check-failed";
 }
 
-// 8. 有改动且落后：用来验证"提交后发现落后于云端要停止，不自动合并"
+// 8. 有改动且落后，本地改动和云端新提交改的是不同文件：
+//    手动"提交并推送"时，提交后发现落后于云端要停止、不合并；
+//    打开自动提交时，一键同步先在本地提交，再预演合并（没有冲突）→ 合并并推送
 {
   const { local, other } = setup("dirty-behind");
   pushFromOther(other, "laptop.md", "笔记本上的改动");
@@ -165,13 +167,44 @@ expected["synced"] = "synced";
 }
 
 // 9. 有改动且落后，并且本地改动和云端新提交改的是同一个文件：
-//    用来验证自动提交时"先拉取"会被 git 拒绝，此时不提交、本地改动保持原样
+//    打开自动提交时，一键同步先在本地提交，预演合并发现冲突 → 不合并，项目变为分叉，云端不变
 {
   const { local, other } = setup("dirty-conflict");
   commit(other, "README.md", "# dirty-conflict\n\n笔记本上改了这一行\n", "笔记本上改了 README");
   git(other, "push", "--quiet", "origin", "main");
   write(local, "README.md", "# dirty-conflict\n\n台式机上没提交的改动\n");
   expected["dirty-conflict"] = "dirty";
+}
+
+// 10. 分叉，并且两边改了同一个文件的同一行：预演合并会冲突，一键同步什么都不动
+{
+  const { local, other } = setup("diverged-conflict");
+  commit(local, "README.md", "# diverged-conflict\n\n台式机上改了这一行\n", "台式机上改了 README");
+  commit(other, "README.md", "# diverged-conflict\n\n笔记本上改了这一行\n", "笔记本上改了 README");
+  git(other, "push", "--quiet", "origin", "main");
+  expected["diverged-conflict"] = "diverged";
+}
+
+// 11. 有改动，其中有没被忽略的 .env（疑似密钥）：自动提交前检查不通过，不提交。
+//     .env.example 不算；.gitignore 里忽略了的 local.key 也不算（git 不会提交它）
+{
+  const { local } = setup("dirty-env");
+  commit(local, ".gitignore", "local.key\n", "忽略 local.key");
+  git(local, "push", "--quiet", "origin", "main");
+  write(local, ".env", "API_TOKEN=测试用的假密钥\n");
+  write(local, ".env.example", "API_TOKEN=\n");
+  write(local, "local.key", "被忽略的假密钥\n");
+  write(local, "notes.md", "普通改动\n");
+  expected["dirty-env"] = "dirty";
+}
+
+// 12. 有改动，其中有一个 2 MB 的文件：大文件上限设成 1 MB 时自动提交前检查不通过，不提交
+{
+  const { local } = setup("dirty-bigfile");
+  fs.mkdirSync(path.join(local, "assets"), { recursive: true });
+  fs.writeFileSync(path.join(local, "assets", "video.bin"), Buffer.alloc(2 * 1024 * 1024, 0x61));
+  write(local, "notes.md", "普通改动\n");
+  expected["dirty-bigfile"] = "dirty";
 }
 
 fs.writeFileSync(path.join(root, "expected.json"), JSON.stringify(expected, null, 2));

@@ -172,8 +172,9 @@ pub enum GitError {
     /// 目录还在，但已经不是 Git 仓库（根目录下没有 .git）
     NotRepo(String),
     Timeout { command: String, secs: u64 },
-    /// git 返回非 0 退出码；stderr 为原文（已去掉 URL 里的账号信息）
-    Failed { command: String, code: Option<i32>, stderr: String },
+    /// git 返回非 0 退出码；stderr 为原文（已去掉 URL 里的账号信息）。
+    /// stdout 也保留着：有的命令用退出码 1 表示"有结果"（如 merge-tree 有冲突时），输出仍然有用
+    Failed { command: String, code: Option<i32>, stderr: String, stdout: String },
     Io(String),
     /// 被安全白名单拦截
     Forbidden(String),
@@ -189,7 +190,7 @@ impl GitError {
             GitError::NoDirectory(dir) => format!("找不到目录：{dir}"),
             GitError::NotRepo(dir) => format!("这个文件夹已经不是 Git 仓库（找不到 .git）：{dir}，可以在详情里取消监控"),
             GitError::Timeout { command, secs } => format!("git {command} 超时（{secs} 秒），已终止"),
-            GitError::Failed { command, code, stderr } => {
+            GitError::Failed { command, code, stderr, .. } => {
                 if stderr.trim().is_empty() {
                     let code = code.map_or("未知".to_string(), |c| c.to_string());
                     format!("git {command} 失败（退出码 {code}）")
@@ -291,7 +292,7 @@ pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<Git
             if out.status.success() {
                 Ok(GitOutput { stdout, stderr })
             } else {
-                Err(GitError::Failed { command, code: out.status.code(), stderr })
+                Err(GitError::Failed { command, code: out.status.code(), stderr, stdout })
             }
         }
     }
