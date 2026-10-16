@@ -102,6 +102,8 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
   const refreshRound = useRef(0);
   const [sync, setSync] = useState<SyncState>(idleSync);
   const [autoSync, setAutoSync] = useState<AutoSyncEvent | null>(null);
+  /** 最后一次后台推来的列表和序号：读列表（reload）期间收到的后台结果不能被读到的旧数据盖掉 */
+  const background = useRef<{ seq: number; list: Project[] | null }>({ seq: 0, list: null });
   const started = useRef(false);
   // 一键同步开始处理某个项目时读取它的最新状态（可能是刷新途中点的一键同步）
   const projectsRef = useRef(projects);
@@ -123,8 +125,12 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const reload = useCallback(async () => {
+    const seq = background.current.seq;
     try {
-      setProjects(await api.listProjects());
+      const list = await api.listProjects();
+      // 读列表期间后台推来过新列表（比如启动时的到达同步刚好结束）：以后台的为准，读到的可能是同步前的数据
+      const bg = background.current;
+      setProjects(bg.seq !== seq && bg.list ? applyBackground(list, bg.list) : list);
     } catch (e) {
       toast.error("读取项目列表失败", { description: errorMessage(e) });
     } finally {
@@ -160,7 +166,10 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     (async () => {
       // 先挂监听再读列表：后台同步刚好在这之间结束也不会漏掉结果
       await Promise.all([
-        api.onProjectsChanged((list) => setProjects((cur) => applyBackground(cur, list))),
+        api.onProjectsChanged((list) => {
+          background.current = { seq: background.current.seq + 1, list };
+          setProjects((cur) => applyBackground(cur, list));
+        }),
         api.onAutoSync({
           started: setAutoSync,
           // 只清掉同一轮的（关机同步可能顶掉正在进行的那一轮）
@@ -177,7 +186,13 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       await reload();
       const auto = await api.getAutoSyncState().catch(() => ({ running: null, startupSync: false }));
       setAutoSync((cur) => cur ?? auto.running);
-      if (git.installed && !auto.startupSync) await refresh().catch(() => undefined);
+      if (git.installed && !auto.startupSync) {
+        await refresh().catch(() => undefined);
+      } else if (auto.startupSync && !auto.running) {
+        // 兜底：后端的启动同步已经结束（或还没开始），再读一次列表，不让列表停在同步前的状态；
+        // 还在进行的话，结束时会推 projects-changed
+        await reload();
+      }
     })();
   }, [reload, refresh]);
 
