@@ -90,9 +90,13 @@ pub fn proxy_plan() -> ProxyPlan {
 /// 读取 git 代理配置用的正则：`http.proxy` 和按网址设置的 `http.<网址>.proxy`
 pub const PROXY_CONFIG_REGEX: &str = r"^http\.(.+\.)?proxy$";
 
-/// git（libcurl）认的代理环境变量，按 git 对 https 地址的查找顺序排列（小写优先，HTTP_PROXY 只用于 http 地址）。
+/// git（libcurl）认的全部代理环境变量，"不用代理"时都要去掉。
 /// Windows 上环境变量本来不分大小写，两种写法都列出来是为了在别的系统上也成立。
 pub const PROXY_ENV_VARS: [&str; 6] = ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY"];
+
+/// git 对 https 地址认的代理环境变量，按查找顺序排列（小写优先）。
+/// HTTP_PROXY / http_proxy 只用于 http 地址，GitHub 这类 https 仓库不会用它，所以不算"git 自己的代理"。
+pub const HTTPS_PROXY_ENV_VARS: [&str; 4] = ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"];
 
 /// 代理设置对应的 git 全局参数（放在子命令前面）
 /// - Use：`-c http.proxy=<地址>`，再对每个按网址设置过代理的网址加 `-c http.<网址>.proxy=<地址>`
@@ -119,9 +123,10 @@ pub fn proxy_env_removals(p: &ProxyPlan) -> &'static [&'static str] {
     }
 }
 
-/// 环境变量里给 git 用的代理（按 `PROXY_ENV_VARS` 的顺序取第一个非空的）。`get` 一般是 `std::env::var(k).ok()`
+/// 环境变量里给 https 地址用的代理（按 `HTTPS_PROXY_ENV_VARS` 的顺序取第一个非空的）。
+/// `get` 一般是 `std::env::var(k).ok()`
 pub fn proxy_from_env(get: impl Fn(&str) -> Option<String>) -> Option<String> {
-    PROXY_ENV_VARS
+    HTTPS_PROXY_ENV_VARS
         .iter()
         .filter_map(|k| get(k))
         .map(|v| v.trim().to_string())
@@ -515,7 +520,11 @@ mod tests {
         };
         assert_eq!(proxy_from_env(env(&[])), None);
         assert_eq!(proxy_from_env(env(&[("HTTPS_PROXY", "  ")])), None, "空值当作没设置");
-        assert_eq!(proxy_from_env(env(&[("http_proxy", "http://h:1")])).as_deref(), Some("http://h:1"));
+        // HTTP_PROXY / http_proxy 只用于 http 地址，git 访问 https 仓库时不用它
+        assert_eq!(proxy_from_env(env(&[("http_proxy", "http://h:1")])), None);
+        assert_eq!(proxy_from_env(env(&[("HTTP_PROXY", "http://h:1"), ("http_proxy", "http://h:1")])), None);
+        assert_eq!(proxy_from_env(env(&[("HTTPS_PROXY", "http://s:3")])).as_deref(), Some("http://s:3"));
+        assert_eq!(proxy_from_env(env(&[("all_proxy", "socks5://a:2")])).as_deref(), Some("socks5://a:2"));
         assert_eq!(
             proxy_from_env(env(&[("HTTP_PROXY", "http://h:1"), ("ALL_PROXY", "socks5://a:2")])).as_deref(),
             Some("socks5://a:2"),
