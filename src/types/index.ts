@@ -84,6 +84,9 @@ export type SyncProgressEvent =
   | { type: "start"; projectId: string; index: number; total: number }
   | { type: "done"; result: SyncItemResult; project: Project; index: number; total: number };
 
+/** 刷新状态的进度事件：每个项目检查完立即发一次，index 为完成顺序（从 0 开始） */
+export type RefreshProgressEvent = { type: "done"; project: Project; index: number; total: number };
+
 export interface SyncResult {
   startedAt: string;
   finishedAt: string;
@@ -115,7 +118,21 @@ export interface Settings {
   commitTemplate: string;
   /** 联网操作（fetch、push、pull）的超时秒数，只能是 NETWORK_TIMEOUT_CHOICES 之一 */
   networkTimeoutSecs: number;
+  /** 代理模式：自动（默认）/ 不用代理 / 手动填写。只影响 SyncDeck 调用的 git，不改全局 git 配置 */
+  proxyMode: ProxyMode;
+  /** 手动填写的代理地址（切到其他模式后仍保留）；保存空字符串表示清除 */
+  proxyUrl: string | null;
+  /** 只读：实际生效的代理地址（去掉了账号密码）；null 表示不用代理 */
+  effectiveProxy: string | null;
+  /** 只读：实际生效的代理来自哪里 */
+  proxySource: ProxySource;
 }
+
+/** 代理模式：auto 自动（git 自己配了代理就用 git 的，否则用 Windows 系统代理）/ off 不用代理 / manual 手动填写 */
+export type ProxyMode = "auto" | "off" | "manual";
+
+/** 实际生效的代理来自：git 自己的配置或环境变量 / Windows 系统代理 / 手动填写 / 不用代理 */
+export type ProxySource = "git" | "system" | "manual" | "none";
 
 /** 应用内更新：发现的新版本 */
 export interface UpdateInfo {

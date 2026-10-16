@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git_syncdeck_lib::git::network_timeout;
 use git_syncdeck_lib::ops;
 use git_syncdeck_lib::status::inspect;
 
@@ -49,7 +50,7 @@ async fn fetch_only_upstream_branch() {
     let remote_main = git(&other, &["rev-parse", "HEAD"]);
 
     let ins = inspect(&local).await.unwrap();
-    ops::fetch(&local, &ins).await.expect("fetch 上游分支应成功");
+    ops::fetch(&local, &ins, network_timeout()).await.expect("fetch 上游分支应成功");
     assert_eq!(git(&local, &["rev-parse", "origin/main"]), remote_main, "上游分支应更新");
     assert!(!has_ref(&local, "refs/remotes/origin/feature"), "其他分支不应被下载");
 
@@ -57,6 +58,6 @@ async fn fetch_only_upstream_branch() {
     git(&remote, &["symbolic-ref", "HEAD", "refs/heads/feature"]); // 裸仓库不允许删除当前分支
     git(&other, &["push", "-q", "origin", "--delete", "main"]);
     let ins = inspect(&local).await.unwrap();
-    ops::fetch(&local, &ins).await.expect("云端分支被删时应退回 fetch 整个远程");
+    ops::fetch(&local, &ins, network_timeout()).await.expect("云端分支被删时应退回 fetch 整个远程");
     assert!(has_ref(&local, "refs/remotes/origin/feature"), "退回后应拉到其他分支");
 }

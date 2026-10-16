@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, CircleAlert, Download, FolderSearch, Loader2, RefreshCw, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
@@ -8,9 +8,9 @@ import { Progress } from "@/components/ui/progress";
 import { DEFAULT_COMMIT_TEMPLATE, NETWORK_TIMEOUT_CHOICES, renderCommitMessage } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/state/settings";
-import type { Theme, UpdateInfo, UpdateProgress } from "@/types";
+import type { ProxyMode, Settings, Theme, UpdateInfo, UpdateProgress } from "@/types";
 
-/** 设置：默认代码目录、联网超时、提交信息模板、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
+/** 设置：默认代码目录、联网超时、代理、提交信息模板、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
 export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateInfo | null }) {
   const { settings, updateSettings } = useSettings();
   const [picking, setPicking] = useState(false);
@@ -48,6 +48,7 @@ export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateI
           </div>
         </div>
         <NetworkTimeoutCard />
+        <ProxyCard />
       </section>
 
       <section className="space-y-3">
@@ -99,7 +100,7 @@ function NetworkTimeoutCard() {
     <div className="rounded-lg border bg-card p-4">
       <div className="text-sm font-medium">联网超时</div>
       <p className="mt-0.5 text-xs text-muted-foreground">
-        刷新、一键同步时连接 GitHub 超过这个时间就停止。网络慢或者一次要拉取的内容很多时，可以调长一些。
+        一键同步、提交并推送时连接 GitHub 超过这个时间就停止（刷新状态只是看一眼，最多等 30 秒）。网络慢或者一次要拉取的内容很多时，可以调长一些。
       </p>
       <div className="mt-3 inline-flex rounded-md border p-0.5" role="radiogroup" aria-label="联网超时">
         {NETWORK_TIMEOUT_CHOICES.map((secs) => {
@@ -122,6 +123,156 @@ function NetworkTimeoutCard() {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+const PROXY_MODE_OPTIONS: { mode: ProxyMode; label: string; saved: string }[] = [
+  { mode: "auto", label: "自动", saved: "已改为自动选择代理" },
+  { mode: "off", label: "不用代理", saved: "已改为不用代理" },
+  { mode: "manual", label: "手动填写", saved: "已改为使用手动填写的代理" },
+];
+
+/** "当前：……"一行：SyncDeck 调用的 git 实际用的代理 */
+function describeProxy(p: Pick<Settings, "effectiveProxy" | "proxySource">): string {
+  switch (p.proxySource) {
+    case "git":
+      return `当前：使用 git 自己的代理 ${p.effectiveProxy ?? ""}`;
+    case "system":
+      return `当前：使用系统代理 ${p.effectiveProxy ?? ""}`;
+    case "manual":
+      return `当前：使用手动填写的代理 ${p.effectiveProxy ?? ""}`;
+    default:
+      return "当前：不使用代理";
+  }
+}
+
+/** 代理：自动 / 不用代理 / 手动填写。点选即保存；手动地址失焦或回车保存 */
+function ProxyCard() {
+  const { settings, updateSettings } = useSettings();
+  const savedMode = settings?.proxyMode ?? "auto";
+  const savedUrl = settings?.proxyUrl ?? "";
+  // 还没保存的选择和输入；null 表示跟随已保存的设置。保存失败时保留，方便改一下再保存
+  const [pendingMode, setPendingMode] = useState<ProxyMode | null>(null);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const mode = pendingMode ?? savedMode;
+  const url = draft ?? savedUrl;
+
+  // 当前实际情况：打开设置页时重新读一次（代理软件可能刚开或刚关），之后以每次保存的结果为准
+  const [current, setCurrent] = useState<Pick<Settings, "effectiveProxy" | "proxySource"> | null>(null);
+  useEffect(() => {
+    if (settings) setCurrent({ effectiveProxy: settings.effectiveProxy, proxySource: settings.proxySource });
+  }, [settings]);
+  useEffect(() => {
+    let alive = true;
+    api.getSettings().then(
+      (s) => alive && setCurrent({ effectiveProxy: s.effectiveProxy, proxySource: s.proxySource }),
+      () => undefined,
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function save(patch: Partial<Settings>, success: string): Promise<boolean> {
+    setSaving(true);
+    try {
+      await updateSettings(patch);
+      toast.success(success);
+      return true;
+    } catch (e) {
+      toast.error("保存失败", { description: e instanceof Error ? e.message : String(e) });
+      // updateSettings 会先乐观更新，失败时重新读回已保存的值
+      await updateSettings({}).catch(() => undefined);
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function choose(next: ProxyMode) {
+    if (next === mode) return;
+    // 切换模式时丢掉没保存的地址草稿：切回"手动填写"时生效的是已保存的地址，输入框也要显示它
+    setDraft(null);
+    if (next === "manual" && !savedUrl) {
+      // 还没填过地址：先填，失焦或回车时再保存
+      setPendingMode("manual");
+      setTimeout(() => inputRef.current?.focus(), 0);
+      return;
+    }
+    if (next === savedMode) {
+      // 取消还没保存的"手动填写"
+      setPendingMode(null);
+      return;
+    }
+    setPendingMode(next);
+    const option = PROXY_MODE_OPTIONS.find((o) => o.mode === next);
+    await save({ proxyMode: next }, option?.saved ?? "代理设置已保存");
+    setPendingMode(null);
+  }
+
+  async function saveUrl() {
+    const next = url.trim();
+    if (!next && savedMode !== "manual") return; // 还没填，不打扰
+    if (next === savedUrl && savedMode === "manual") {
+      setDraft(null);
+      return;
+    }
+    if (await save({ proxyMode: "manual", proxyUrl: next }, "代理地址已保存")) {
+      setPendingMode(null);
+      setDraft(null);
+    }
+  }
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="text-sm font-medium">代理</div>
+      <p className="mt-0.5 text-xs text-muted-foreground">
+        自动：git 自己配了代理就用 git 的；没配而 Windows 系统代理开着，就用系统代理。只对 SyncDeck 调用的 git 生效，不改全局 git
+        配置。
+      </p>
+      <div className="mt-3 inline-flex rounded-md border p-0.5" role="radiogroup" aria-label="代理">
+        {PROXY_MODE_OPTIONS.map(({ mode: m, label }) => {
+          const active = mode === m;
+          return (
+            <button
+              key={m}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              disabled={!settings || saving}
+              // 不让地址输入框先失焦保存一次草稿
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => void choose(m)}
+              className={cn(
+                "rounded px-3 py-1 text-sm transition-colors",
+                active ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+      {mode === "manual" && (
+        <Input
+          ref={inputRef}
+          value={url}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => void saveUrl()}
+          onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+          placeholder="如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+          disabled={!settings || saving}
+          className="mt-3 font-mono"
+          aria-label="代理地址"
+        />
+      )}
+      <p className="mt-3 text-sm break-all">{current ? describeProxy(current) : "当前：正在检测…"}</p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        只影响 https 地址的仓库，SSH 地址的仓库不受影响；仓库里单独配置的 remote.&lt;远程名&gt;.proxy 也不受这里影响
+      </p>
     </div>
   );
 }

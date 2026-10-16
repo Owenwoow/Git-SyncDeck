@@ -5,6 +5,7 @@ import type {
   CommitInfo,
   GitInfo,
   Project,
+  ProxyMode,
   ScannedRepo,
   Settings,
   SyncItemResult,
@@ -17,7 +18,7 @@ import { buildDiagnosticText } from "@/lib/diagnostic";
 import { DEFAULT_COMMIT_TEMPLATE, NETWORK_TIMEOUT_CHOICES, describeIssue, isAbnormal, sortProjects, willAutoCommit } from "@/lib/status";
 import { formatDateTime } from "@/lib/time";
 import { clone, db, delay, jitter } from "./db";
-import { defaultSettings, pickableDirs } from "./repos";
+import { defaultSettings, demoSystemProxy, pickableDirs } from "./repos";
 
 // ---------------- 项目 ----------------
 
@@ -31,9 +32,27 @@ export async function listProjects(): Promise<Project[]> {
   return clone(db.monitoredProjects());
 }
 
-export async function refreshStatus(): Promise<Project[]> {
-  await delay(800);
-  return clone(db.monitoredProjects());
+/** 正在进行的刷新；一键同步要等它结束（和真实实现一样，联网操作互斥） */
+let refreshing: Promise<unknown> | null = null;
+
+/** 演示：每个项目各自"联网"一段时间，检查完就回调一次 */
+export async function refreshStatus(onProgress?: (p: Project) => void): Promise<Project[]> {
+  const run = (async () => {
+    await Promise.all(
+      db.monitoredProjects().map(async (p) => {
+        await delay(jitter(400, 2600));
+        const latest = db.getRepo(p.id);
+        if (latest && db.isMonitored(p.id)) onProgress?.(clone(latest));
+      }),
+    );
+    return clone(db.monitoredProjects());
+  })();
+  refreshing = run;
+  try {
+    return await run;
+  } finally {
+    if (refreshing === run) refreshing = null;
+  }
 }
 
 export async function addProjects(paths: string[]): Promise<Project[]> {
@@ -92,6 +111,8 @@ export async function scanDirectory(dir: string): Promise<ScannedRepo[]> {
 
 export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promise<SyncResult> {
   const startedAt = new Date().toISOString();
+  // 刷新进行中时先等它结束，再复用刚检查过的结果
+  await refreshing?.catch(() => undefined);
   const queue = sortProjects(db.monitoredProjects());
   const total = queue.length;
   const items: SyncItemResult[] = [];
@@ -197,12 +218,38 @@ export async function openInEditor(projectId: string): Promise<string> {
 
 const SETTINGS_KEY = "syncdeck.settings";
 
+/** 保存在 localStorage 里的部分（实际生效的代理是每次读取时算出来的） */
+type StoredSettings = Omit<Settings, "effectiveProxy" | "proxySource">;
+
+const PROXY_MODES: readonly ProxyMode[] = ["auto", "off", "manual"];
+const PROXY_FORMAT_HINT =
+  "代理地址格式不对：要以 http://、https://、socks5:// 或 socks5h:// 开头，并写明主机和端口，如 http://127.0.0.1:7890";
+
+/** 和真实实现（src-tauri/src/url.rs 的 validate_proxy_url）规则一致：协议、主机、端口都要有，不能带路径 */
+function normalizeProxyUrl(input: string): string {
+  const m = /^(https?|socks5h?):\/\/([^/?#\s]+?)\/?$/i.exec(input.trim());
+  const hostPort = m ? m[2].slice(m[2].lastIndexOf("@") + 1) : "";
+  const hp = /^(\[[0-9a-f:.]+\]|[A-Za-z0-9._-]+):(\d{1,5})$/i.exec(hostPort);
+  const port = hp ? Number(hp[2]) : 0;
+  if (!m || port < 1 || port > 65535) throw new Error(PROXY_FORMAT_HINT);
+  return `${m[1].toLowerCase()}://${m[2]}`;
+}
+
+/** 演示：按代理模式算出"当前实际使用的代理"（自动模式假装探测到了系统代理） */
+function withProxy(s: StoredSettings): Settings {
+  if (s.proxyMode === "off") return { ...s, effectiveProxy: null, proxySource: "none" };
+  if (s.proxyMode === "manual" && s.proxyUrl) {
+    return { ...s, effectiveProxy: s.proxyUrl.replace(/:\/\/[^@/]*@/, "://"), proxySource: "manual" };
+  }
+  return { ...s, effectiveProxy: demoSystemProxy, proxySource: "system" };
+}
+
 function systemTheme(): Settings["theme"] {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function readSettings(): Settings {
-  const fallback: Settings = { ...defaultSettings, theme: systemTheme() };
+function readSettings(): StoredSettings {
+  const fallback: StoredSettings = { ...defaultSettings, theme: systemTheme() };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     return raw ? { ...fallback, ...JSON.parse(raw) } : fallback;
@@ -213,7 +260,7 @@ function readSettings(): Settings {
 
 export async function getSettings(): Promise<Settings> {
   await delay(50);
-  return readSettings();
+  return withProxy(readSettings());
 }
 
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
@@ -221,15 +268,34 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
   if (patch.networkTimeoutSecs !== undefined && !(NETWORK_TIMEOUT_CHOICES as readonly number[]).includes(patch.networkTimeoutSecs)) {
     throw new Error(`不支持的联网超时：${patch.networkTimeoutSecs} 秒`);
   }
-  const next = { ...readSettings(), ...patch };
-  // 和真实实现一致：模板为空时恢复默认
-  next.commitTemplate = next.commitTemplate.trim() || DEFAULT_COMMIT_TEMPLATE;
+  const cur = readSettings();
+  // 代理：和真实实现一致，先校验，不合法时什么都不改
+  if (patch.proxyMode !== undefined && !PROXY_MODES.includes(patch.proxyMode)) {
+    throw new Error(`未知的代理模式：${patch.proxyMode}`);
+  }
+  const proxyMode = patch.proxyMode ?? cur.proxyMode;
+  let proxyUrl = cur.proxyUrl;
+  if (patch.proxyUrl !== undefined) {
+    const url = (patch.proxyUrl ?? "").trim();
+    proxyUrl = url ? normalizeProxyUrl(url) : null;
+  }
+  if (proxyMode === "manual" && !proxyUrl) throw new Error("选择手动填写时，请先填好代理地址");
+
+  const next: StoredSettings = {
+    defaultCodeDir: patch.defaultCodeDir ?? cur.defaultCodeDir,
+    theme: patch.theme ?? cur.theme,
+    // 和真实实现一致：模板为空时恢复默认
+    commitTemplate: (patch.commitTemplate ?? cur.commitTemplate).trim() || DEFAULT_COMMIT_TEMPLATE,
+    networkTimeoutSecs: patch.networkTimeoutSecs ?? cur.networkTimeoutSecs,
+    proxyMode,
+    proxyUrl,
+  };
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
   } catch {
     // 存储不可用时只在本次会话生效
   }
-  return next;
+  return withProxy(next);
 }
 
 // ---------------- 应用更新（演示）----------------

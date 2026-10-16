@@ -23,6 +23,10 @@ pub struct StoredSettings {
     pub commit_template: Option<String>,
     /// 联网超时（秒）；None 表示用默认值
     pub network_timeout_secs: Option<u64>,
+    /// 代理模式："off" / "manual"；None（或不认识的值）表示 "auto"
+    pub proxy_mode: Option<String>,
+    /// 手动填写的代理地址
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +105,7 @@ mod tests {
         assert_eq!(c.settings.theme.as_deref(), Some("dark"));
         assert!(c.settings.commit_template.is_none());
         assert!(c.settings.network_timeout_secs.is_none());
+        assert!(c.settings.proxy_mode.is_none() && c.settings.proxy_url.is_none());
         assert_eq!(c.projects.len(), 1);
         assert!(!c.projects[0].auto_commit);
         assert_eq!(c.projects[0].issue.as_deref(), Some("有改动"));

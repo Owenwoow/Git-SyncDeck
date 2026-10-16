@@ -2,25 +2,26 @@
 //! 不使用 --force、reset、rebase、stash、clean、checkout 等任何可能改写历史或丢失改动的命令。
 
 use std::path::Path;
+use std::time::Duration;
 
-use crate::git::{network_timeout, run_git, GitError, STATUS_TIMEOUT};
+use crate::git::{network_timeout, run_git, GitError, PROXY_CONFIG_REGEX, STATUS_TIMEOUT};
 use crate::model::{CommitInfo, SyncOutcome, SyncStatus};
 use crate::status::{inspect, issue_text, no_remote_reason, read_config, Inspection, DETACHED};
 use crate::url::sanitize_url;
 
 /// 只 fetch 上游分支（下载量和 pull 一样，分支、标签多的仓库不会因为下载其他分支而超时）。
 /// 上游分支在本地已没有远程跟踪分支，或者按分支 fetch 失败（如云端分支已删除）时，退回 fetch 整个远程；
-/// 超时不退回，免得再等一轮。
-pub async fn fetch(dir: &Path, ins: &Inspection) -> Result<(), GitError> {
+/// 超时不退回，免得再等一轮。`timeout` 是每次 fetch 的超时（刷新用 `refresh_timeout()`，其余用 `network_timeout()`）。
+pub async fn fetch(dir: &Path, ins: &Inspection, timeout: Duration) -> Result<(), GitError> {
     let remote = ins.remote_name.as_deref().unwrap_or("origin");
     if let (Some(branch), false) = (ins.upstream_branch.as_deref(), ins.upstream_gone) {
-        match run_git(dir, &["fetch", "--quiet", remote, branch], network_timeout()).await {
+        match run_git(dir, &["fetch", "--quiet", remote, branch], timeout).await {
             Ok(_) => return Ok(()),
             Err(e @ GitError::Timeout { .. }) => return Err(e),
             Err(_) => {}
         }
     }
-    run_git(dir, &["fetch", "--quiet", remote], network_timeout()).await.map(|_| ())
+    run_git(dir, &["fetch", "--quiet", remote], timeout).await.map(|_| ())
 }
 
 /// 推送当前分支到它的上游（显式写出 refspec，不加 +，远程拒绝时不会强推）
@@ -54,8 +55,9 @@ pub enum Checked {
     Failed(GitError),
 }
 
-/// 刷新状态：先 fetch，再 git status。没有上游的项目不需要联网。
-pub async fn check(dir: &Path) -> Checked {
+/// 联网检查：先 fetch（超时为 `fetch_timeout`），再 git status。没有上游的项目不需要联网。
+/// 刷新状态时传 `refresh_timeout()`，一键同步时传 `network_timeout()`。
+pub async fn check(dir: &Path, fetch_timeout: Duration) -> Checked {
     let local = match inspect(dir).await {
         Ok(i) => i,
         Err(e) => return Checked::Failed(e),
@@ -63,7 +65,7 @@ pub async fn check(dir: &Path) -> Checked {
     if !local.can_fetch() {
         return Checked::Fresh(local);
     }
-    if let Err(error) = fetch(dir, &local).await {
+    if let Err(error) = fetch(dir, &local, fetch_timeout).await {
         return Checked::FetchFailed { local, error };
     }
     match inspect(dir).await {
@@ -92,17 +94,35 @@ impl SyncOne {
     }
 }
 
+/// 一键同步单个项目时的选项。只由 `commands::sync_options_for` 构造，以后加选项也只改那里。
+#[derive(Debug, Clone, Default)]
+pub struct SyncOptions {
+    /// 有未提交改动时自动提交用的提交信息；None 表示不自动提交
+    pub auto_commit: Option<String>,
+    /// 跳过 fetch，直接用本地的远程跟踪分支判断（刚联网检查过时，复用那次的结果）
+    pub skip_fetch: bool,
+}
+
 /// 一键同步单个项目：先检查状态，再按状态处理
 /// - 待推送 → push；待拉取 → pull --ff-only；已同步 → 跳过
-/// - 有未提交改动：打开了自动提交（`auto_commit` 为提交信息）→ 自动提交并推送，见 `auto_commit_and_push`；
+/// - 有未提交改动：打开了自动提交（`opts.auto_commit` 为提交信息）→ 自动提交并推送，见 `auto_commit_and_push`；
 ///   没打开 → 不做任何操作，记为异常
 /// - 分叉 / 未关联云端 → 不做任何操作，记为异常
-pub async fn sync_one(dir: &Path, auto_commit: Option<&str>) -> SyncOne {
-    let ins = match check(dir).await {
+pub async fn sync_one(dir: &Path, opts: &SyncOptions) -> SyncOne {
+    let checked = if opts.skip_fetch {
+        match inspect(dir).await {
+            Ok(i) => Checked::Fresh(i),
+            Err(e) => Checked::Failed(e),
+        }
+    } else {
+        check(dir, network_timeout()).await
+    };
+    let ins = match checked {
         Checked::Fresh(i) => i,
         Checked::FetchFailed { local, error } => return SyncOne::failed(error.message(), Some(local), true),
         Checked::Failed(error) => return SyncOne::failed(error.message(), None, true),
     };
+    let auto_commit = opts.auto_commit.as_deref();
 
     match ins.status {
         SyncStatus::Ahead => match push(dir, &ins).await {
@@ -245,7 +265,7 @@ pub async fn commit_and_push(dir: &Path, message: &str) -> Result<Inspection, St
         .await
         .map_err(|e| format!("提交失败：{}", e.message()))?;
 
-    fetch(dir, &ins)
+    fetch(dir, &ins, network_timeout())
         .await
         .map_err(|e| format!("已提交到本地，但检查云端失败，没有推送：{}", e.message()))?;
     let after = inspect(dir)
@@ -297,8 +317,120 @@ pub async fn repo_brief(dir: &Path) -> (String, Option<String>) {
     (branch, remote)
 }
 
+/// git 配置里的代理（全局 / 系统级）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitProxyConfig {
+    /// `http.proxy`；Some("") 表示明确写了空值（git 约定为不用代理）
+    pub proxy: Option<String>,
+    /// 按网址设置的代理 `http.<网址>.proxy`：(网址, 值)，值为空表示这个网址明确不用代理
+    pub url_proxies: Vec<(String, String)>,
+}
+
+impl GitProxyConfig {
+    /// 按网址设置过代理的网址（不管值是不是空）
+    pub fn url_scopes(&self) -> Vec<String> {
+        self.url_proxies.iter().map(|(url, _)| url.clone()).collect()
+    }
+}
+
+/// 读取 git 自己配置的代理：全局和系统级都读，同一个配置项全局优先（和 git 自己一样）
+pub async fn git_proxy_config() -> GitProxyConfig {
+    let (global, system) = tokio::join!(read_proxy_config("--global"), read_proxy_config("--system"));
+    merge_proxy_config(global, system)
+}
+
+/// `git config <scope> -z --get-regexp <PROXY_CONFIG_REGEX>`；没配置（退出码 1）或读取失败时为空
+async fn read_proxy_config(scope: &str) -> GitProxyConfig {
+    let args = ["config", scope, "-z", "--get-regexp", PROXY_CONFIG_REGEX];
+    match run_git(&std::env::temp_dir(), &args, STATUS_TIMEOUT).await {
+        Ok(out) => parse_proxy_config(&out.stdout),
+        Err(_) => GitProxyConfig::default(),
+    }
+}
+
+/// 解析 `git config -z --get-regexp` 的输出：每条是 `键\n值\0`（没有值时是 `键\0`）。
+/// 键里的 section 和变量名已被 git 转成小写，网址部分保留原样。同一个键出现多次时取最后一个（和 git 一样）。
+pub fn parse_proxy_config(out: &str) -> GitProxyConfig {
+    let mut cfg = GitProxyConfig::default();
+    for record in out.split('\0').filter(|r| !r.is_empty()) {
+        let (key, value) = record.split_once('\n').unwrap_or((record, ""));
+        let value = value.trim().to_string();
+        if key == "http.proxy" {
+            cfg.proxy = Some(value);
+        } else if let Some(url) = key.strip_prefix("http.").and_then(|k| k.strip_suffix(".proxy")) {
+            match cfg.url_proxies.iter_mut().find(|(u, _)| u == url) {
+                Some(entry) => entry.1 = value,
+                None => cfg.url_proxies.push((url.to_string(), value)),
+            }
+        }
+    }
+    cfg
+}
+
+/// 合并全局和系统级的代理配置：同一个配置项以全局为准
+pub fn merge_proxy_config(global: GitProxyConfig, system: GitProxyConfig) -> GitProxyConfig {
+    let mut url_proxies = global.url_proxies;
+    for (url, value) in system.url_proxies {
+        if !url_proxies.iter().any(|(u, _)| *u == url) {
+            url_proxies.push((url, value));
+        }
+    }
+    GitProxyConfig { proxy: global.proxy.or(system.proxy), url_proxies }
+}
+
 /// 检测 git 是否已安装，返回版本号
 pub async fn git_version() -> Result<String, GitError> {
     let out = run_git(&std::env::temp_dir(), &["--version"], STATUS_TIMEOUT).await?;
     Ok(out.stdout.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(u: &str, v: &str) -> (String, String) {
+        (u.to_string(), v.to_string())
+    }
+
+    #[test]
+    fn parses_proxy_config() {
+        assert_eq!(parse_proxy_config(""), GitProxyConfig::default());
+        // 实测的 git 输出格式：键\n值\0；空值是 键\n\0；没写值是 键\0
+        let out = "http.proxy\nsocks5://127.0.0.1:10808\0\
+                   http.https://github.com.proxy\nsocks5://127.0.0.1:1080\0\
+                   http.https://GitLab.Corp.proxy\n\0\
+                   http.https://novalue.example.proxy\0\
+                   http.https://github.com.proxy\nhttp://127.0.0.1:7890\0";
+        assert_eq!(
+            parse_proxy_config(out),
+            GitProxyConfig {
+                proxy: Some("socks5://127.0.0.1:10808".into()),
+                url_proxies: vec![
+                    url("https://github.com", "http://127.0.0.1:7890"), // 同一个键取最后一个
+                    url("https://GitLab.Corp", ""),
+                    url("https://novalue.example", ""),
+                ],
+            }
+        );
+        // 明确写了空的 http.proxy
+        assert_eq!(parse_proxy_config("http.proxy\n\0").proxy.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn merges_global_over_system() {
+        let global = GitProxyConfig { proxy: None, url_proxies: vec![url("https://github.com", "g")] };
+        let system = GitProxyConfig {
+            proxy: Some("s".into()),
+            url_proxies: vec![url("https://github.com", "s"), url("https://gitlab.com", "s")],
+        };
+        let merged = merge_proxy_config(global, system);
+        assert_eq!(merged.proxy.as_deref(), Some("s"), "全局没配就用系统级的");
+        assert_eq!(merged.url_proxies, vec![url("https://github.com", "g"), url("https://gitlab.com", "s")]);
+        assert_eq!(merged.url_scopes(), ["https://github.com", "https://gitlab.com"]);
+        let both = merge_proxy_config(
+            GitProxyConfig { proxy: Some("".into()), url_proxies: vec![] },
+            GitProxyConfig { proxy: Some("s".into()), url_proxies: vec![] },
+        );
+        assert_eq!(both.proxy.as_deref(), Some(""), "全局写了空值（不用代理）也优先");
+    }
 }

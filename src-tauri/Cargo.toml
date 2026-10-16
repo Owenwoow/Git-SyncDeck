@@ -28,6 +28,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["process", "time", "sync", "macros", "rt-multi-thread"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+[target.'cfg(windows)'.dependencies]
+# 读取 Windows 系统代理（注册表 HKCU\...\Internet Settings）
+winreg = "0.56"
+
 [dev-dependencies]
 # 测试里用模拟运行时直接调用 Tauri 命令
 tauri = { version = "2", features = ["test"] }

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tauri::ipc::Channel;
 use tauri::State;
@@ -16,16 +17,26 @@ use crate::util::{
     commit_message_now, folder_name, map_limited, normalize_path, now_iso, project_id, same_path, CONCURRENCY,
     DEFAULT_COMMIT_TEMPLATE,
 };
-use crate::git::{set_network_timeout, DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES};
-use crate::{scan, system};
+use crate::git::{
+    proxy_from_env, refresh_timeout, set_network_timeout, set_proxy_plan, ProxyOverride, ProxyPlan,
+    DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES,
+};
+use crate::ops::GitProxyConfig;
+use crate::util::SystemProxy;
+use crate::url::{display_proxy, validate_proxy_url};
+use crate::{scan, system, util};
 
 pub struct AppState {
     pub config: ConfigStore,
     /// 每个项目最近一次检查的结果（内存），检查失败时用它保留上一次的状态
     cache: Mutex<HashMap<String, Project>>,
+    /// 每个项目最近一次联网检查（fetch）成功的时间，刷新和一键同步都会记；一键同步据此跳过刚 fetch 过的项目
+    checked_at: Mutex<HashMap<String, Instant>>,
     /// 联网操作（刷新、一键同步、提交推送）互斥，避免同一个仓库被同时 fetch / push
     net_lock: tokio::sync::Mutex<()>,
     syncing: AtomicBool,
+    /// 代理解析互斥：保存设置和刷新 / 同步同时解析时，保证最后生效的是按最新配置算出的结果
+    proxy_lock: tokio::sync::Mutex<()>,
 }
 
 pub type Shared = Arc<AppState>;
@@ -36,8 +47,10 @@ impl AppState {
         AppState {
             config,
             cache: Mutex::new(HashMap::new()),
+            checked_at: Mutex::new(HashMap::new()),
             net_lock: tokio::sync::Mutex::new(()),
             syncing: AtomicBool::new(false),
+            proxy_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -51,6 +64,16 @@ impl AppState {
 
     fn forget(&self, id: &str) {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    }
+
+    /// 记下"刚刚联网检查成功"
+    fn mark_checked(&self, id: &str) {
+        self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), Instant::now());
+    }
+
+    fn last_checked(&self, id: &str) -> Option<Instant> {
+        self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).get(id).copied()
     }
 
     fn stored(&self, id: &str) -> Option<StoredProject> {
@@ -133,22 +156,127 @@ async fn local_project(st: &AppState, sp: &StoredProject) -> Project {
     p
 }
 
-/// 联网检查：fetch + status
-async fn remote_project(st: &AppState, sp: &StoredProject) -> Project {
+/// 联网检查（刷新状态用）：fetch + status，fetch 用刷新的短超时。
+/// 检查要等联网，期间用户可能改了"自动提交"开关或取消了监控：检查完后重新读持久化字段再组装结果；
+/// 已经取消监控的返回 None（不再记缓存和检查时间）。
+async fn remote_project(st: &AppState, sp: &StoredProject) -> Option<Project> {
+    let checked = ops::check(Path::new(&sp.path), refresh_timeout()).await;
+    let sp = st.stored(&sp.id)?;
     let prev = st.cached(&sp.id);
-    let mut p = match ops::check(Path::new(&sp.path)).await {
-        Checked::Fresh(ins) => project_from(sp, &ins),
+    let mut p = match checked {
+        Checked::Fresh(ins) => {
+            st.mark_checked(&sp.id);
+            project_from(&sp, &ins)
+        }
         // fetch 失败：状态停留在上一次 fetch 时的结果（本地的远程跟踪分支没变）
-        Checked::FetchFailed { local, error } => with_error(Some(project_from(sp, &local)), sp, error.message()),
-        Checked::Failed(error) => with_error(prev, sp, error.message()),
+        Checked::FetchFailed { local, error } => with_error(Some(project_from(&sp, &local)), &sp, error.message()),
+        Checked::Failed(error) => with_error(prev, &sp, error.message()),
     };
     // 刷新检测到已同步：清除遗留的异常标记
     if p.status == SyncStatus::Synced && p.check_error.is_none() && p.issue.is_some() {
-        st.update_stored(sp, |e| e.issue = None);
+        st.update_stored(&sp, |e| e.issue = None);
         p.issue = None;
     }
     st.remember(&p);
-    p
+    Some(p)
+}
+
+// ---------------- 代理 ----------------
+
+/// 设置里的代理模式
+const PROXY_MODES: [&str; 3] = ["auto", "off", "manual"];
+
+/// 解析出的代理：交给 run_git 的代理设置，以及设置页显示的来源和地址（已去掉账号密码）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedProxy {
+    pub plan: ProxyPlan,
+    pub source: ProxySource,
+    pub effective: Option<String>,
+}
+
+/// 按代理模式决定 SyncDeck 调用的 git 用什么代理。纯函数，探测结果由调用方传入：
+/// - `off`：完全不走代理；git 配置里按网址设置的代理（`http.<网址>.proxy`）也一并盖住
+/// - `manual`：用手动填写的地址（`manual_url` 为已校验的地址；没有时按自动处理），按网址设置的代理也盖住
+/// - `auto`：git 自己配了代理 → 不覆盖。"git 自己的代理"按 git 的优先级看：`http.proxy`（写成空值表示
+///   明确不用代理）、https 用的代理环境变量（`env_proxy`）、按网址设置的非空代理。
+///   都没有而系统代理开着（`system_proxy`）→ 用系统代理（连同它的绕过列表）；都没有 → 不覆盖，也就是不用代理
+pub fn decide_proxy(
+    mode: &str,
+    manual_url: Option<&str>,
+    git: &GitProxyConfig,
+    env_proxy: Option<&str>,
+    system_proxy: Option<&SystemProxy>,
+) -> ResolvedProxy {
+    let plan = |over| ProxyPlan { over, url_scopes: git.url_scopes(), no_proxy: None };
+    let none = |plan| ResolvedProxy { plan, source: ProxySource::NoProxy, effective: None };
+    let own = |effective: String| ResolvedProxy {
+        plan: ProxyOverride::Inherit.into(),
+        source: ProxySource::Git,
+        effective: Some(effective),
+    };
+    match (mode, manual_url) {
+        ("off", _) => return none(plan(ProxyOverride::Disable)),
+        ("manual", Some(url)) => {
+            return ResolvedProxy {
+                plan: plan(ProxyOverride::Use(url.to_string())),
+                source: ProxySource::Manual,
+                effective: Some(display_proxy(url)),
+            }
+        }
+        _ => {}
+    }
+
+    // 只给某些网址配的代理：显示成"地址（仅 网址）"
+    let scoped: Vec<_> = git.url_proxies.iter().filter(|(_, v)| !v.is_empty()).collect();
+    let scoped_display = scoped.first().map(|(url, value)| match scoped.len() {
+        1 => format!("{}（仅 {url}）", display_proxy(value)),
+        n => format!("{}（仅 {url} 等 {n} 个网址）", display_proxy(value)),
+    });
+    let env_proxy = env_proxy.map(str::trim).filter(|v| !v.is_empty());
+    match git.proxy.as_deref().map(str::trim) {
+        Some("") => scoped_display.map_or_else(|| none(ProxyOverride::Inherit.into()), own),
+        Some(p) => own(display_proxy(p)),
+        None => match (env_proxy, scoped_display, system_proxy) {
+            (Some(e), _, _) => own(display_proxy(e)),
+            (None, Some(d), _) => own(d),
+            // 用系统代理时不碰按网址的设置：能走到这里，它们都是"这个网址不用代理"
+            (None, None, Some(sys)) => ResolvedProxy {
+                plan: ProxyPlan {
+                    over: ProxyOverride::Use(sys.addr.clone()),
+                    url_scopes: Vec::new(),
+                    no_proxy: sys.no_proxy.clone(),
+                },
+                source: ProxySource::System,
+                effective: Some(display_proxy(&sys.addr)),
+            },
+            (None, None, None) => none(ProxyOverride::Inherit.into()),
+        },
+    }
+}
+
+/// 配置里的代理模式；没设置过或不认识的值都当作 auto
+fn proxy_mode_of(c: &AppConfig) -> &'static str {
+    match c.settings.proxy_mode.as_deref() {
+        Some("off") => "off",
+        Some("manual") => "manual",
+        _ => "auto",
+    }
+}
+
+/// 按当前配置重新解析代理并立即生效（只影响 SyncDeck 调用的 git）。
+/// 每轮刷新 / 同步 / 提交推送开始前、读取和保存设置时调用：用户可能中途开关了代理软件。
+async fn refresh_proxy(st: &AppState) -> ResolvedProxy {
+    let _guard = st.proxy_lock.lock().await;
+    let (mode, url) = st.config.read(|c| (proxy_mode_of(c), c.settings.proxy_url.clone()));
+    let manual = url.as_deref().and_then(|u| validate_proxy_url(u).ok());
+    let auto = mode == "auto" || (mode == "manual" && manual.is_none());
+    // git 自己的代理配置每次都读：不用代理 / 手动模式也要知道哪些网址单独配了代理，好把它们盖住
+    let git = ops::git_proxy_config().await;
+    let env_proxy = if auto { proxy_from_env(|k| std::env::var(k).ok()) } else { None };
+    let system_proxy = if auto { util::windows_system_proxy() } else { None };
+    let resolved = decide_proxy(mode, manual.as_deref(), &git, env_proxy.as_deref(), system_proxy.as_ref());
+    set_proxy_plan(resolved.plan.clone());
+    resolved
 }
 
 // ---------------- 命令 ----------------
@@ -172,17 +300,33 @@ pub async fn list_projects(state: State<'_, Shared>) -> Result<Vec<Project>, Str
     .await)
 }
 
+/// 联网刷新所有项目：每个项目检查完就通过 `on_event` 发一次 Done，最后仍返回完整列表。
+/// 刷新途中被取消监控的项目不发事件，也不在返回的列表里。
 #[tauri::command]
-pub async fn refresh_status(state: State<'_, Shared>) -> Result<Vec<Project>, String> {
+pub async fn refresh_status(
+    state: State<'_, Shared>,
+    on_event: Channel<RefreshProgressEvent>,
+) -> Result<Vec<Project>, String> {
     let st = state.inner().clone();
     let _net = st.net_lock.lock().await;
+    refresh_proxy(&st).await;
     let stored = st.config.read(|c| c.projects.clone());
+    let total = stored.len();
+    let finished = Arc::new(AtomicUsize::new(0));
     let st2 = st.clone();
-    Ok(map_limited(stored, CONCURRENCY, move |sp| {
+    let checked = map_limited(stored, CONCURRENCY, move |sp| {
         let st = st2.clone();
-        async move { remote_project(&st, &sp).await }
+        let on_event = on_event.clone();
+        let finished = finished.clone();
+        async move {
+            let project = remote_project(&st, &sp).await?;
+            let index = finished.fetch_add(1, Ordering::SeqCst);
+            let _ = on_event.send(RefreshProgressEvent::Done { project: project.clone(), index, total });
+            Some(project)
+        }
     })
-    .await)
+    .await;
+    Ok(checked.into_iter().flatten().collect())
 }
 
 #[tauri::command]
@@ -286,6 +430,7 @@ pub async fn sync_all(
     }
     let _flag = SyncingFlag(st.clone());
     let _net = st.net_lock.lock().await;
+    refresh_proxy(&st).await;
 
     let started_at = now_iso();
     let mut stored = st.config.read(|c| c.projects.clone());
@@ -309,9 +454,9 @@ pub async fn sync_all(
         async move {
             let index = started.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Start { project_id: sp.id.clone(), index, total });
-            let auto_commit = sp.auto_commit.then_some(commit_message.as_str());
-            let one = ops::sync_one(Path::new(&sp.path), auto_commit).await;
-            let (project, result) = record_sync(&st, &sp, one);
+            let opts = sync_options_for(&st, &sp, &commit_message);
+            let one = ops::sync_one(Path::new(&sp.path), &opts).await;
+            let (project, result) = record_sync(&st, &sp, &opts, one);
             let index = finished.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(SyncProgressEvent::Done { result: result.clone(), project, index, total });
             result
@@ -329,8 +474,29 @@ pub async fn sync_all(
     })
 }
 
-/// 记录单个项目的同步结果：成功（含自动提交并推送）→ 更新上次同步时间、清除异常；失败 → 保存异常原因
-fn record_sync(st: &AppState, sp: &StoredProject, one: SyncOne) -> (Project, SyncItemResult) {
+/// 一键同步时复用检查结果的时间窗口：这段时间内联网检查成功过的项目不再 fetch
+pub const REUSE_CHECK_WITHIN: Duration = Duration::from_secs(60);
+
+/// 一键同步要不要跳过 fetch：最近一次联网检查成功距现在不到 `REUSE_CHECK_WITHIN`
+pub fn should_skip_fetch(last_checked: Option<Instant>, now: Instant) -> bool {
+    last_checked.is_some_and(|t| now.saturating_duration_since(t) < REUSE_CHECK_WITHIN)
+}
+
+/// 一键同步时单个项目的选项。**唯一的构造入口**：`sync_all` 只通过这里拿选项，以后加选项也只改这里。
+/// `commit_message` 是本轮共用的自动提交信息，只给打开了自动提交的项目用。
+fn sync_options_for(st: &AppState, sp: &StoredProject, commit_message: &str) -> ops::SyncOptions {
+    ops::SyncOptions {
+        auto_commit: sp.auto_commit.then(|| commit_message.to_string()),
+        skip_fetch: should_skip_fetch(st.last_checked(&sp.id), Instant::now()),
+    }
+}
+
+/// 记录单个项目的同步结果：成功（含自动提交并推送）→ 更新上次同步时间、清除异常；失败 → 保存异常原因。
+/// 这次真的 fetch 成功了，就记下检查时间（跳过 fetch 时不记，免得一直沿用旧结果）。
+fn record_sync(st: &AppState, sp: &StoredProject, opts: &ops::SyncOptions, one: SyncOne) -> (Project, SyncItemResult) {
+    if !opts.skip_fetch && !one.check_failed {
+        st.mark_checked(&sp.id);
+    }
     let success = one.outcome != SyncOutcome::Failed;
     let reason = one.reason.clone();
     let now = now_iso();
@@ -360,6 +526,7 @@ pub async fn commit_and_push(
 ) -> Result<Project, String> {
     let st = state.inner().clone();
     let _net = st.net_lock.lock().await;
+    refresh_proxy(&st).await;
     let sp = st.stored(&project_id).ok_or("项目不存在")?;
     let dir = PathBuf::from(&sp.path);
     match ops::commit_and_push(&dir, &message).await {
@@ -413,7 +580,7 @@ pub async fn open_in_editor(state: State<'_, Shared>, project_id: String) -> Res
     Ok(sp.path)
 }
 
-fn settings_of(c: &AppConfig) -> Settings {
+fn settings_of(c: &AppConfig, proxy: &ResolvedProxy) -> Settings {
     Settings {
         default_code_dir: c
             .settings
@@ -423,6 +590,10 @@ fn settings_of(c: &AppConfig) -> Settings {
         theme: c.settings.theme.clone(),
         commit_template: commit_template_of(c),
         network_timeout_secs: network_timeout_of(c),
+        proxy_mode: proxy_mode_of(c).to_string(),
+        proxy_url: c.settings.proxy_url.clone(),
+        effective_proxy: proxy.effective.clone(),
+        proxy_source: proxy.source,
     }
 }
 
@@ -445,9 +616,11 @@ fn commit_template_of(c: &AppConfig) -> String {
         .to_string()
 }
 
+/// 读取设置；顺带重新解析一次代理，设置页显示的"当前代理"是此刻的实际情况
 #[tauri::command]
 pub async fn get_settings(state: State<'_, Shared>) -> Result<Settings, String> {
-    Ok(state.config.read(settings_of))
+    let proxy = refresh_proxy(&state).await;
+    Ok(state.config.read(|c| settings_of(c, &proxy)))
 }
 
 #[tauri::command]
@@ -462,7 +635,35 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
             return Err(format!("不支持的联网超时：{secs} 秒"));
         }
     }
+    // 代理：先算出保存后的模式和地址并校验，不合法时什么都不改
+    let proxy_patch = if patch.proxy_mode.is_some() || patch.proxy_url.is_some() {
+        let (cur_mode, cur_url) = state.config.read(|c| (proxy_mode_of(c), c.settings.proxy_url.clone()));
+        let mode = match patch.proxy_mode.as_deref() {
+            None => cur_mode,
+            Some(m) => *PROXY_MODES.iter().find(|x| **x == m).ok_or_else(|| format!("未知的代理模式：{m}"))?,
+        };
+        let url = match patch.proxy_url.as_deref().map(str::trim) {
+            None => cur_url,
+            Some("") => None,
+            Some(u) => Some(validate_proxy_url(u)?),
+        };
+        if mode == "manual" {
+            match &url {
+                None => return Err("选择手动填写时，请先填好代理地址".into()),
+                Some(u) => {
+                    validate_proxy_url(u)?;
+                }
+            }
+        }
+        Some((mode, url))
+    } else {
+        None
+    };
     state.config.update(|c| {
+        if let Some((mode, url)) = &proxy_patch {
+            c.settings.proxy_mode = (*mode != "auto").then(|| mode.to_string());
+            c.settings.proxy_url = url.clone();
+        }
         if let Some(dir) = &patch.default_code_dir {
             c.settings.default_code_dir = Some(normalize_path(dir));
         }
@@ -478,8 +679,134 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
         if let Some(secs) = patch.network_timeout_secs {
             c.settings.network_timeout_secs = (secs != DEFAULT_NETWORK_TIMEOUT_SECS).then_some(secs);
         }
-        let s = settings_of(c);
-        set_network_timeout(s.network_timeout_secs);
-        s
-    })
+        set_network_timeout(network_timeout_of(c));
+    })?;
+    let proxy = refresh_proxy(&state).await;
+    Ok(state.config.read(|c| settings_of(c, &proxy)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_fetch_only_right_after_successful_check() {
+        // 用"基准时间 + 偏移"构造，避免 Instant 减法在刚开机时下溢
+        let base = Instant::now();
+        let now = base + Duration::from_secs(600);
+        let ago = |secs: u64| Some(now - Duration::from_secs(secs));
+        assert!(!should_skip_fetch(None, now), "从没检查成功过 → 要 fetch");
+        assert!(should_skip_fetch(ago(0), now));
+        assert!(should_skip_fetch(ago(10), now));
+        assert!(should_skip_fetch(ago(59), now));
+        assert!(!should_skip_fetch(ago(60), now), "满 1 分钟 → 要 fetch");
+        assert!(!should_skip_fetch(ago(300), now));
+        // 检查时间比 now 还晚（并行时先取了 now）：算刚检查过
+        assert!(should_skip_fetch(Some(now + Duration::from_secs(1)), now));
+    }
+
+    #[test]
+    fn proxy_decisions() {
+        let r = |over: ProxyOverride, source: ProxySource, effective: Option<&str>| ResolvedProxy {
+            plan: over.into(),
+            source,
+            effective: effective.map(str::to_string),
+        };
+        let cfg = |proxy: Option<&str>, urls: &[(&str, &str)]| GitProxyConfig {
+            proxy: proxy.map(str::to_string),
+            url_proxies: urls.iter().map(|(u, v)| (u.to_string(), v.to_string())).collect(),
+        };
+        let nothing = cfg(None, &[]);
+        let git = cfg(Some("socks5://127.0.0.1:10808"), &[]);
+        let system = |addr: &str, no_proxy: Option<&str>| SystemProxy {
+            addr: addr.to_string(),
+            no_proxy: no_proxy.map(str::to_string),
+        };
+        let sys_proxy = system("http://127.0.0.1:10809", None);
+        let sys = Some(&sys_proxy);
+
+        // 自动：git 自己配了代理 → 不覆盖
+        assert_eq!(
+            decide_proxy("auto", None, &git, None, sys),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("socks5://127.0.0.1:10808"))
+        );
+        // 自动：git 没配，系统代理开着 → 用系统代理
+        assert_eq!(
+            decide_proxy("auto", None, &nothing, None, sys),
+            r(ProxyOverride::Use("http://127.0.0.1:10809".into()), ProxySource::System, Some("http://127.0.0.1:10809"))
+        );
+        // 自动：都没有 → 不覆盖、不用代理
+        assert_eq!(decide_proxy("auto", None, &nothing, None, None), r(ProxyOverride::Inherit, ProxySource::NoProxy, None));
+        // 自动：git 配置成空值（明确不用代理）→ 尊重 git 的配置，不套系统代理，也不看环境变量
+        assert_eq!(
+            decide_proxy("auto", None, &cfg(Some(""), &[]), Some("http://127.0.0.1:3"), sys),
+            r(ProxyOverride::Inherit, ProxySource::NoProxy, None)
+        );
+        // 自动：环境变量里给 https 用的代理也算 git 自己的
+        assert_eq!(
+            decide_proxy("auto", None, &nothing, Some("http://127.0.0.1:3"), sys),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("http://127.0.0.1:3"))
+        );
+        // 显示的地址去掉账号密码，交给 git 的保留原样
+        assert_eq!(
+            decide_proxy("auto", None, &nothing, None, Some(&system("http://u:p@127.0.0.1:1", None))),
+            r(ProxyOverride::Use("http://u:p@127.0.0.1:1".into()), ProxySource::System, Some("http://127.0.0.1:1"))
+        );
+        assert_eq!(
+            decide_proxy("auto", None, &nothing, Some("user:pw@127.0.0.1:2"), None),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("127.0.0.1:2"))
+        );
+
+        // 自动：只按网址配了代理（http.https://github.com.proxy）→ 也算 git 自己配了代理，不覆盖
+        let github = cfg(None, &[("https://github.com", "socks5://127.0.0.1:10808")]);
+        assert_eq!(
+            decide_proxy("auto", None, &github, None, sys),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("socks5://127.0.0.1:10808（仅 https://github.com）"))
+        );
+        let two = cfg(Some(""), &[("https://a.example", ""), ("https://github.com", "http://h:1"), ("https://gitlab.com", "http://h:2")]);
+        assert_eq!(
+            decide_proxy("auto", None, &two, None, sys),
+            r(ProxyOverride::Inherit, ProxySource::Git, Some("http://h:1（仅 https://github.com 等 2 个网址）"))
+        );
+        // 自动：按网址的设置只有"这个网址不用代理"→ 不算，照常用系统代理，而且不去盖这些网址的设置
+        let direct_only = cfg(None, &[("https://git.corp.local", "")]);
+        assert_eq!(
+            decide_proxy("auto", None, &direct_only, None, sys),
+            r(ProxyOverride::Use("http://127.0.0.1:10809".into()), ProxySource::System, Some("http://127.0.0.1:10809"))
+        );
+
+        // 自动 + 系统代理：系统的绕过列表带进 NO_PROXY
+        let with_bypass = system("http://127.0.0.1:10809", Some("localhost,192.168.0.0/16"));
+        let r_sys = decide_proxy("auto", None, &nothing, None, Some(&with_bypass));
+        assert_eq!(r_sys.plan.over, ProxyOverride::Use("http://127.0.0.1:10809".into()));
+        assert_eq!(r_sys.plan.no_proxy.as_deref(), Some("localhost,192.168.0.0/16"));
+        assert!(r_sys.plan.url_scopes.is_empty());
+        // 手动 / 不用代理 / git 自己的代理时不带系统的绕过列表
+        for r in [
+            decide_proxy("manual", Some("http://127.0.0.1:7890"), &nothing, None, Some(&with_bypass)),
+            decide_proxy("off", None, &nothing, None, Some(&with_bypass)),
+            decide_proxy("auto", None, &git, None, Some(&with_bypass)),
+        ] {
+            assert_eq!(r.plan.no_proxy, None, "{r:?}");
+        }
+
+        // 不用代理：不管 git 和系统怎么配，都完全不走代理，按网址配的代理也盖住
+        assert_eq!(decide_proxy("off", None, &git, None, sys), r(ProxyOverride::Disable, ProxySource::NoProxy, None));
+        let off = decide_proxy("off", None, &two, None, sys);
+        assert_eq!(off.plan.over, ProxyOverride::Disable);
+        assert_eq!(off.plan.url_scopes, ["https://a.example", "https://github.com", "https://gitlab.com"]);
+
+        // 手动：用填写的地址，按网址配的代理也盖住
+        assert_eq!(
+            decide_proxy("manual", Some("http://127.0.0.1:7890"), &git, None, sys),
+            r(ProxyOverride::Use("http://127.0.0.1:7890".into()), ProxySource::Manual, Some("http://127.0.0.1:7890"))
+        );
+        let manual = decide_proxy("manual", Some("http://127.0.0.1:7890"), &github, None, sys);
+        assert_eq!(manual.plan.url_scopes, ["https://github.com"]);
+        // 手动但没有可用的地址（配置被手动改坏）→ 按自动处理
+        assert_eq!(
+            decide_proxy("manual", None, &nothing, None, sys),
+            decide_proxy("auto", None, &nothing, None, sys)
+        );
+    }
 }
