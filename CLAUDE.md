@@ -57,7 +57,7 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 - 开发服务器固定监听 `127.0.0.1:1420`（`strictPort`）：部分 Windows 机器上 `localhost` 只解析到 `::1`，Tauri CLI 会一直等不到开发服务器。
 - 调试时用环境变量 `SYNCDECK_CONFIG_DIR` 指定配置目录，以免改到真实配置 `%APPDATA%\com.gitsyncdeck.desktop\config.json`。
 - 发布：先把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 三处的版本号改成同一个并提交，再推 `v*` 标签。`.github/workflows/release.yml` 会先跑测试，再构建 Windows 安装包并发布到 Releases，同时上传应用内更新用的 `latest.json` 和 `.sig`（需要仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`）。`tauri.conf.json` 里的 updater 公钥和这把私钥是一对，换私钥等于让所有已安装版本收不到更新。
-- 自动提交只在一键同步时、对打开了开关的项目进行；不做后台定时提交。
+- 自动同步只在换电脑的时刻触发（离开：关机、锁屏、睡眠；到达：开机、唤醒、解锁），不做按固定间隔的后台提交；自动提交只对打开了开关的项目进行。分叉时只在 `merge-tree` 预演无冲突时才合并，有冲突什么都不动、交给用户。详见 `docs/requirements.md` 第 7 节。
 
 ## 本项目例外
 
