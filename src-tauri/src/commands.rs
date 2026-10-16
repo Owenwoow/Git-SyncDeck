@@ -154,25 +154,29 @@ async fn local_project(st: &AppState, sp: &StoredProject) -> Project {
     p
 }
 
-/// 联网检查（刷新状态用）：fetch + status，fetch 用刷新的短超时
-async fn remote_project(st: &AppState, sp: &StoredProject) -> Project {
+/// 联网检查（刷新状态用）：fetch + status，fetch 用刷新的短超时。
+/// 检查要等联网，期间用户可能改了"自动提交"开关或取消了监控：检查完后重新读持久化字段再组装结果；
+/// 已经取消监控的返回 None（不再记缓存和检查时间）。
+async fn remote_project(st: &AppState, sp: &StoredProject) -> Option<Project> {
+    let checked = ops::check(Path::new(&sp.path), refresh_timeout()).await;
+    let sp = st.stored(&sp.id)?;
     let prev = st.cached(&sp.id);
-    let mut p = match ops::check(Path::new(&sp.path), refresh_timeout()).await {
+    let mut p = match checked {
         Checked::Fresh(ins) => {
             st.mark_checked(&sp.id);
-            project_from(sp, &ins)
+            project_from(&sp, &ins)
         }
         // fetch 失败：状态停留在上一次 fetch 时的结果（本地的远程跟踪分支没变）
-        Checked::FetchFailed { local, error } => with_error(Some(project_from(sp, &local)), sp, error.message()),
-        Checked::Failed(error) => with_error(prev, sp, error.message()),
+        Checked::FetchFailed { local, error } => with_error(Some(project_from(&sp, &local)), &sp, error.message()),
+        Checked::Failed(error) => with_error(prev, &sp, error.message()),
     };
     // 刷新检测到已同步：清除遗留的异常标记
     if p.status == SyncStatus::Synced && p.check_error.is_none() && p.issue.is_some() {
-        st.update_stored(sp, |e| e.issue = None);
+        st.update_stored(&sp, |e| e.issue = None);
         p.issue = None;
     }
     st.remember(&p);
-    p
+    Some(p)
 }
 
 // ---------------- 代理 ----------------
@@ -268,7 +272,8 @@ pub async fn list_projects(state: State<'_, Shared>) -> Result<Vec<Project>, Str
     .await)
 }
 
-/// 联网刷新所有项目：每个项目检查完就通过 `on_event` 发一次 Done，最后仍返回完整列表
+/// 联网刷新所有项目：每个项目检查完就通过 `on_event` 发一次 Done，最后仍返回完整列表。
+/// 刷新途中被取消监控的项目不发事件，也不在返回的列表里。
 #[tauri::command]
 pub async fn refresh_status(
     state: State<'_, Shared>,
@@ -281,18 +286,19 @@ pub async fn refresh_status(
     let total = stored.len();
     let finished = Arc::new(AtomicUsize::new(0));
     let st2 = st.clone();
-    Ok(map_limited(stored, CONCURRENCY, move |sp| {
+    let checked = map_limited(stored, CONCURRENCY, move |sp| {
         let st = st2.clone();
         let on_event = on_event.clone();
         let finished = finished.clone();
         async move {
-            let project = remote_project(&st, &sp).await;
+            let project = remote_project(&st, &sp).await?;
             let index = finished.fetch_add(1, Ordering::SeqCst);
             let _ = on_event.send(RefreshProgressEvent::Done { project: project.clone(), index, total });
-            project
+            Some(project)
         }
     })
-    .await)
+    .await;
+    Ok(checked.into_iter().flatten().collect())
 }
 
 #[tauri::command]

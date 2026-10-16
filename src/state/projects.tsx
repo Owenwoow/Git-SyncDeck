@@ -71,12 +71,13 @@ function errorMessage(e: unknown): string {
 const NO_IDS: ReadonlySet<string> = new Set();
 
 /** 用刷新结果更新列表：只更新列表里还在的项目（刷新途中取消监控的不再加回来），
- *  一键同步已经开始处理的项目保留"同步中"，等同步结果覆盖 */
+ *  一键同步已经开始处理的项目保留"同步中"，等同步结果覆盖；
+ *  "自动提交"开关以界面上的为准（刷新途中刚改过的开关不会被刷新结果改回去） */
 function applyChecked(list: Project[], checked: Project[]): Project[] {
   const byId = new Map(checked.map((p) => [p.id, p]));
   return list.map((p) => {
     const next = byId.get(p.id);
-    return next && p.status !== "syncing" ? next : p;
+    return next && p.status !== "syncing" ? { ...next, autoCommit: p.autoCommit } : p;
   });
 }
 
