@@ -75,8 +75,11 @@ GitHub Actions（`.github/workflows/release.yml`）会在推送 `v*` 标签时�
 
 前提：仓库 Settings → Secrets 里有 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件的内容，只需配置一次）。私钥务必备份，丢了的话，已安装的版本就再也收不到应用内更新。
 
-1. 把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 里的版本号改成新版本，例如 `0.2.0`，然后提交。
-2. 打标签并推送：`git tag v0.2.0`，`git push origin main v0.2.0`。
+1. 写这个版本的发布说明 `docs/release-notes/v0.2.0.md`：用大白话写这个版本的新功能、改进、修复和注意事项，格式参考同目录下的其他版本。下载、安装、更新这些通用说明在 `_common.md` 里，会自动接在后面。**缺了这个文件，流水线会在一开始就失败。**
+2. 把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 里的版本号改成新版本，例如 `0.2.0`，和发布说明一起提交。
+3. 打标签并推送：`git tag v0.2.0`，`git push origin main v0.2.0`。
+
+Release 网页上显示"本版本说明 + 通用说明"；应用内"检查更新"只显示本版本说明（来自 `latest.json`）。想先看看效果：`node scripts/release-notes.mjs 0.2.0`。改已经发布的版本：`node scripts/release-notes.mjs 0.2.0 | gh release edit v0.2.0 --notes-file -`（这只改网页，应用内显示的说明要另外改 `latest.json`）。
 
 也可以在 GitHub 网页的 Actions 页面手动运行 "Release (Windows)"。
 

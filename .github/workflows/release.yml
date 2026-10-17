@@ -26,6 +26,11 @@ jobs:
           node-version: 22
           cache: npm
 
+      # 每个版本都要有自己的发布说明（docs/release-notes/v<版本>.md），缺了就在这里直接失败，不用等构建
+      - name: 检查本版本的发布说明
+        shell: bash
+        run: node scripts/release-notes.mjs > /dev/null
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
@@ -63,6 +68,18 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
+      # 建 Release 时只填这个版本的说明（docs/release-notes/v<版本>.md），它也会写进 latest.json，
+      # 就是应用内"检查更新"显示的更新说明；Release 建好后再在网页上补上通用说明（下载、安装、更新）
+      - name: 生成本版本的发布说明
+        id: notes
+        shell: bash
+        run: |
+          {
+            echo 'body<<SYNCDECK_RELEASE_NOTES_EOF'
+            node scripts/release-notes.mjs --only-version
+            echo 'SYNCDECK_RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: 构建安装包并发布 Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -76,16 +93,12 @@ jobs:
           releaseName: Git SyncDeck v__VERSION__
           releaseDraft: false
           prerelease: false
-          releaseBody: |
-            Windows 桌面工具：在一个界面里统一管理多个本地 Git 项目与 GitHub 的同步状态。
+          releaseBody: ${{ steps.notes.outputs.body }}
 
-            **下载**
-            - `…_x64-setup.exe`：安装程序（推荐）
-            - `…_x64_en-US.msi`：MSI 安装包
-
-            **使用前**
-            - 需要先安装 [Git for Windows](https://git-scm.com/download/win)，并且 GitHub 登录已保存在凭据管理器里（在终端里 `git push` 不用输密码即可）。
-            - 安装包未签名，Windows 提示"已保护你的电脑"时，点"更多信息"→"仍要运行"。
-
-            **更新**
-            - 0.2.0 起支持应用内更新：在"设置 → 关于"里检查更新，或等待启动时的提示。
+      - name: Release 网页上补上通用说明
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          node scripts/release-notes.mjs "$version" | gh release edit "v$version" --notes-file -
