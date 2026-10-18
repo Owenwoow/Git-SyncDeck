@@ -32,9 +32,7 @@ pub struct StoredSettings {
     // 以下开关：None 表示用默认值（默认值见 autosync::Switches::DEFAULT）
     pub launch_at_login: Option<bool>,
     pub close_to_tray: Option<bool>,
-    pub sync_on_shutdown: Option<bool>,
     pub sync_on_lock: Option<bool>,
-    pub sync_on_sleep: Option<bool>,
     pub sync_on_startup: Option<bool>,
     pub sync_on_resume: Option<bool>,
     pub sync_on_unlock: Option<bool>,

@@ -45,7 +45,7 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
   - `util::map_limited` 最多 8 个项目并行
   - `run_sync` / `run_refresh` 是同步和刷新的主体，前端命令和后台自动同步共用
 - 一键同步和刷新的进度由 Rust 端通过 Tauri 2 `Channel<SyncProgressEvent>` / `Channel<RefreshProgressEvent>` 推给前端，并行时 `index` 是完成顺序；后台发起的同步用 Tauri 事件（`projects-changed` 等）通知前端。
-- 自动同步：`autosync.rs` 是调度（纯函数 `decide`：离开 / 到达各自 10 分钟冷却、暂停到次日 00:00、各开关），`sysevents.rs` 用一个可见的 0×0 弹出窗口收锁屏 / 电源 / 关机消息（没有可见窗口的程序不能阻止关机），`tray.rs` 是托盘。单实例插件只在发布版启用；调试版的开机自启项叫"Git SyncDeck (dev)"，不会覆盖安装版。
+- 自动同步：`autosync.rs` 是调度（纯函数 `decide`：离开 / 到达各自 10 分钟冷却、暂停到次日 00:00、各开关），`sysevents.rs` 用一个隐藏的 0×0 顶层窗口收锁屏 / 解锁和唤醒消息（关机、睡眠前不同步），`tray.rs` 是托盘。单实例插件只在发布版启用；调试版的开机自启项叫"Git SyncDeck (dev)"，不会覆盖安装版。
 - `url.rs` 负责把远程地址、代理地址和 git 错误输出里的账号、token 去掉，之后才能显示或保存。
 
 ### 前端
@@ -61,7 +61,7 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 - 开发服务器固定监听 `127.0.0.1:1420`（`strictPort`）：部分 Windows 机器上 `localhost` 只解析到 `::1`，Tauri CLI 会一直等不到开发服务器。
 - 调试时用环境变量 `SYNCDECK_CONFIG_DIR` 指定配置目录，以免改到真实配置 `%APPDATA%\com.gitsyncdeck.desktop\config.json`。
 - 发布：先写这个版本的发布说明 `docs/release-notes/v<版本>.md`（每个版本单独写，流水线缺这个文件会直接失败），再把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 三处的版本号改成同一个，一起提交，然后推 `v*` 标签。`.github/workflows/release.yml` 会先跑测试，再构建 Windows 安装包并发布到 Releases，同时上传应用内更新用的 `latest.json` 和 `.sig`（需要仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`）。`tauri.conf.json` 里的 updater 公钥和这把私钥是一对，换私钥等于让所有已安装版本收不到更新。
-- 自动同步只在换电脑的时刻触发（离开：关机、锁屏、睡眠；到达：开机、唤醒、解锁），不做按固定间隔的后台提交；自动提交只对打开了开关的项目进行。分叉时只在 `merge-tree` 预演无冲突时才合并，有冲突什么都不动、交给用户。详见 `docs/requirements.md` 第 7 节。
+- 自动同步只在换电脑的时刻触发（离开：锁屏；到达：开机、唤醒、解锁；关机和睡眠前不同步），不做按固定间隔的后台提交；自动提交只对打开了开关的项目进行。分叉时只在 `merge-tree` 预演无冲突时才合并，有冲突什么都不动、交给用户。详见 `docs/requirements.md` 第 7 节。
 
 ## 本项目例外
 

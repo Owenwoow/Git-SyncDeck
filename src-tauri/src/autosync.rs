@@ -19,8 +19,6 @@ use crate::model::{
 pub const SAME_KIND_MINUTES: i64 = 10;
 /// 定时检查云端的间隔（分钟）
 pub const PERIODIC_MINUTES: i64 = 30;
-/// 关机时最多等多久（包括等正在进行的那一轮同步）
-pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 /// 启动 / 唤醒后联网失败时，等多久重试一次（网络可能还没连上）
 pub const RETRY_DELAY: Duration = Duration::from_secs(15);
 /// 定时检查的轮询间隔：每隔这么久看一眼是否到了 30 分钟（开关随时可改，不用重启计时器）
@@ -38,7 +36,7 @@ impl AutoSyncTrigger {
     pub fn kind(self) -> Kind {
         use AutoSyncTrigger::*;
         match self {
-            Shutdown | Lock | Sleep => Kind::Departure,
+            Lock => Kind::Departure,
             Startup | Resume | Unlock | Manual => Kind::Arrival,
             Periodic => Kind::Check,
         }
@@ -48,9 +46,7 @@ impl AutoSyncTrigger {
     pub fn label(self) -> &'static str {
         use AutoSyncTrigger::*;
         match self {
-            Shutdown => "关机前同步",
             Lock => "锁屏时同步",
-            Sleep => "睡眠前同步",
             Startup => "启动时同步",
             Resume => "唤醒后同步",
             Unlock => "解锁后同步",
@@ -67,9 +63,7 @@ impl AutoSyncTrigger {
 pub struct Switches {
     pub launch_at_login: bool,
     pub close_to_tray: bool,
-    pub sync_on_shutdown: bool,
     pub sync_on_lock: bool,
-    pub sync_on_sleep: bool,
     pub sync_on_startup: bool,
     pub sync_on_resume: bool,
     pub sync_on_unlock: bool,
@@ -83,9 +77,7 @@ macro_rules! each_switch {
     ($m:ident) => {
         $m!(launch_at_login);
         $m!(close_to_tray);
-        $m!(sync_on_shutdown);
         $m!(sync_on_lock);
-        $m!(sync_on_sleep);
         $m!(sync_on_startup);
         $m!(sync_on_resume);
         $m!(sync_on_unlock);
@@ -96,13 +88,11 @@ macro_rules! each_switch {
 }
 
 impl Switches {
-    /// 默认值：开机自启、关窗口隐藏到托盘、离开 / 到达的 6 个时机都开；定时检查关；只在出错或冲突时通知
+    /// 默认值：开机自启、关窗口隐藏到托盘、锁屏和启动 / 唤醒 / 解锁都开；定时检查关；只在出错或冲突时通知
     pub const DEFAULT: Switches = Switches {
         launch_at_login: true,
         close_to_tray: true,
-        sync_on_shutdown: true,
         sync_on_lock: true,
-        sync_on_sleep: true,
         sync_on_startup: true,
         sync_on_resume: true,
         sync_on_unlock: true,
@@ -151,9 +141,7 @@ impl Switches {
     pub fn allows(&self, t: AutoSyncTrigger) -> bool {
         use AutoSyncTrigger::*;
         match t {
-            Shutdown => self.sync_on_shutdown,
             Lock => self.sync_on_lock,
-            Sleep => self.sync_on_sleep,
             Startup => self.sync_on_startup,
             Resume => self.sync_on_resume,
             Unlock => self.sync_on_unlock,
@@ -180,7 +168,7 @@ pub enum Decision {
 /// 判断这次要不要做：
 /// - 托盘"立即同步"是用户亲手点的：总是做（不看开关、暂停和间隔）
 /// - 对应开关关着 → 不做；暂停中（`now` 早于 `paused_until`）→ 不做
-/// - 同一种（离开 / 到达）上次距今不到 10 分钟 → 不做；关机不受这条限制；定时检查的间隔是 30 分钟
+/// - 同一种（离开 / 到达）上次距今不到 10 分钟 → 不做；定时检查的间隔是 30 分钟
 /// - `last_same_kind` 比 `now` 还晚（系统时间被往回调过）→ 不算刚做过
 pub fn decide<Tz: TimeZone>(
     trigger: AutoSyncTrigger,
@@ -198,12 +186,11 @@ pub fn decide<Tz: TimeZone>(
     if paused_until.is_some_and(|until| now < until) {
         return Decision::Paused;
     }
-    let min_gap = match trigger {
-        AutoSyncTrigger::Shutdown => None,
-        AutoSyncTrigger::Periodic => Some(PERIODIC_MINUTES),
-        _ => Some(SAME_KIND_MINUTES),
+    let gap = match trigger {
+        AutoSyncTrigger::Periodic => PERIODIC_MINUTES,
+        _ => SAME_KIND_MINUTES,
     };
-    if let (Some(gap), Some(last)) = (min_gap, last_same_kind) {
+    if let Some(last) = last_same_kind {
         let elapsed = now.clone().signed_duration_since(last.clone());
         if elapsed >= chrono::Duration::zero() && elapsed < chrono::Duration::minutes(gap) {
             return Decision::TooSoon;
@@ -260,17 +247,13 @@ pub fn pick_departure(projects: &[Project], auto_merge: bool) -> Vec<String> {
 
 /// 后台同步结束后的系统通知（标题、正文）；不需要通知时为 None。
 /// 有项目失败 → "2 个项目需要处理：A、B"（"出错或冲突时通知"打开时）；
-/// 都成功且确实推送 / 拉取 / 提交了东西 → "已同步 2 个项目：A、B"（"同步成功时通知"打开时）。
-/// 关机和睡眠前的同步不通知：关机后没人看得到；睡眠前的同步常被睡眠打断而失败，唤醒后的同步会补上并照常通知
+/// 都成功且确实推送 / 拉取 / 提交了东西 → "已同步 2 个项目：A、B"（"同步成功时通知"打开时）
 pub fn notification_text(
     trigger: AutoSyncTrigger,
     result: &SyncResult,
     name_of: &HashMap<String, String>,
     switches: &Switches,
 ) -> Option<(String, String)> {
-    if matches!(trigger, AutoSyncTrigger::Shutdown | AutoSyncTrigger::Sleep) {
-        return None;
-    }
     let names = |pick: &dyn Fn(SyncOutcome) -> bool| -> Vec<String> {
         result
             .items
@@ -365,10 +348,10 @@ impl AutoSync {
         *self.running.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 开始一轮后台同步；已经有一轮时返回 None（`force` 时照样开始：关机不能等）
-    fn begin(&self, trigger: AutoSyncTrigger, force: bool) -> Option<RunningGuard<'_>> {
+    /// 开始一轮后台同步；已经有一轮时返回 None
+    fn begin(&self, trigger: AutoSyncTrigger) -> Option<RunningGuard<'_>> {
         let mut r = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        if r.is_some() && !force {
+        if r.is_some() {
             return None;
         }
         *r = Some(trigger);
@@ -427,17 +410,17 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// 到达类最多等多久"离开前那一轮"结束（它常被睡眠打断，唤醒后接着跑完）
+/// 到达类最多等多久"离开前那一轮"结束（锁屏那一轮常被睡眠打断，唤醒后接着跑完）
 pub const WAIT_DEPARTURE_LEFTOVER: Duration = Duration::from_secs(120);
 
 /// 到达类触发遇到正在跑的离开同步时，要不要先等它结束。
-/// 离开同步（锁屏、睡眠……）常被睡眠打断、唤醒后才接着跑完：设了"唤醒需要登录"时，合盖往往先锁屏再睡眠，
+/// 锁屏同步常被睡眠打断、唤醒后才接着跑完：设了"唤醒需要登录"时，合盖往往先锁屏再睡眠，
 /// 正在跑的就是锁屏那一轮。不等的话，唤醒和解锁的到达同步都会被它挡掉，唤醒后什么都不做
 pub fn waits_for_departure(trigger: AutoSyncTrigger, running: Option<AutoSyncTrigger>) -> bool {
     trigger.kind() == Kind::Arrival && running.is_some_and(|t| t.kind() == Kind::Departure)
 }
 
-/// 处理一次触发（锁屏、解锁、唤醒、托盘立即同步、定时检查……）。关机走 `shutdown`。
+/// 处理一次触发（锁屏、解锁、唤醒、托盘立即同步、定时检查……）。
 /// 已经有一轮同步在跑时直接跳过，也不记时间。例外：到达类遇到正在跑的离开同步，先等它结束（最多 2 分钟）
 /// 再做，见 `waits_for_departure`
 pub async fn handle(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> Outcome {
@@ -451,42 +434,9 @@ pub async fn handle(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> O
         return Outcome::Busy;
     }
     match st.config.read(|c| st.auto.claim(trigger, Local::now(), &c.settings)) {
-        Decision::Run => execute(st, host, trigger, false).await,
+        Decision::Run => execute(st, host, trigger).await,
         d => Outcome::Skipped(d),
     }
-}
-
-/// 关机 / 重启 / 注销：先等正在进行的同步结束，再做自己的离开同步；到 `deadline` 还没轮到就放弃
-/// （调用方最多等到 `deadline`，到点就放行关机）
-pub async fn shutdown(st: &Shared, host: &dyn Host, deadline: Instant) -> Outcome {
-    match st.config.read(|c| st.auto.claim(AutoSyncTrigger::Shutdown, Local::now(), &c.settings)) {
-        Decision::Run => {}
-        d => return Outcome::Skipped(d),
-    }
-    loop {
-        while st.is_syncing() {
-            if Instant::now() >= deadline {
-                return Outcome::Busy;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        match execute(st, host, AutoSyncTrigger::Shutdown, true).await {
-            // 刚等完又被别的同步抢先了：继续等
-            Outcome::Busy if Instant::now() < deadline => continue,
-            other => return other,
-        }
-    }
-}
-
-/// 关机消息的处理线程里调用：在后台做关机前同步，本线程最多等 `SHUTDOWN_BUDGET`（30 秒），到点就返回放行关机
-pub fn shutdown_blocking(st: Shared, host: Arc<dyn Host>) {
-    let deadline = Instant::now() + SHUTDOWN_BUDGET;
-    let (tx, rx) = std::sync::mpsc::channel();
-    tauri::async_runtime::spawn(async move {
-        shutdown(&st, &*host, deadline).await;
-        let _ = tx.send(());
-    });
-    let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
 /// 程序启动 = 一次"到达"。要做的话由后端做（前端启动时就不再自己刷新），不做的话只做一次本地检查给托盘用
@@ -495,7 +445,7 @@ pub fn on_startup(st: Shared, host: Arc<dyn Host>) {
     if decision == Decision::Run {
         st.auto.startup_sync.store(true, Ordering::SeqCst);
         tauri::async_runtime::spawn(async move {
-            execute(&st, &*host, AutoSyncTrigger::Startup, false).await;
+            execute(&st, &*host, AutoSyncTrigger::Startup).await;
         });
     } else {
         tauri::async_runtime::spawn(async move {
@@ -521,7 +471,7 @@ pub async fn periodic_loop(st: Shared, host: Arc<dyn Host>) {
 }
 
 /// 已经决定要做之后的执行部分
-async fn execute(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger, force: bool) -> Outcome {
+async fn execute(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> Outcome {
     if trigger.kind() == Kind::Check {
         // 定时检查只是看一眼（不拉取、不推送），不占"正在后台同步"：
         // 期间来的到达同步照常开始，靠 net_lock 排在它后面
@@ -529,7 +479,7 @@ async fn execute(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger, force: 
         host.projects_changed(st.snapshot());
         return Outcome::Checked(checked);
     }
-    let Some(_running) = st.auto.begin(trigger, force) else {
+    let Some(_running) = st.auto.begin(trigger) else {
         return Outcome::Busy;
     };
     match trigger.kind() {
@@ -615,13 +565,11 @@ mod tests {
         FixedOffset::east_opt(8 * 3600).unwrap().with_ymd_and_hms(2026, 10, 16, h, m, 0).unwrap()
     }
 
-    const ALL: [AutoSyncTrigger; 8] = [Shutdown, Lock, Sleep, Startup, Resume, Unlock, Manual, Periodic];
+    const ALL: [AutoSyncTrigger; 6] = [Lock, Startup, Resume, Unlock, Manual, Periodic];
 
     #[test]
     fn kinds() {
-        for t in [Shutdown, Lock, Sleep] {
-            assert_eq!(t.kind(), Kind::Departure);
-        }
+        assert_eq!(Lock.kind(), Kind::Departure);
         for t in [Startup, Resume, Unlock, Manual] {
             assert_eq!(t.kind(), Kind::Arrival);
         }
@@ -641,13 +589,12 @@ mod tests {
     fn same_kind_only_once_in_ten_minutes() {
         let sw = Switches { periodic_check: true, ..Switches::DEFAULT };
         let now = at(9, 30);
-        for t in [Lock, Sleep, Startup, Resume, Unlock] {
+        for t in [Lock, Startup, Resume, Unlock] {
             assert_eq!(decide(t, &now, Some(&at(9, 21)), None, &sw), Decision::TooSoon, "{t:?} 9 分钟前做过");
             assert_eq!(decide(t, &now, Some(&at(9, 20)), None, &sw), Decision::Run, "{t:?} 满 10 分钟");
             assert_eq!(decide(t, &now, Some(&at(8, 0)), None, &sw), Decision::Run);
         }
-        // 关机、托盘"立即同步"不受 10 分钟限制
-        assert_eq!(decide(Shutdown, &now, Some(&at(9, 29)), None, &sw), Decision::Run);
+        // 托盘"立即同步"不受 10 分钟限制
         assert_eq!(decide(Manual, &now, Some(&at(9, 29)), None, &sw), Decision::Run);
         // 定时检查：30 分钟一次
         assert_eq!(decide(Periodic, &now, Some(&at(9, 1)), None, &sw), Decision::TooSoon);
@@ -659,9 +606,7 @@ mod tests {
     #[test]
     fn switches_turn_off_each_trigger() {
         let off = Switches {
-            sync_on_shutdown: false,
             sync_on_lock: false,
-            sync_on_sleep: false,
             sync_on_startup: false,
             sync_on_resume: false,
             sync_on_unlock: false,
@@ -734,10 +679,10 @@ mod tests {
         assert_eq!(auto.claim(Lock, t0 + chrono::Duration::minutes(1), &s), Decision::Run);
         assert_eq!(auto.claim(Unlock, t0 + chrono::Duration::minutes(11), &s), Decision::Run);
         // 关着开关的不记时间：打开后马上能做
-        let off = StoredSettings { sync_on_sleep: Some(false), ..Default::default() };
+        let off = StoredSettings { sync_on_lock: Some(false), ..Default::default() };
         let auto = AutoSync::new();
-        assert_eq!(auto.claim(Sleep, t0, &off), Decision::Disabled);
-        assert_eq!(auto.claim(Sleep, t0, &s), Decision::Run);
+        assert_eq!(auto.claim(Lock, t0, &off), Decision::Disabled);
+        assert_eq!(auto.claim(Lock, t0, &s), Decision::Run);
     }
 
     #[test]
@@ -831,11 +776,6 @@ mod tests {
         assert_eq!(notification_text(Manual, &good, &names, &both).unwrap().1, "已同步 3 个项目：项目A、项目C、项目D");
         let nothing = result(&[("a", UpToDate)]);
         assert!(notification_text(Manual, &nothing, &names, &both).is_none());
-
-        // 关机、睡眠前的同步不通知（关机后看不到；睡眠常打断同步，唤醒后会补上）
-        assert!(notification_text(Shutdown, &bad, &names, &both).is_none());
-        assert!(notification_text(Sleep, &bad, &names, &both).is_none());
-        assert!(notification_text(Lock, &bad, &names, &both).is_some());
     }
 
     #[test]
@@ -849,18 +789,16 @@ mod tests {
 
     #[test]
     fn arrival_waits_only_for_departure_leftovers() {
-        // 正在跑的是离开类（锁屏、睡眠、关机）：到达类先等它结束
-        for running in [Lock, Sleep, Shutdown] {
-            for t in [Resume, Unlock, Startup, Manual] {
-                assert!(waits_for_departure(t, Some(running)), "{t:?} 遇到 {running:?}");
-            }
+        // 正在跑的是离开类（锁屏）：到达类先等它结束
+        for t in [Resume, Unlock, Startup, Manual] {
+            assert!(waits_for_departure(t, Some(Lock)), "{t:?}");
         }
         // 正在跑的是到达类、或者没在跑：不等（到达类遇到到达类直接跳过）
         for running in [None, Some(Unlock), Some(Manual), Some(Resume)] {
             assert!(!waits_for_departure(Resume, running), "{running:?}");
         }
         // 离开类、定时检查不等
-        assert!(!waits_for_departure(Lock, Some(Sleep)));
+        assert!(!waits_for_departure(Lock, Some(Lock)));
         assert!(!waits_for_departure(Periodic, Some(Lock)));
     }
 
@@ -874,7 +812,7 @@ mod tests {
     async fn resume_after_lock_leftover_still_syncs() {
         // 合盖时先锁屏再睡眠：锁屏那一轮被睡眠打断，唤醒后还没跑完
         let st = empty_state("syncdeck-autosync-unit-leftover");
-        let leftover = st.auto.begin(Lock, false).unwrap();
+        let leftover = st.auto.begin(Lock).unwrap();
         let st2 = st.clone();
         let resume = tokio::spawn(async move { handle(&st2, &NoHost, Resume).await });
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -889,7 +827,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn arrival_skips_when_another_arrival_is_running() {
         let st = empty_state("syncdeck-autosync-unit-busy");
-        let _running = st.auto.begin(Manual, false).unwrap();
+        let _running = st.auto.begin(Manual).unwrap();
         assert!(matches!(handle(&st, &NoHost, Resume).await, Outcome::Busy));
     }
 }

@@ -173,12 +173,8 @@ pub struct Settings {
     pub launch_at_login: bool,
     /// 关窗口时隐藏到托盘，不退出
     pub close_to_tray: bool,
-    /// 离开时同步：关机 / 重启 / 注销
-    pub sync_on_shutdown: bool,
     /// 离开时同步：锁屏
     pub sync_on_lock: bool,
-    /// 离开时同步：睡眠
-    pub sync_on_sleep: bool,
     /// 到达时同步：程序启动（含开机自启）
     pub sync_on_startup: bool,
     /// 到达时同步：从睡眠唤醒
@@ -234,9 +230,7 @@ pub struct SettingsPatch {
     pub host_name: Option<String>,
     pub launch_at_login: Option<bool>,
     pub close_to_tray: Option<bool>,
-    pub sync_on_shutdown: Option<bool>,
     pub sync_on_lock: Option<bool>,
-    pub sync_on_sleep: Option<bool>,
     pub sync_on_startup: Option<bool>,
     pub sync_on_resume: Option<bool>,
     pub sync_on_unlock: Option<bool>,
@@ -249,13 +243,11 @@ pub struct SettingsPatch {
     pub big_file_limit_mb: Option<u64>,
 }
 
-/// 自动同步的触发原因。离开：关机 / 锁屏 / 睡眠；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端
+/// 自动同步的触发原因。离开：锁屏；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AutoSyncTrigger {
-    Shutdown,
     Lock,
-    Sleep,
     Startup,
     Resume,
     Unlock,

@@ -299,9 +299,7 @@ function ProxyCard() {
 type SwitchKey =
   | "launchAtLogin"
   | "closeToTray"
-  | "syncOnShutdown"
   | "syncOnLock"
-  | "syncOnSleep"
   | "syncOnStartup"
   | "syncOnResume"
   | "syncOnUnlock"
@@ -325,9 +323,7 @@ const BACKGROUND_SWITCHES: SwitchItem[] = [
 ];
 
 const LEAVE_SWITCHES: SwitchItem[] = [
-  { key: "syncOnShutdown", label: "关机、重启或注销", description: "最多等 30 秒，同步完或超时就继续关机" },
   { key: "syncOnLock", label: "锁屏" },
-  { key: "syncOnSleep", label: "睡眠", description: "Windows 只给几秒，来不及推完的，下次唤醒或开机时补上" },
 ];
 
 const ARRIVE_SWITCHES: SwitchItem[] = [
@@ -457,7 +453,7 @@ function AutoSyncSection() {
       <SwitchCard title="后台运行" items={BACKGROUND_SWITCHES} />
       <SwitchCard
         title="离开这台电脑时同步"
-        description="只推送本机还没推上去的提交（打开了自动提交的项目先提交再推送）；没有要推的就完全不联网。"
+        description="只推送本机还没推上去的提交（打开了自动提交的项目先提交再推送）；没有要推的就完全不联网。关机和睡眠前不同步，没推上去的下次开机、唤醒或解锁时补上。"
         items={LEAVE_SWITCHES}
       />
       <SwitchCard

@@ -1,5 +1,5 @@
 //! 换电脑自动同步：离开时只同步有东西要推的项目（没有就完全不联网）、到达时同步所有项目、
-//! 10 分钟内同一种只做一次、关机不受限制、暂停与托盘"立即同步"、设置的读写和旧配置兼容。
+//! 10 分钟内同一种只做一次、暂停与托盘"立即同步"、设置的读写和旧配置兼容。
 //! 只使用 scripts/make-test-repos.mjs 生成的临时仓库和临时配置目录。
 //! 运行：cd src-tauri && cargo test --test auto_sync -- --nocapture
 
@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use chrono::Local;
 use tauri::Manager;
@@ -118,22 +117,16 @@ async fn departure_only_pushes_what_needs_pushing() {
 
     // 10 分钟内再次锁屏：不做
     assert!(matches!(
-        autosync::handle(&st, &host, AutoSyncTrigger::Sleep).await,
+        autosync::handle(&st, &host, AutoSyncTrigger::Lock).await,
         Outcome::Skipped(Decision::TooSoon)
     ));
     assert!(host.take().is_empty());
 
-    // 关机不受 10 分钟限制；这次已经没有要推的 → 完全不联网
-    let outcome = autosync::shutdown(&st, &host, Instant::now() + Duration::from_secs(30)).await;
-    assert!(matches!(outcome, Outcome::NothingToDo), "{outcome:?}");
-    assert_eq!(host.take(), ["projects 5", "finished Shutdown 无"], "没联网就不发 started");
-    assert_eq!(git(&behind, &["rev-parse", "origin/main"]), behind_tracking, "关机时也没去 fetch");
-
-    // 关掉"关机时同步"：不做
-    commands::save_settings(app.state(), SettingsPatch { sync_on_shutdown: Some(false), ..Default::default() })
+    // 关掉"锁屏时同步"：不做
+    commands::save_settings(app.state(), SettingsPatch { sync_on_lock: Some(false), ..Default::default() })
         .await
         .unwrap();
-    let outcome = autosync::shutdown(&st, &host, Instant::now() + Duration::from_secs(30)).await;
+    let outcome = autosync::handle(&st, &host, AutoSyncTrigger::Lock).await;
     assert!(matches!(outcome, Outcome::Skipped(Decision::Disabled)), "{outcome:?}");
 }
 
@@ -195,10 +188,10 @@ async fn arrival_syncs_everything_and_respects_pause() {
 async fn auto_sync_settings_and_old_config() {
     let dir = fresh_config_dir("syncdeck-autosync-settings-config");
     let cfg_file = dir.join("config.json");
-    // 加入自动同步之前的配置文件
+    // 加入自动同步之前的配置文件（syncOnShutdown / syncOnSleep 是已经去掉的开关，读的时候忽略）
     std::fs::write(
         &cfg_file,
-        r#"{ "version": 1, "settings": { "theme": "dark", "commitTemplate": "同步 {host}" }, "projects": [] }"#,
+        r#"{ "version": 1, "settings": { "theme": "dark", "commitTemplate": "同步 {host}", "syncOnShutdown": false, "syncOnSleep": false }, "projects": [] }"#,
     )
     .unwrap();
     let app = new_app(&cfg_file);
@@ -207,7 +200,7 @@ async fn auto_sync_settings_and_old_config() {
     let s = commands::get_settings(app.state()).await.unwrap();
     assert_eq!(s.theme.as_deref(), Some("dark"));
     assert!(s.launch_at_login && s.close_to_tray);
-    assert!(s.sync_on_shutdown && s.sync_on_lock && s.sync_on_sleep);
+    assert!(s.sync_on_lock);
     assert!(s.sync_on_startup && s.sync_on_resume && s.sync_on_unlock);
     assert!(!s.periodic_check && !s.notify_on_success && s.notify_on_error);
     assert_eq!(s.host_name, "");

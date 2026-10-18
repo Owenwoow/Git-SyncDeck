@@ -146,12 +146,8 @@ export interface Settings {
   launchAtLogin: boolean;
   /** 关窗口时隐藏到托盘，不退出，默认开 */
   closeToTray: boolean;
-  /** 离开时同步：关机 / 重启 / 注销，默认开 */
-  syncOnShutdown: boolean;
   /** 离开时同步：锁屏，默认开 */
   syncOnLock: boolean;
-  /** 离开时同步：睡眠，默认开 */
-  syncOnSleep: boolean;
   /** 到达时同步：程序启动（含开机自启），默认开 */
   syncOnStartup: boolean;
   /** 到达时同步：从睡眠唤醒，默认开 */
@@ -174,8 +170,8 @@ export interface Settings {
   bigFileLimitMb: number;
 }
 
-/** 自动同步的触发原因。离开：关机 / 锁屏 / 睡眠；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端 */
-export type AutoSyncTrigger = "shutdown" | "lock" | "sleep" | "startup" | "resume" | "unlock" | "manual" | "periodic";
+/** 自动同步的触发原因。离开：锁屏；到达：启动 / 唤醒 / 解锁 / 托盘"立即同步"；另有定时检查云端 */
+export type AutoSyncTrigger = "lock" | "startup" | "resume" | "unlock" | "manual" | "periodic";
 
 /** 后台自动同步的事件：开始时 result 为 null；结束时为同步结果（没有要同步的项目、定时检查时为 null） */
 export interface AutoSyncEvent {

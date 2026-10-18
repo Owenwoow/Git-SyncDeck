@@ -172,7 +172,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
         }),
         api.onAutoSync({
           started: setAutoSync,
-          // 只清掉同一轮的（关机同步可能顶掉正在进行的那一轮）
+          // 只清掉同一轮的
           finished: (e) => setAutoSync((cur) => (cur && cur.trigger !== e.trigger ? cur : null)),
         }),
       ]).catch(() => undefined);

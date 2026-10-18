@@ -138,7 +138,7 @@ pub fn run() {
                 tray::show_main_window(&handle);
             }
 
-            // 系统事件：锁屏 / 睡眠 / 关机 → 离开；解锁 / 唤醒 → 到达
+            // 系统事件：锁屏 → 离开；解锁 / 唤醒 → 到达
             let handlers = sysevents::Handlers {
                 on_event: Box::new({
                     let (st, host) = (st.clone(), host.clone());
@@ -146,15 +146,10 @@ pub fn run() {
                         let trigger = match e {
                             sysevents::SysEvent::Lock => AutoSyncTrigger::Lock,
                             sysevents::SysEvent::Unlock => AutoSyncTrigger::Unlock,
-                            sysevents::SysEvent::Suspend => AutoSyncTrigger::Sleep,
                             sysevents::SysEvent::Resume => AutoSyncTrigger::Resume,
                         };
                         autosync::spawn(st.clone(), host.clone(), trigger);
                     }
-                }),
-                on_end_session: Box::new({
-                    let (st, host) = (st.clone(), host.clone());
-                    move || autosync::shutdown_blocking(st.clone(), host.clone())
                 }),
             };
             if let Err(e) = sysevents::start(handlers) {

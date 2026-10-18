@@ -1,31 +1,24 @@
-//! Windows 系统事件：锁屏 / 解锁、睡眠 / 唤醒、关机 / 重启 / 注销。
-//! 起一个看不见的顶层窗口和它自己的消息循环线程（message-only 窗口收不到广播和关机消息）。
-//! 这个窗口必须"可见"（WS_VISIBLE，但 0×0、不进任务栏和 Alt+Tab、不抢焦点）：Windows 不允许没有可见窗口的
-//! 程序阻止关机，5 秒内不回复 WM_QUERYENDSESSION 就直接结束进程。开机自启（从没弹窗口）或主窗口关到托盘时，
-//! 这是整个进程唯一的可见窗口。
+//! Windows 系统事件：锁屏 / 解锁、从睡眠唤醒。
+//! 起一个隐藏的顶层窗口和它自己的消息循环线程（message-only 窗口收不到广播）。
 //!
 //! 监听的事件：
 //! - `WTSRegisterSessionNotification`：锁屏 → 离开；解锁 → 到达
-//! - `WM_POWERBROADCAST`：`PBT_APMSUSPEND` → 离开（Windows 只给几秒，尽力而为，不阻塞）；
-//!   `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` → 到达
-//! - `WM_QUERYENDSESSION` / `WM_ENDSESSION`：关机、重启、注销 → 离开。用 `ShutdownBlockReasonCreate` 显示
-//!   "Git SyncDeck 正在同步…"，阻塞到同步完成或超时（最长时间由 `on_end_session` 自己控制），然后放行，
-//!   绝不拒绝关机（总是返回 TRUE）
+//! - `WM_POWERBROADCAST`：`PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` → 到达
+//!
+//! 关机和睡眠前不同步（Windows 给的时间太短，实际用起来不可靠）：没推上去的提交由下次开机、唤醒或解锁时的
+//! 到达同步补上。
 
-/// 不需要阻塞的系统事件
+/// 系统事件
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysEvent {
     Lock,
     Unlock,
-    Suspend,
     Resume,
 }
 
 pub struct Handlers {
-    /// 锁屏、解锁、睡眠、唤醒：在消息线程里调用，不能阻塞（把活儿丢到后台去做）
+    /// 锁屏、解锁、唤醒：在消息线程里调用，不能阻塞（把活儿丢到后台去做）
     pub on_event: Box<dyn Fn(SysEvent) + Send + Sync>,
-    /// 关机 / 重启 / 注销：阻塞到同步完成或超时，返回后放行关机
-    pub on_end_session: Box<dyn Fn() + Send + Sync>,
 }
 
 /// 启动监听（只能调用一次）。失败时返回原因，程序其他功能照常
@@ -41,28 +34,22 @@ pub fn start(_handlers: Handlers) -> Result<(), String> {
 
 #[cfg(windows)]
 mod imp {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
-    use windows_sys::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage,
-        ENDSESSION_CLOSEAPP, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WM_ENDSESSION,
-        WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_POPUP, WS_VISIBLE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage, MSG,
+        PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
     };
 
     use super::{Handlers, SysEvent};
 
     static HANDLERS: OnceLock<Handlers> = OnceLock::new();
-    /// 这次关机已经处理过（WM_QUERYENDSESSION 之后还会来 WM_ENDSESSION）；关机被取消时清除，下次关机再做
-    static ENDING: AtomicBool = AtomicBool::new(false);
 
     const CLASS_NAME: &str = "GitSyncDeckSystemEvents";
-    const BLOCK_REASON: &str = "Git SyncDeck 正在同步…";
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()
@@ -94,7 +81,7 @@ mod imp {
     unsafe fn create_window() -> Result<(), String> {
         let hwnd = create_event_window()?;
         if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
-            // 收不到锁屏 / 解锁，睡眠和关机照常
+            // 收不到锁屏 / 解锁，唤醒照常
             eprintln!("注册锁屏通知失败：{}", std::io::Error::last_os_error());
         }
         Ok(())
@@ -114,13 +101,12 @@ mod imp {
             return Err(format!("注册窗口类失败：{}", std::io::Error::last_os_error()));
         }
         let title = wide("Git SyncDeck 系统事件");
-        // 顶层窗口，能收到广播和关机消息。带 WS_VISIBLE 让系统把它当作可见窗口（这样关机时才允许它阻止关机，
-        // 见文件开头），但 0×0 大小、WS_EX_TOOLWINDOW 不进任务栏和 Alt+Tab、WS_EX_NOACTIVATE 不抢焦点，用户看不到
+        // 隐藏的顶层窗口，能收到广播；0×0 大小、WS_EX_TOOLWINDOW 不进任务栏和 Alt+Tab、WS_EX_NOACTIVATE 不抢焦点
         let hwnd: HWND = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class.as_ptr(),
             title.as_ptr(),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP,
             0,
             0,
             0,
@@ -144,24 +130,9 @@ mod imp {
         }
     }
 
-    /// 只是安装程序要关掉本程序（Restart Manager），不是关机或注销
-    fn closes_app_only(lparam: LPARAM) -> bool {
-        (lparam as u32) & ENDSESSION_CLOSEAPP != 0
-    }
-
     fn fire(h: &Handlers, e: SysEvent) {
         // panic 不能穿过 extern "system" 边界
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (h.on_event)(e)));
-    }
-
-    /// 关机前同步：显示阻止关机的原因，阻塞到同步完成或超时，然后撤掉原因
-    unsafe fn block_for_sync(hwnd: HWND, h: &Handlers) {
-        let reason = wide(BLOCK_REASON);
-        let blocked = ShutdownBlockReasonCreate(hwnd, reason.as_ptr()) != 0;
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (h.on_end_session)()));
-        if blocked {
-            ShutdownBlockReasonDestroy(hwnd);
-        }
     }
 
     unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -179,27 +150,10 @@ mod imp {
             }
             WM_POWERBROADCAST => {
                 match wparam as u32 {
-                    PBT_APMSUSPEND => fire(h, SysEvent::Suspend),
                     PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => fire(h, SysEvent::Resume),
                     _ => {}
                 }
                 1
-            }
-            WM_QUERYENDSESSION => {
-                if !closes_app_only(lparam) && !ENDING.swap(true, Ordering::SeqCst) {
-                    block_for_sync(hwnd, h);
-                }
-                1 // 总是放行
-            }
-            WM_ENDSESSION => {
-                if wparam == 0 {
-                    // 关机被取消了（别的程序拦下或用户取消）：下次关机还要同步
-                    ENDING.store(false, Ordering::SeqCst);
-                } else if !closes_app_only(lparam) && !ENDING.swap(true, Ordering::SeqCst) {
-                    // 没收到 WM_QUERYENDSESSION 就直接结束会话：尽力同步一下
-                    block_for_sync(hwnd, h);
-                }
-                0
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -213,12 +167,12 @@ mod imp {
             WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         };
 
-        /// 系统只允许有可见窗口的程序阻止关机：事件窗口要"可见"，但 0×0、不进任务栏、不抢焦点
+        /// 事件窗口用户看不到：隐藏、0×0、不进任务栏、不抢焦点
         #[test]
-        fn event_window_counts_as_visible_but_takes_no_space() {
+        fn event_window_is_invisible() {
             unsafe {
                 let hwnd = super::create_event_window().unwrap();
-                assert!(IsWindowVisible(hwnd) != 0, "必须是可见窗口，否则关机时 5 秒就被结束");
+                assert!(IsWindowVisible(hwnd) == 0, "隐藏窗口");
                 let mut rect: RECT = std::mem::zeroed();
                 assert!(GetWindowRect(hwnd, &mut rect) != 0);
                 assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (0, 0), "0×0，用户看不到");
