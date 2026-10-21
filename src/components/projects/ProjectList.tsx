@@ -15,12 +15,15 @@ export function ProjectList({
   selectedId,
   onSelect,
   checkingIds,
+  percents,
 }: {
   projects: Project[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   /** 刷新时还没检查完的项目，状态旁显示小转圈 */
   checkingIds?: ReadonlySet<string>;
+  /** 同步中的项目正在上传 / 下载的百分比，显示在"同步中"旁边 */
+  percents?: ReadonlyMap<string, number>;
 }) {
   return (
     <div className="overflow-hidden rounded-lg border bg-card">
@@ -37,6 +40,7 @@ export function ProjectList({
               project={p}
               selected={p.id === selectedId}
               checking={checkingIds?.has(p.id) ?? false}
+              percent={p.status === "syncing" ? percents?.get(p.id) : undefined}
               onClick={() => onSelect(p.id)}
             />
           </li>
@@ -50,11 +54,13 @@ function ProjectRow({
   project: p,
   selected,
   checking,
+  percent,
   onClick,
 }: {
   project: Project;
   selected: boolean;
   checking: boolean;
+  percent?: number;
   onClick: () => void;
 }) {
   const repo = repoShortName(p.remoteUrl);
@@ -112,6 +118,7 @@ function ProjectRow({
 
       <div className="flex min-w-0 items-center gap-1.5">
         <StatusBadge status={p.status} />
+        {percent !== undefined && <span className="text-xs text-status-syncing tabular-nums">{percent}%</span>}
         {checking && (
           <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" aria-label="正在检查" />
         )}

@@ -14,7 +14,9 @@ use tauri::Manager;
 use git_syncdeck_lib::autosync::{self, Decision, Host, Outcome};
 use git_syncdeck_lib::commands::{self, AppState, Shared};
 use git_syncdeck_lib::config::ConfigStore;
-use git_syncdeck_lib::model::{AutoSyncTrigger, Project, SettingsPatch, SyncOutcome, SyncResult};
+use git_syncdeck_lib::model::{
+    AutoSyncTrigger, GitOp, ProgressPhase, Project, SettingsPatch, SyncOutcome, SyncProgressEvent, SyncResult,
+};
 use git_syncdeck_lib::util;
 
 fn fixtures(name: &str) -> PathBuf {
@@ -250,4 +252,83 @@ async fn auto_sync_settings_and_old_config() {
     let st: Shared = app.state::<Shared>().inner().clone();
     commands::set_auto_sync_pause(&st, Some(Local::now() - chrono::Duration::minutes(1))).unwrap();
     assert!(commands::get_settings(app.state()).await.unwrap().auto_sync_paused_until.is_none());
+}
+
+/// 记下后台同步的每条进度事件；每完成一个项目，顺便看一眼"这一轮到现在的进度"
+struct ProgressRecorder {
+    st: Shared,
+    events: Mutex<Vec<SyncProgressEvent>>,
+    /// 每次 Done 时进度快照里已完成的项目数
+    done_seen: Mutex<Vec<usize>>,
+}
+
+impl Host for ProgressRecorder {
+    fn progress(&self, _t: AutoSyncTrigger, e: &SyncProgressEvent) {
+        if matches!(e, SyncProgressEvent::Done { .. }) {
+            assert!(self.st.auto.running().is_some(), "进度事件发出时后台同步还在进行");
+            self.done_seen.lock().unwrap().push(self.st.round_snapshot().results.len());
+        }
+        self.events.lock().unwrap().push(e.clone());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_sync_reports_progress() {
+    let root = fixtures("syncdeck-autosync-progress");
+    let repos = root.join("repos");
+    let app = new_app(&fresh_config_dir("syncdeck-autosync-progress-config").join("config.json"));
+    let st: Shared = app.state::<Shared>().inner().clone();
+    let added = commands::add_projects(
+        app.state(),
+        ["synced", "behind", "ahead"].iter().map(|n| repos.join(n).to_string_lossy().into()).collect(),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<String> = added.iter().map(|p| p.id.clone()).collect();
+
+    let host = ProgressRecorder { st: st.clone(), events: Mutex::default(), done_seen: Mutex::default() };
+    let r = synced(autosync::handle(&st, &host, AutoSyncTrigger::Manual).await);
+    assert_eq!(r.items.len(), 3);
+    let events = host.events.lock().unwrap().clone();
+    for e in &events {
+        println!("{}", serde_json::to_string(e).unwrap());
+    }
+
+    // 先是这一轮的项目清单，然后每个项目开始、完成各一次
+    match &events[0] {
+        SyncProgressEvent::Begin { project_ids, total } => {
+            assert_eq!(*total, 3);
+            let mut got = project_ids.clone();
+            got.sort();
+            let mut want = ids.clone();
+            want.sort();
+            assert_eq!(got, want);
+        }
+        other => panic!("第一条应该是 Begin：{other:?}"),
+    }
+    let count = |f: &dyn Fn(&SyncProgressEvent) -> bool| events.iter().filter(|e| f(e)).count();
+    assert_eq!(count(&|e| matches!(e, SyncProgressEvent::Start { .. })), 3);
+    assert_eq!(count(&|e| matches!(e, SyncProgressEvent::Done { .. })), 3);
+    // 联网的 git 操作有百分比
+    let progress: Vec<(GitOp, ProgressPhase, u8)> = events
+        .iter()
+        .filter_map(|e| match e {
+            SyncProgressEvent::Progress { op, phase, percent, .. } => Some((*op, *phase, *percent)),
+            _ => None,
+        })
+        .collect();
+    assert!(progress.iter().any(|(op, _, _)| *op == GitOp::Push), "推送有进度：{progress:?}");
+    // 待拉取的项目：要下载的东西在"检查云端"的 fetch 里就下载完了，pull 只是快进
+    assert!(progress.iter().any(|(op, _, _)| *op == GitOp::Fetch), "检查云端有进度：{progress:?}");
+    assert!(progress.iter().any(|(_, phase, _)| *phase == ProgressPhase::Uploading), "推送有上传的百分比：{progress:?}");
+    assert!(progress.iter().all(|(_, _, p)| *p <= 100));
+    // 同步途中的进度快照里能拿到已完成项目的结果
+    assert_eq!(*host.done_seen.lock().unwrap(), [1, 2, 3]);
+
+    // 结束后：不在进行，保留最近一次的结果
+    let state = commands::get_auto_sync_state(app.state());
+    assert!(state.running.is_none() && state.progress.is_none());
+    let last = state.last.expect("保留最近一次后台同步的结果");
+    assert_eq!(last.trigger, AutoSyncTrigger::Manual);
+    assert_eq!(last.result.unwrap().items.len(), 3);
 }

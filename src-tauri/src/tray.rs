@@ -61,9 +61,9 @@ pub struct TraySummary {
 /// 按项目状态算托盘的颜色和摘要：
 /// - 红：有项目分叉、有异常标记或检查失败
 /// - 黄：有项目待推送或有未提交改动
-/// - 蓝：正在同步
+/// - 蓝：正在同步（`syncing` 为这一轮的（已完成, 总数）；总数还是 0 时显示"正在同步…"）
 /// - 绿：其他（包括只是待拉取的）
-pub fn summarize(projects: &[Project], syncing: bool) -> TraySummary {
+pub fn summarize(projects: &[Project], syncing: Option<(usize, usize)>) -> TraySummary {
     let attention = |p: &Project| p.status == SyncStatus::Diverged || p.issue.is_some() || p.check_error.is_some();
     let count = |f: &dyn Fn(&Project) -> bool| projects.iter().filter(|p| f(p)).count();
     let bad = count(&|p| attention(p));
@@ -72,7 +72,7 @@ pub fn summarize(projects: &[Project], syncing: bool) -> TraySummary {
     let synced = count(&|p| !attention(p) && p.status == SyncStatus::Synced);
     let no_remote = count(&|p| !attention(p) && p.status == SyncStatus::NoRemote);
 
-    let color = if syncing {
+    let color = if syncing.is_some() {
         TrayColor::Blue
     } else if bad > 0 {
         TrayColor::Red
@@ -81,8 +81,12 @@ pub fn summarize(projects: &[Project], syncing: bool) -> TraySummary {
     } else {
         TrayColor::Green
     };
-    let text = if syncing {
-        "正在同步…".to_string()
+    let text = if let Some((done, total)) = syncing {
+        if total == 0 {
+            "正在同步…".to_string()
+        } else {
+            format!("正在同步 {done}/{total}")
+        }
     } else if projects.is_empty() {
         "还没有监控项目".to_string()
     } else {
@@ -229,9 +233,14 @@ fn on_menu(app: &AppHandle, id: &str, st: &Shared, host: &Arc<dyn Host>) {
                 let _ = app.emit(EVENT_SETTINGS_CHANGED, commands::current_settings(&st).await);
             });
         }
-        MENU_QUIT => app.exit(0),
+        MENU_QUIT => quit(app),
         _ => {}
     }
+}
+
+/// 彻底退出 SyncDeck（托盘菜单「退出」和设置页「退出 SyncDeck」共用）
+pub fn quit<R: Runtime>(app: &AppHandle<R>) {
+    app.exit(0);
 }
 
 /// 显示主窗口并放到最前面
@@ -265,7 +274,7 @@ fn apply(app: &AppHandle, tray: &Tray) {
     let st = app.state::<Shared>();
     let now = Local::now();
     let paused = st.config.read(|c| autosync::active_pause(&c.settings, &now));
-    let summary = summarize(&st.snapshot(), st.is_syncing());
+    let summary = summarize(&st.snapshot(), st.is_syncing().then(|| st.round_snapshot().counts()));
     let mut tooltip = format!("Git SyncDeck · {}", summary.text);
     if let Some(until) = &paused {
         tooltip.push_str(&format!("\n自动同步已暂停到 {}", autosync::describe_until(until, &now)));
@@ -330,13 +339,14 @@ mod tests {
 
     #[test]
     fn colors_and_tooltips() {
-        let s = |list: &[Project], syncing| summarize(list, syncing);
+        let s = |list: &[Project], syncing: bool| summarize(list, syncing.then_some((0, 0)));
         assert_eq!(s(&[], false), TraySummary { color: TrayColor::Green, text: "还没有监控项目".into() });
 
         let synced: Vec<_> = (0..7).map(|i| project(&format!("p{i}"), SyncStatus::Synced)).collect();
         assert_eq!(s(&synced, false), TraySummary { color: TrayColor::Green, text: "7 个项目已同步".into() });
         assert_eq!(s(&synced, true).color, TrayColor::Blue, "正在同步优先");
-        assert_eq!(s(&synced, true).text, "正在同步…");
+        assert_eq!(s(&synced, true).text, "正在同步…", "这一轮还没开始联网");
+        assert_eq!(summarize(&synced, Some((3, 7))).text, "正在同步 3/7");
 
         // 只是待拉取 / 未关联云端：仍是绿色，悬停文字里说明
         let mut list = synced.clone();

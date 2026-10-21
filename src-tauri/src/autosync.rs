@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
 
-use crate::commands::{self, Shared, SYNC_BUSY};
+use crate::commands::{self, Shared, SyncSink, SYNC_BUSY};
 use crate::config::StoredSettings;
 use crate::model::{
-    AutoSyncEvent, AutoSyncState, AutoSyncTrigger, Project, SettingsPatch, SyncOutcome, SyncResult, SyncStatus,
+    AutoSyncEvent, AutoSyncState, AutoSyncTrigger, Project, SettingsPatch, SyncOutcome, SyncProgressEvent, SyncResult,
+    SyncStatus,
 };
 
 /// 同一种自动同步（离开 / 到达）多少分钟内只做一次
@@ -301,6 +302,8 @@ pub struct AutoSync {
     running: Mutex<Option<AutoSyncTrigger>>,
     /// 启动时的到达同步由后端负责
     startup_sync: AtomicBool,
+    /// 最近一次真的联网同步了的后台同步（只在内存里）
+    last: Mutex<Option<AutoSyncEvent>>,
 }
 
 impl Default for AutoSync {
@@ -316,6 +319,7 @@ impl AutoSync {
             times: Mutex::new(Times { check: Some(Local::now()), ..Default::default() }),
             running: Mutex::new(None),
             startup_sync: AtomicBool::new(false),
+            last: Mutex::new(None),
         }
     }
 
@@ -358,11 +362,18 @@ impl AutoSync {
         Some(RunningGuard(self, trigger))
     }
 
+    /// 当前状态；`progress` 由 `commands::get_auto_sync_state` 补上（进度记在 AppState 里）
     pub fn state(&self) -> AutoSyncState {
         AutoSyncState {
             running: self.running().map(|t| AutoSyncEvent { trigger: t, label: t.label().into(), result: None }),
             startup_sync: self.startup_sync.load(Ordering::SeqCst),
+            progress: None,
+            last: self.last.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
+    }
+
+    fn set_last(&self, e: AutoSyncEvent) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
     }
 }
 
@@ -383,6 +394,8 @@ impl Drop for RunningGuard<'_> {
 pub trait Host: Send + Sync {
     /// 开始联网同步
     fn started(&self, _trigger: AutoSyncTrigger) {}
+    /// 同步进度（和一键同步的进度事件一样，另有等网络重试的 Retry）
+    fn progress(&self, _trigger: AutoSyncTrigger, _event: &SyncProgressEvent) {}
     /// 一轮同步结束（定时检查不算）。`result` 为 None：没有要同步的项目（没联网），或同步没能开始
     fn finished(&self, _trigger: AutoSyncTrigger, _result: Option<&SyncResult>) {}
     /// 最新的项目列表（后台检查 / 同步之后）
@@ -511,16 +524,39 @@ async fn sync_and_report(
     only: Option<Vec<String>>,
     retry: bool,
 ) -> Outcome {
+    st.reset_round();
     host.started(trigger);
-    let mut result = commands::run_sync(st, only, Arc::new(|_| {})).await;
-    if let (true, Ok(first)) = (retry, &mut result) {
-        let again = network_failures(st, first);
-        if !again.is_empty() {
-            tokio::time::sleep(RETRY_DELAY).await;
-            if let Ok(second) = commands::run_sync(st, Some(again), Arc::new(|_| {})).await {
-                merge_retry(first, second);
+    // 进度事件从各个项目的任务里发出来，经过通道交给 host（host 只借用到这一轮结束）
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncProgressEvent>();
+    let sink: SyncSink = Arc::new(move |e| {
+        let _ = tx.send(e);
+    });
+    let work = async move {
+        let mut result = commands::run_sync(st, only, sink.clone()).await;
+        if let (true, Ok(first)) = (retry, &mut result) {
+            let again = network_failures(st, first);
+            if !again.is_empty() {
+                let retry_at = (Local::now() + chrono::Duration::from_std(RETRY_DELAY).unwrap_or_default()).to_rfc3339();
+                let notice = SyncProgressEvent::Retry { project_ids: again.clone(), retry_at };
+                st.note_progress(&notice);
+                sink(notice);
+                tokio::time::sleep(RETRY_DELAY).await;
+                if let Ok(second) = commands::run_sync(st, Some(again), sink.clone()).await {
+                    merge_retry(first, second);
+                }
             }
         }
+        drop(sink); // 发送端都丢掉后，下面的转发就结束了
+        result
+    };
+    let forward = async {
+        while let Some(e) = rx.recv().await {
+            host.progress(trigger, &e);
+        }
+    };
+    let (result, ()) = tokio::join!(work, forward);
+    if let Ok(r) = &result {
+        st.auto.set_last(AutoSyncEvent { trigger, label: trigger.label().into(), result: Some(r.clone()) });
     }
     host.projects_changed(st.snapshot());
     host.finished(trigger, result.as_ref().ok());

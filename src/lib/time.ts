@@ -30,3 +30,12 @@ export function formatDateTime(iso: string | Date): string {
   const d = typeof iso === "string" ? new Date(iso) : iso;
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm(d)}`;
 }
+
+/** 钟点：今天 → 10:32；昨天 → 昨天 10:32；更早 → 10月20日 10:32 */
+export function formatClock(iso: string, now: Date = new Date()): string {
+  const d = new Date(iso);
+  const dayDiff = Math.round((startOfDay(now) - startOfDay(d)) / 86_400_000);
+  if (dayDiff === 0) return hm(d);
+  if (dayDiff === 1) return `昨天 ${hm(d)}`;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${hm(d)}`;
+}

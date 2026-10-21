@@ -4,44 +4,98 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::git::{network_timeout, run_git, GitError, MERGE_TREE_FLAGS, PROXY_CONFIG_REGEX, STATUS_TIMEOUT};
-use crate::model::{ChangeKind, CommitInfo, SyncOutcome, SyncStatus};
+use crate::git::{
+    network_timeout, run_git, run_git_progress, GitError, GitOutput, MERGE_TREE_FLAGS, PROXY_CONFIG_REGEX,
+    STATUS_TIMEOUT,
+};
+use crate::model::{ChangeKind, CommitInfo, GitOp, GitProgress, SyncOutcome, SyncStatus};
 use crate::status::{inspect, issue_text, no_remote_reason, parse_porcelain_v2, read_config, Inspection, DETACHED};
 use crate::url::sanitize_url;
+
+/// 联网操作的进度交给谁（一键同步、后台同步把它转成进度事件）；`none()` 表示没人要看进度
+#[derive(Clone, Default)]
+pub struct ProgressSink(Option<Arc<dyn Fn(GitOp, GitProgress) + Send + Sync>>);
+
+impl ProgressSink {
+    pub fn new(f: impl Fn(GitOp, GitProgress) + Send + Sync + 'static) -> Self {
+        ProgressSink(Some(Arc::new(f)))
+    }
+
+    pub fn none() -> Self {
+        ProgressSink(None)
+    }
+}
+
+impl std::fmt::Debug for ProgressSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "ProgressSink(有)" } else { "ProgressSink(无)" })
+    }
+}
+
+/// 执行联网的 git 命令（fetch / push / pull）：有人要看进度时把 `--quiet` 换成 `--progress`，边运行边上报；
+/// 没人看时和原来一样安静地执行
+async fn run_net(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    op: GitOp,
+    progress: &ProgressSink,
+) -> Result<GitOutput, GitError> {
+    let Some(f) = &progress.0 else {
+        return run_git(dir, args, timeout).await;
+    };
+    let args = with_progress(args);
+    run_git_progress(dir, &args, timeout, &|p| f(op, p)).await
+}
+
+/// `--quiet` 换成 `--progress`（`--quiet` 会让 push 不输出进度）；本来没有 `--quiet` 的，在子命令后面加上
+pub fn with_progress<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = args.iter().copied().filter(|a| *a != "--quiet").collect();
+    out.insert(1.min(out.len()), "--progress");
+    out
+}
 
 /// 只 fetch 上游分支（下载量和 pull 一样，分支、标签多的仓库不会因为下载其他分支而超时）。
 /// 上游分支在本地已没有远程跟踪分支，或者按分支 fetch 失败（如云端分支已删除）时，退回 fetch 整个远程；
 /// 超时不退回，免得再等一轮。`timeout` 是每次 fetch 的超时（刷新用 `refresh_timeout()`，其余用 `network_timeout()`）。
 pub async fn fetch(dir: &Path, ins: &Inspection, timeout: Duration) -> Result<(), GitError> {
+    fetch_with(dir, ins, timeout, &ProgressSink::none()).await
+}
+
+/// 和 `fetch` 一样，进度交给 `progress`
+pub async fn fetch_with(dir: &Path, ins: &Inspection, timeout: Duration, progress: &ProgressSink) -> Result<(), GitError> {
     let remote = ins.remote_name.as_deref().unwrap_or("origin");
     if let (Some(branch), false) = (ins.upstream_branch.as_deref(), ins.upstream_gone) {
-        match run_git(dir, &["fetch", "--quiet", remote, branch], timeout).await {
+        match run_net(dir, &["fetch", "--quiet", remote, branch], timeout, GitOp::Fetch, progress).await {
             Ok(_) => return Ok(()),
             Err(e @ GitError::Timeout { .. }) => return Err(e),
             Err(_) => {}
         }
     }
-    run_git(dir, &["fetch", "--quiet", remote], timeout).await.map(|_| ())
+    run_net(dir, &["fetch", "--quiet", remote], timeout, GitOp::Fetch, progress).await.map(|_| ())
 }
 
 /// 推送当前分支到它的上游（显式写出 refspec，不加 +，远程拒绝时不会强推）
-pub async fn push(dir: &Path, ins: &Inspection) -> Result<(), GitError> {
+pub async fn push(dir: &Path, ins: &Inspection, progress: &ProgressSink) -> Result<(), GitError> {
     let remote = ins.remote_name.as_deref().unwrap_or("origin");
     let target = ins.upstream_branch.as_deref().unwrap_or(&ins.branch);
     let refspec = format!("refs/heads/{}:refs/heads/{}", ins.branch, target);
-    run_git(dir, &["push", "--quiet", remote, &refspec], network_timeout()).await.map(|_| ())
+    run_net(dir, &["push", "--quiet", remote, &refspec], network_timeout(), GitOp::Push, progress).await.map(|_| ())
 }
 
 /// 只快进拉取。--no-rebase / --no-autostash 防止全局配置（pull.rebase、autostash）让它变成变基或自动 stash
-pub async fn pull_ff_only(dir: &Path, ins: &Inspection) -> Result<(), GitError> {
+pub async fn pull_ff_only(dir: &Path, ins: &Inspection, progress: &ProgressSink) -> Result<(), GitError> {
     let remote = ins.remote_name.as_deref().unwrap_or("origin");
     let target = ins.upstream_branch.as_deref().unwrap_or(&ins.branch);
-    run_git(
+    run_net(
         dir,
         &["pull", "--ff-only", "--no-rebase", "--no-autostash", "--quiet", remote, target],
         network_timeout(),
+        GitOp::Pull,
+        progress,
     )
     .await
     .map(|_| ())
@@ -60,6 +114,11 @@ pub enum Checked {
 /// 联网检查：先 fetch（超时为 `fetch_timeout`），再 git status。没有上游的项目不需要联网。
 /// 刷新状态时传 `refresh_timeout()`，一键同步时传 `network_timeout()`。
 pub async fn check(dir: &Path, fetch_timeout: Duration) -> Checked {
+    check_with(dir, fetch_timeout, &ProgressSink::none()).await
+}
+
+/// 和 `check` 一样，fetch 的进度交给 `progress`
+pub async fn check_with(dir: &Path, fetch_timeout: Duration, progress: &ProgressSink) -> Checked {
     let local = match inspect(dir).await {
         Ok(i) => i,
         Err(e) => return Checked::Failed(e),
@@ -67,7 +126,7 @@ pub async fn check(dir: &Path, fetch_timeout: Duration) -> Checked {
     if !local.can_fetch() {
         return Checked::Fresh(local);
     }
-    if let Err(error) = fetch(dir, &local, fetch_timeout).await {
+    if let Err(error) = fetch_with(dir, &local, fetch_timeout, progress).await {
         return Checked::FetchFailed { local, error };
     }
     match inspect(dir).await {
@@ -109,6 +168,8 @@ pub struct SyncOptions {
     pub merge_message: String,
     /// 自动提交前的检查（大文件、疑似密钥文件）；None 表示不检查
     pub precommit: Option<PrecommitCheck>,
+    /// fetch / push / pull 的进度交给谁；默认没人看
+    pub progress: ProgressSink,
 }
 
 /// 自动提交前检查的设置
@@ -145,7 +206,7 @@ pub async fn sync_one(dir: &Path, opts: &SyncOptions) -> SyncOne {
             Err(e) => Checked::Failed(e),
         }
     } else {
-        check(dir, network_timeout()).await
+        check_with(dir, network_timeout(), &opts.progress).await
     };
     let ins = match checked {
         Checked::Fresh(i) => i,
@@ -155,17 +216,17 @@ pub async fn sync_one(dir: &Path, opts: &SyncOptions) -> SyncOne {
     let auto_commit = opts.auto_commit.as_deref();
 
     match ins.status {
-        SyncStatus::Ahead => match push(dir, &ins).await {
+        SyncStatus::Ahead => match push(dir, &ins, &opts.progress).await {
             Ok(()) => SyncOne::ok(SyncOutcome::Pushed, ins.ahead, reinspect(dir, ins.clone()).await),
             Err(e) => SyncOne::failed(e.message(), Some(ins), false),
         },
-        SyncStatus::Behind => match pull_ff_only(dir, &ins).await {
+        SyncStatus::Behind => match pull_ff_only(dir, &ins, &opts.progress).await {
             Ok(()) => SyncOne::ok(SyncOutcome::Pulled, ins.behind, reinspect(dir, ins.clone()).await),
             Err(e) => SyncOne::failed(e.message(), Some(ins), false),
         },
         SyncStatus::Synced => SyncOne::ok(SyncOutcome::UpToDate, 0, ins),
         // 分叉意味着工作区干净（"有未提交改动"优先级更高）
-        SyncStatus::Diverged if opts.auto_merge => merge_and_push(dir, ins, &opts.merge_message).await,
+        SyncStatus::Diverged if opts.auto_merge => merge_and_push(dir, ins, &opts.merge_message, &opts.progress).await,
         // 有未提交改动意味着已有上游（"未关联云端"优先级更高）
         SyncStatus::Dirty if auto_commit.is_some() => {
             auto_commit_and_push(dir, ins, auto_commit.unwrap_or(""), opts).await
@@ -231,7 +292,7 @@ async fn auto_commit_and_push(dir: &Path, ins: Inspection, message: &str, opts: 
     };
 
     if after.behind == 0 {
-        return match push(dir, &after).await {
+        return match push(dir, &after, &opts.progress).await {
             Ok(()) => SyncOne::ok(SyncOutcome::Committed, after.ahead, reinspect(dir, after.clone()).await),
             Err(e) => {
                 let reason = format!("已提交到本地，但推送失败：{}", e.message());
@@ -249,7 +310,7 @@ async fn auto_commit_and_push(dir: &Path, ins: Inspection, message: &str, opts: 
         return SyncOne::failed(reason, Some(after), false);
     }
     match merge_upstream(dir, &after, &opts.merge_message).await {
-        Ok(merged) => push_merged(dir, merged).await,
+        Ok(merged) => push_merged(dir, merged, &opts.progress).await,
         Err(reason) => {
             let reason = format!("已自动提交到本地（还没推送）。{reason}");
             SyncOne::failed(reason, Some(reinspect(dir, after.clone()).await), false)
@@ -260,16 +321,16 @@ async fn auto_commit_and_push(dir: &Path, ins: Inspection, message: &str, opts: 
 // ---------------- 分叉时的自动合并 ----------------
 
 /// 分叉时的自动合并：预演无冲突才合并（见 `merge_upstream`），合并后推送
-async fn merge_and_push(dir: &Path, ins: Inspection, message: &str) -> SyncOne {
+async fn merge_and_push(dir: &Path, ins: Inspection, message: &str, progress: &ProgressSink) -> SyncOne {
     match merge_upstream(dir, &ins, message).await {
-        Ok(merged) => push_merged(dir, merged).await,
+        Ok(merged) => push_merged(dir, merged, progress).await,
         Err(reason) => SyncOne::failed(reason, Some(reinspect(dir, ins.clone()).await), false),
     }
 }
 
 /// 推送刚在本地合并好的结果；推送失败时合并提交保留在本地
-async fn push_merged(dir: &Path, merged: Inspection) -> SyncOne {
-    match push(dir, &merged).await {
+async fn push_merged(dir: &Path, merged: Inspection, progress: &ProgressSink) -> SyncOne {
+    match push(dir, &merged, progress).await {
         Ok(()) => SyncOne::ok(SyncOutcome::Merged, merged.ahead, reinspect(dir, merged.clone()).await),
         Err(e) => {
             let reason = format!("已在本地自动合并，但推送失败：{}", e.message());
@@ -657,7 +718,7 @@ pub async fn commit_and_push(dir: &Path, message: &str) -> Result<Inspection, St
         ));
     }
 
-    push(dir, &after)
+    push(dir, &after, &ProgressSink::none())
         .await
         .map_err(|e| format!("已提交到本地，但推送失败：{}", e.message()))?;
     Ok(reinspect(dir, after).await)
@@ -803,6 +864,25 @@ mod tests {
         );
         // 明确写了空的 http.proxy
         assert_eq!(parse_proxy_config("http.proxy\n\0").proxy.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn progress_args() {
+        assert_eq!(with_progress(&["fetch", "--quiet", "origin", "main"]), ["fetch", "--progress", "origin", "main"]);
+        assert_eq!(
+            with_progress(&["push", "--quiet", "origin", "refs/heads/a:refs/heads/a"]),
+            ["push", "--progress", "origin", "refs/heads/a:refs/heads/a"]
+        );
+        assert_eq!(
+            with_progress(&["pull", "--ff-only", "--no-rebase", "--no-autostash", "--quiet", "origin", "main"]),
+            ["pull", "--progress", "--ff-only", "--no-rebase", "--no-autostash", "origin", "main"]
+        );
+        for args in [
+            with_progress(&["fetch", "--quiet", "origin"]),
+            with_progress(&["pull", "--ff-only", "--no-rebase", "--no-autostash", "--quiet", "origin", "main"]),
+        ] {
+            assert!(crate::git::validate(&args).is_ok(), "{args:?}");
+        }
     }
 
     #[test]

@@ -10,10 +10,12 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use crate::model::{GitProgress, ProgressPhase};
 use crate::url::redact;
 
 /// 状态查询类命令（status、config、log……）的超时
@@ -232,6 +234,84 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// 在 `dir` 目录下执行 `git <args>`。
 pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<GitOutput, GitError> {
+    let (cmd, command) = prepare(dir, args)?;
+    let child = spawn(cmd)?;
+
+    // 超时后 future 被丢弃，kill_on_drop 会终止子进程
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Err(_) => Err(GitError::Timeout { command, secs: timeout.as_secs() }),
+        Ok(Err(e)) => Err(GitError::Io(e.to_string())),
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = redact(&String::from_utf8_lossy(&out.stderr));
+            if out.status.success() {
+                Ok(GitOutput { stdout, stderr })
+            } else {
+                Err(GitError::Failed { command, code: out.status.code(), stderr, stdout })
+            }
+        }
+    }
+}
+
+/// 和 `run_git` 一样（白名单、不弹窗、超时、代理都相同），但边运行边读 stderr：
+/// 带 `--progress` 的 fetch / push / pull / clone 输出的进度行解析成阶段和百分比，交给 `on_progress`
+/// （同一阶段 200 毫秒最多一次，见 `Throttle`）。错误信息里去掉进度行，只留真正的提示
+pub async fn run_git_progress(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    on_progress: &(dyn Fn(GitProgress) + Send + Sync),
+) -> Result<GitOutput, GitError> {
+    let (cmd, command) = prepare(dir, args)?;
+    let mut child = spawn(cmd)?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    let work = async {
+        let read_out = async {
+            let mut buf = Vec::new();
+            if let Some(s) = stdout.as_mut() {
+                s.read_to_end(&mut buf).await?;
+            }
+            Ok::<_, std::io::Error>(buf)
+        };
+        let read_err = async {
+            let mut reader = ProgressReader::new(on_progress);
+            if let Some(s) = stderr.as_mut() {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = s.read(&mut chunk).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    reader.feed(&chunk[..n], Instant::now());
+                }
+            }
+            Ok::<_, std::io::Error>(reader.finish())
+        };
+        let (out, err) = tokio::join!(read_out, read_err);
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out?, err?))
+    };
+
+    // 超时后 future 被丢弃；函数返回时 child 被丢弃，kill_on_drop 会终止子进程
+    match tokio::time::timeout(timeout, work).await {
+        Err(_) => Err(GitError::Timeout { command, secs: timeout.as_secs() }),
+        Ok(Err(e)) => Err(GitError::Io(e.to_string())),
+        Ok(Ok((status, out, err))) => {
+            let stdout = String::from_utf8_lossy(&out).into_owned();
+            let stderr = redact(&err);
+            if status.success() {
+                Ok(GitOutput { stdout, stderr })
+            } else {
+                Err(GitError::Failed { command, code: status.code(), stderr, stdout })
+            }
+        }
+    }
+}
+
+/// 校验参数、准备好 git 子进程（还没启动）：返回命令和子命令名
+fn prepare(dir: &Path, args: &[&str]) -> Result<(Command, String), GitError> {
     validate(args).map_err(GitError::Forbidden)?;
     if !dir.is_dir() {
         return Err(GitError::NoDirectory(dir.display().to_string()));
@@ -273,28 +353,153 @@ pub async fn run_git(dir: &Path, args: &[&str], timeout: Duration) -> Result<Git
     }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
+    Ok((cmd, command))
+}
 
-    let child = cmd.spawn().map_err(|e| {
+fn spawn(mut cmd: Command) -> Result<tokio::process::Child, GitError> {
+    cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             GitError::NotInstalled
         } else {
             GitError::Io(e.to_string())
         }
-    })?;
+    })
+}
 
-    // 超时后 future 被丢弃，kill_on_drop 会终止子进程
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Err(_) => Err(GitError::Timeout { command, secs: timeout.as_secs() }),
-        Ok(Err(e)) => Err(GitError::Io(e.to_string())),
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = redact(&String::from_utf8_lossy(&out.stderr));
-            if out.status.success() {
-                Ok(GitOutput { stdout, stderr })
-            } else {
-                Err(GitError::Failed { command, code: out.status.code(), stderr, stdout })
+// ---------------- 进度 ----------------
+
+/// 把 git 进度行的标题归到界面上显示的阶段。git 的提示跟随系统语言，英文、简体、繁体都认；不认识的算"准备中"
+fn phase_of(title: &str) -> ProgressPhase {
+    let t = title.to_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| t.contains(k));
+    if has(&["writing objects", "写入对象", "寫入物件"]) {
+        ProgressPhase::Uploading
+    } else if has(&["receiving objects", "unpacking objects", "接收对象", "展开对象", "解包对象", "接收物件", "展開物件"]) {
+        ProgressPhase::Downloading
+    } else if has(&["resolving deltas", "处理 delta", "處理 delta"]) {
+        ProgressPhase::Resolving
+    } else if has(&["updating files", "checking out files", "更新文件", "检出文件", "更新檔案"]) {
+        ProgressPhase::Checkout
+    } else {
+        ProgressPhase::Preparing
+    }
+}
+
+/// 解析一行 git 进度，如 `Writing objects:  45% (9/20), 1.20 MiB | 1.00 MiB/s` 或 `接收对象中: 100% (3/3), 完成.`。
+/// 只认"标题: NN% (a/b)"这种格式（标题后面的冒号可以是全角）；`remote:` 开头的是云端那边的统计和压缩，算"准备中"
+pub fn parse_progress(line: &str) -> Option<GitProgress> {
+    let line = line.trim();
+    let (remote, body) = match line.strip_prefix("remote:") {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, line),
+    };
+    let pct = body.find('%')?;
+    let head = &body[..pct];
+    let digits_from = head
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let percent: u8 = head[digits_from..].parse().ok().filter(|p| *p <= 100)?;
+    // 百分比后面必须是 "(已完成/总数)"
+    let counter = body[pct + 1..].trim_start().strip_prefix('(')?;
+    let (done, rest) = counter.split_once('/')?;
+    let total = rest.split(')').next()?;
+    if done.is_empty() || total.is_empty() || !done.chars().chain(total.chars()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let title = head[..digits_from].trim_end().trim_end_matches([':', '：']).trim();
+    if title.is_empty() {
+        return None;
+    }
+    let phase = if remote { ProgressPhase::Preparing } else { phase_of(title) };
+    Some(GitProgress { phase, percent })
+}
+
+/// 不算错误原因的进度输出（`Total 3 (delta 0)…`、`… done.` 这类收尾行）
+fn is_progress_noise(line: &str) -> bool {
+    let body = line.trim();
+    let body = body.strip_prefix("remote:").map_or(body, str::trim_start);
+    parse_progress(line).is_some()
+        || body.ends_with(", done.")
+        || body.ends_with("完成.")
+        || body.ends_with("完成。")
+        || body.starts_with("Total ")
+        || body.starts_with("Delta compression using")
+}
+
+/// 进度节流：阶段变了、到 100% 时马上报；同一阶段 200 毫秒最多报一次；和上次一样的不报
+pub struct Throttle {
+    last: Option<(GitProgress, Instant)>,
+}
+
+pub const PROGRESS_EVERY: Duration = Duration::from_millis(200);
+
+impl Throttle {
+    pub fn new() -> Self {
+        Throttle { last: None }
+    }
+
+    pub fn admit(&mut self, p: GitProgress, now: Instant) -> bool {
+        if let Some((prev, at)) = &self.last {
+            if *prev == p {
+                return false;
+            }
+            if prev.phase == p.phase && p.percent < 100 && now.saturating_duration_since(*at) < PROGRESS_EVERY {
+                return false;
             }
         }
+        self.last = Some((p, now));
+        true
+    }
+}
+
+impl Default for Throttle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 一点点读进 stderr：按 `\r` 或 `\n` 切成行（git 用 `\r` 原地刷新进度），进度行解析后上报，其余的留作错误信息
+struct ProgressReader<'a> {
+    on_progress: &'a (dyn Fn(GitProgress) + Send + Sync),
+    pending: Vec<u8>,
+    kept: String,
+    throttle: Throttle,
+}
+
+impl<'a> ProgressReader<'a> {
+    fn new(on_progress: &'a (dyn Fn(GitProgress) + Send + Sync)) -> Self {
+        ProgressReader { on_progress, pending: Vec::new(), kept: String::new(), throttle: Throttle::new() }
+    }
+
+    fn feed(&mut self, bytes: &[u8], now: Instant) {
+        self.pending.extend_from_slice(bytes);
+        // \r 和 \n 都是 ASCII，在 UTF-8 里不会出现在多字节字符中间，按字节切不会切坏中文
+        while let Some(i) = self.pending.iter().position(|b| *b == b'\r' || *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=i).collect();
+            self.line(&line[..line.len() - 1], now);
+        }
+    }
+
+    fn line(&mut self, bytes: &[u8], now: Instant) {
+        let line = String::from_utf8_lossy(bytes);
+        if let Some(p) = parse_progress(&line) {
+            if self.throttle.admit(p, now) {
+                (self.on_progress)(p);
+            }
+        } else if !line.trim().is_empty() && !is_progress_noise(&line) {
+            self.kept.push_str(&line);
+            self.kept.push('\n');
+        }
+    }
+
+    fn finish(mut self) -> String {
+        let rest = std::mem::take(&mut self.pending);
+        if !rest.is_empty() {
+            self.line(&rest, Instant::now());
+        }
+        self.kept
     }
 }
 
@@ -508,6 +713,111 @@ mod tests {
         ] {
             assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
         }
+    }
+
+    /// 显示进度要加 --progress：白名单允许，原来禁止的照样禁止
+    #[test]
+    fn progress_flag_allowed() {
+        assert!(validate(&["fetch", "--progress", "origin", "main"]).is_ok());
+        assert!(validate(&["push", "--progress", "origin", "refs/heads/main:refs/heads/main"]).is_ok());
+        assert!(validate(&["pull", "--ff-only", "--no-rebase", "--no-autostash", "--progress", "origin", "main"]).is_ok());
+        for args in [
+            vec!["push", "--progress", "--force", "origin", "main:main"],
+            vec!["push", "--progress", "origin", "+main:main"],
+            vec!["push", "--progress", "origin"],
+            vec!["fetch", "--progress", "--prune", "origin"],
+            vec!["pull", "--progress", "origin", "main"],
+            vec!["pull", "--progress", "--rebase", "--ff-only", "--no-rebase"],
+        ] {
+            assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
+        }
+    }
+
+    #[test]
+    fn parses_progress_lines() {
+        use super::parse_progress;
+        use crate::model::{GitProgress, ProgressPhase::*};
+        let p = |phase, percent| Some(GitProgress { phase, percent });
+        // 英文
+        assert_eq!(parse_progress("Writing objects:  45% (9/20), 1.20 MiB | 1.00 MiB/s"), p(Uploading, 45));
+        assert_eq!(parse_progress("Writing objects: 100% (20/20), 2.1 KiB | 2.1 MiB/s, done."), p(Uploading, 100));
+        assert_eq!(parse_progress("Receiving objects:   3% (1/30)"), p(Downloading, 3));
+        assert_eq!(parse_progress("Unpacking objects: 100% (3/3), 250 bytes | 25.00 KiB/s, done."), p(Downloading, 100));
+        assert_eq!(parse_progress("Resolving deltas:  50% (1/2)"), p(Resolving, 50));
+        assert_eq!(parse_progress("Updating files:  12% (100/800)"), p(Checkout, 12));
+        assert_eq!(parse_progress("Compressing objects:  66% (2/3)"), p(Preparing, 66));
+        assert_eq!(parse_progress("Counting objects: 100% (5/5), done."), p(Preparing, 100));
+        // 云端那边的输出都算准备中
+        assert_eq!(parse_progress("remote: Counting objects:  50% (2/4)"), p(Preparing, 50));
+        assert_eq!(parse_progress("remote: Compressing objects: 100% (3/3), done.        "), p(Preparing, 100));
+        // 简体、繁体中文（冒号可能是全角）
+        assert_eq!(parse_progress("写入对象中:  45% (9/20), 1.20 MiB | 1.00 MiB/s"), p(Uploading, 45));
+        assert_eq!(parse_progress("接收对象中: 100% (30/30), 完成."), p(Downloading, 100));
+        assert_eq!(parse_progress("展开对象中:  33% (1/3)"), p(Downloading, 33));
+        assert_eq!(parse_progress("处理 delta 中: 100% (2/2), 完成."), p(Resolving, 100));
+        assert_eq!(parse_progress("更新文件中：  7% (7/100)"), p(Checkout, 7));
+        assert_eq!(parse_progress("压缩对象中: 100% (3/3), 完成."), p(Preparing, 100));
+        assert_eq!(parse_progress("寫入物件中:  80% (8/10)"), p(Uploading, 80));
+        assert_eq!(parse_progress("接收物件中:  10% (1/10)"), p(Downloading, 10));
+        // 不是进度
+        for line in [
+            "",
+            "To D:\\remotes\\a.git",
+            "   abc123..def456  main -> main",
+            "Enumerating objects: 5, done.",
+            "Total 3 (delta 0), reused 0 (delta 0), pack-reused 0",
+            "error: failed to push some refs to 'x'",
+            "hint: 100% sure (not a counter)",
+            "Writing objects: 145% (1/1)",
+            "Writing objects: 45%",
+            ": 45% (1/2)",
+        ] {
+            assert_eq!(parse_progress(line), None, "{line:?}");
+        }
+    }
+
+    /// 按 \r、\n 切行（一次读到的数据可能在行中间、甚至中文字符中间断开），错误信息里不留进度行
+    #[test]
+    fn progress_reader_splits_cr_and_keeps_errors() {
+        use super::ProgressReader;
+        use crate::model::ProgressPhase;
+        use std::sync::Mutex;
+        let seen = Mutex::new(Vec::new());
+        let on = |p: crate::model::GitProgress| seen.lock().unwrap().push((p.phase, p.percent));
+        let mut r = ProgressReader::new(&on);
+        let t0 = std::time::Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let text = "Enumerating objects: 5, done.\nCounting objects: 100% (5/5), done.\n写入对象中:  10% (1/10)\r写入对象中:  20% (2/10)\r";
+        let bytes = text.as_bytes();
+        // 从"写"字的中间切开（"写"占 3 个字节）
+        let cut = text.find("写入").unwrap() + 1;
+        r.feed(&bytes[..cut], ms(0));
+        r.feed(&bytes[cut..], ms(0));
+        r.feed("写入对象中:  60% (6/10)\r".as_bytes(), ms(250));
+        r.feed("写入对象中: 100% (10/10), 完成.\nerror: failed to push some refs to 'D:\\x.git'\nhint: Updates were rejected".as_bytes(), ms(260));
+        let kept = r.finish();
+        // 20% 和 10% 同一时刻：节流掉；60% 隔了 250 毫秒；100% 总是报
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(ProgressPhase::Preparing, 100), (ProgressPhase::Uploading, 10), (ProgressPhase::Uploading, 60), (ProgressPhase::Uploading, 100)]
+        );
+        assert_eq!(kept, "error: failed to push some refs to 'D:\\x.git'\nhint: Updates were rejected\n");
+    }
+
+    #[test]
+    fn throttle_rules() {
+        use super::Throttle;
+        use crate::model::{GitProgress, ProgressPhase::*};
+        let g = |phase, percent| GitProgress { phase, percent };
+        let t0 = std::time::Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut t = Throttle::new();
+        assert!(t.admit(g(Downloading, 1), ms(0)));
+        assert!(!t.admit(g(Downloading, 2), ms(100)), "同一阶段 200 毫秒内不报");
+        assert!(t.admit(g(Downloading, 3), ms(200)));
+        assert!(!t.admit(g(Downloading, 3), ms(900)), "和上次一样不报");
+        assert!(t.admit(g(Downloading, 100), ms(901)), "100% 马上报");
+        assert!(t.admit(g(Resolving, 0), ms(902)), "换阶段马上报");
     }
 
     /// 预演合并和正式合并只允许固定的几种写法
