@@ -238,12 +238,12 @@ fn on_menu(app: &AppHandle, id: &str, st: &Shared, host: &Arc<dyn Host>) {
     }
 }
 
-/// 显示主窗口并放到最前面
 /// 彻底退出 SyncDeck（托盘菜单「退出」和设置页「退出 SyncDeck」共用）
 pub fn quit<R: Runtime>(app: &AppHandle<R>) {
     app.exit(0);
 }
 
+/// 显示主窗口并放到最前面
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
