@@ -37,6 +37,8 @@ pub struct AppState {
     /// 联网操作（刷新、一键同步、提交推送）互斥，避免同一个仓库被同时 fetch / push
     net_lock: tokio::sync::Mutex<()>,
     syncing: AtomicBool,
+    /// 最近一轮同步（一键同步或后台同步）到现在的进度：托盘显示"正在同步 3/7"，窗口中途打开时补上后台同步的进度
+    round: Mutex<SyncProgressSnapshot>,
     /// 代理解析互斥：保存设置和刷新 / 同步同时解析时，保证最后生效的是按最新配置算出的结果
     proxy_lock: tokio::sync::Mutex<()>,
     /// 换电脑自动同步的调度状态（上次离开 / 到达同步的时间、正在进行的后台同步）
@@ -67,6 +69,7 @@ impl AppState {
             checked_at: Mutex::new(HashMap::new()),
             net_lock: tokio::sync::Mutex::new(()),
             syncing: AtomicBool::new(false),
+            round: Mutex::new(SyncProgressSnapshot::default()),
             proxy_lock: tokio::sync::Mutex::new(()),
             auto: AutoSync::new(),
             on_change: OnceLock::new(),
@@ -94,6 +97,24 @@ impl AppState {
     /// 是否有一轮同步正在进行（窗口里的一键同步或后台自动同步）
     pub fn is_syncing(&self) -> bool {
         self.syncing.load(Ordering::SeqCst)
+    }
+
+    /// 最近一轮同步的进度
+    pub fn round_snapshot(&self) -> SyncProgressSnapshot {
+        self.round.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 后台同步开始时清掉上一轮的进度（还没开始联网时窗口打开，看到的是"准备中"而不是上一轮的结果）
+    pub fn reset_round(&self) {
+        *self.round.lock().unwrap_or_else(|e| e.into_inner()) = SyncProgressSnapshot::default();
+    }
+
+    /// 记下一条同步进度事件。项目数变了（开始、完成、等重试）时通知托盘更新悬停文字；百分比不通知，太频繁
+    pub fn note_progress(&self, e: &SyncProgressEvent) {
+        self.round.lock().unwrap_or_else(|e| e.into_inner()).apply(e);
+        if !matches!(e, SyncProgressEvent::Progress { .. } | SyncProgressEvent::Start { .. }) {
+            self.changed();
+        }
     }
 
     /// 所有监控中的项目最近一次的检查结果（按清单顺序；还没检查过的不在里面）
@@ -519,7 +540,16 @@ pub async fn run_sync(st: &Shared, only: Option<Vec<String>>, on_event: SyncSink
     // 自动提交的提交信息：本轮所有项目共用同一个时间
     let commit_message = Arc::new(commit_message_now(&st.config.read(commit_template_of)));
 
+    // 每条进度事件先记进这一轮的进度（托盘、窗口中途打开时用），再交给调用方
+    let on_event: SyncSink = {
+        let st = st.clone();
+        Arc::new(move |e| {
+            st.note_progress(&e);
+            on_event(e);
+        })
+    };
     let total = stored.len();
+    on_event(SyncProgressEvent::Begin { project_ids: stored.iter().map(|sp| sp.id.clone()).collect(), total });
     let started = Arc::new(AtomicUsize::new(0));
     let finished = Arc::new(AtomicUsize::new(0));
     let st2 = st.clone();
@@ -532,7 +562,18 @@ pub async fn run_sync(st: &Shared, only: Option<Vec<String>>, on_event: SyncSink
         async move {
             let index = started.fetch_add(1, Ordering::SeqCst);
             on_event(SyncProgressEvent::Start { project_id: sp.id.clone(), index, total });
-            let opts = sync_options_for(&st, &sp, &commit_message);
+            let progress = {
+                let (on_event, project_id) = (on_event.clone(), sp.id.clone());
+                ops::ProgressSink::new(move |op, p| {
+                    on_event(SyncProgressEvent::Progress {
+                        project_id: project_id.clone(),
+                        op,
+                        phase: p.phase,
+                        percent: p.percent,
+                    })
+                })
+            };
+            let opts = sync_options_for(&st, &sp, &commit_message, progress);
             let one = ops::sync_one(Path::new(&sp.path), &opts).await;
             let (project, result) = record_sync(&st, &sp, &opts, one);
             let index = finished.fetch_add(1, Ordering::SeqCst);
@@ -561,9 +602,14 @@ pub fn should_skip_fetch(last_checked: Option<Instant>, now: Instant) -> bool {
 }
 
 /// 一键同步时单个项目的选项。**唯一的构造入口**：`sync_all` 只通过这里拿选项，以后加选项也只改这里。
-/// `commit_message` 是本轮共用的自动提交信息，只给打开了自动提交的项目用。
+/// `commit_message` 是本轮共用的自动提交信息，只给打开了自动提交的项目用；`progress` 接收这个项目的 git 进度。
 /// 自动合并的提交信息"自动合并：来自 {host}"里的 `{host}` 和自动提交信息用同一个取电脑名的来源。
-fn sync_options_for(st: &AppState, sp: &StoredProject, commit_message: &str) -> ops::SyncOptions {
+fn sync_options_for(
+    st: &AppState,
+    sp: &StoredProject,
+    commit_message: &str,
+    progress: ops::ProgressSink,
+) -> ops::SyncOptions {
     let (auto_merge, precommit_check, big_file_limit_mb) =
         st.config.read(|c| (auto_merge_of(c), precommit_check_of(c), big_file_limit_of(c)));
     ops::SyncOptions {
@@ -572,6 +618,7 @@ fn sync_options_for(st: &AppState, sp: &StoredProject, commit_message: &str) -> 
         auto_merge,
         merge_message: ops::merge_message(&util::computer_name()),
         precommit: precommit_check.then_some(ops::PrecommitCheck { big_file_limit_mb }),
+        progress,
     }
 }
 
@@ -880,10 +927,13 @@ pub async fn resume_auto_sync(state: State<'_, Shared>) -> Result<Settings, Stri
     Ok(current_settings(&state).await)
 }
 
-/// 后台自动同步的当前状态（前端启动时查一次，之后靠 auto-sync-started / auto-sync-finished 事件）
+/// 后台自动同步的当前状态（前端启动时查一次，之后靠 auto-sync-started / -progress / -finished 事件）：
+/// 正在进行的后台同步和它到现在的进度、最近一次后台同步的结果
 #[tauri::command]
 pub fn get_auto_sync_state(state: State<'_, Shared>) -> AutoSyncState {
-    state.auto.state()
+    let mut s = state.auto.state();
+    s.progress = s.running.as_ref().map(|_| state.round_snapshot());
+    s
 }
 
 #[cfg(test)]

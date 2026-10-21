@@ -110,7 +110,7 @@ pub enum SyncOutcome {
     Merged,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncItemResult {
     pub project_id: String,
@@ -119,14 +119,132 @@ pub struct SyncItemResult {
     pub reason: Option<String>,
 }
 
+/// 正在进行的联网 git 操作
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitOp {
+    Fetch,
+    Push,
+    Pull,
+    Clone,
+}
+
+/// git 进度的阶段（只分用户关心的几种）：
+/// 准备中（统计、压缩、枚举对象，以及云端那边的输出）、上传、下载、处理差异、写出文件（克隆后检出）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgressPhase {
+    Preparing,
+    Uploading,
+    Downloading,
+    Resolving,
+    Checkout,
+}
+
+/// 从 git 的 `--progress` 输出解析出的一条进度
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GitProgress {
+    pub phase: ProgressPhase,
+    /// 0 ~ 100
+    pub percent: u8,
+}
+
 /// 一键同步的进度事件。并行处理时 index 表示开始 / 完成的先后顺序。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SyncProgressEvent {
+    /// 这一轮要处理的项目（按处理顺序）。等网络重试时会再来一次，只列要重试的
+    #[serde(rename_all = "camelCase")]
+    Begin { project_ids: Vec<String>, total: usize },
     #[serde(rename_all = "camelCase")]
     Start { project_id: String, index: usize, total: usize },
+    /// 正在处理的项目里 git 的阶段和百分比（每个项目最多 200 毫秒一次）
+    #[serde(rename_all = "camelCase")]
+    Progress { project_id: String, op: GitOp, phase: ProgressPhase, percent: u8 },
     #[serde(rename_all = "camelCase")]
     Done { result: SyncItemResult, project: Project, index: usize, total: usize },
+    /// 后台同步：联网失败的项目等一会儿再试（`retry_at` 为 RFC 3339 时间）
+    #[serde(rename_all = "camelCase")]
+    Retry { project_ids: Vec<String>, retry_at: String },
+}
+
+/// 正在处理的项目和它最近一次的 git 进度（还没有进度时三项都是 None）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSync {
+    pub project_id: String,
+    pub op: Option<GitOp>,
+    pub phase: Option<ProgressPhase>,
+    pub percent: Option<u8>,
+}
+
+/// 等网络重试
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryInfo {
+    pub project_ids: Vec<String>,
+    pub retry_at: String,
+}
+
+/// 一轮同步到现在的进度（后端按进度事件累积，窗口中途打开时用它补上）。前端 src/state/syncProgress.ts 的 applyEvent 是同一套规则
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProgressSnapshot {
+    /// 这一轮的项目（按处理顺序）
+    pub project_ids: Vec<String>,
+    pub active: Vec<ActiveSync>,
+    /// 已完成的项目的结果（按完成顺序）
+    pub results: Vec<SyncItemResult>,
+    pub retry: Option<RetryInfo>,
+}
+
+impl SyncProgressSnapshot {
+    /// 按一条进度事件更新。Begin：等重试时是接着这一轮（只把要重试的项目改回没完成），否则从头开始新的一轮
+    pub fn apply(&mut self, e: &SyncProgressEvent) {
+        match e {
+            SyncProgressEvent::Begin { project_ids, .. } => {
+                if self.retry.take().is_some() {
+                    self.results.retain(|r| !project_ids.contains(&r.project_id));
+                    for id in project_ids {
+                        if !self.project_ids.contains(id) {
+                            self.project_ids.push(id.clone());
+                        }
+                    }
+                } else {
+                    *self = SyncProgressSnapshot { project_ids: project_ids.clone(), ..Default::default() };
+                }
+            }
+            SyncProgressEvent::Start { project_id, .. } => {
+                self.active.retain(|a| a.project_id != *project_id);
+                self.active.push(ActiveSync { project_id: project_id.clone(), op: None, phase: None, percent: None });
+            }
+            SyncProgressEvent::Progress { project_id, op, phase, percent } => {
+                let entry = match self.active.iter_mut().position(|a| a.project_id == *project_id) {
+                    Some(i) => &mut self.active[i],
+                    None => {
+                        self.active.push(ActiveSync { project_id: project_id.clone(), op: None, phase: None, percent: None });
+                        self.active.last_mut().expect("刚放进去")
+                    }
+                };
+                entry.op = Some(*op);
+                entry.phase = Some(*phase);
+                entry.percent = Some(*percent);
+            }
+            SyncProgressEvent::Done { result, .. } => {
+                self.active.retain(|a| a.project_id != result.project_id);
+                self.results.retain(|r| r.project_id != result.project_id);
+                self.results.push(result.clone());
+            }
+            SyncProgressEvent::Retry { project_ids, retry_at } => {
+                self.retry = Some(RetryInfo { project_ids: project_ids.clone(), retry_at: retry_at.clone() });
+            }
+        }
+    }
+
+    /// （已完成的项目数, 这一轮的项目数）
+    pub fn counts(&self) -> (usize, usize) {
+        (self.results.len(), self.project_ids.len())
+    }
 }
 
 /// 刷新状态的进度事件：每个项目检查完立即发一次，index 为完成顺序（0 起）
@@ -276,6 +394,10 @@ pub struct AutoSyncState {
     pub running: Option<AutoSyncEvent>,
     /// 启动时的到达同步由后端负责（正在做或已做完）：前端启动时不用再自己刷新一次
     pub startup_sync: bool,
+    /// 正在进行的后台同步到现在的进度；没有后台同步时为 None
+    pub progress: Option<SyncProgressSnapshot>,
+    /// 最近一次后台同步的结果（只在内存里，重启后没有）；还没有过时为 None
+    pub last: Option<AutoSyncEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,4 +422,69 @@ pub struct DiagnosticInfo {
     pub conflict_files: Vec<String>,
     /// 云端（上游分支）最近 3 次提交；没有上游时为空
     pub recent_remote_commits: Vec<CommitInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn done(id: &str, outcome: SyncOutcome) -> SyncProgressEvent {
+        let project = Project {
+            id: id.into(),
+            name: id.into(),
+            path: String::new(),
+            branch: "main".into(),
+            remote_url: None,
+            upstream: None,
+            status: SyncStatus::Synced,
+            ahead: 0,
+            behind: 0,
+            changes: Vec::new(),
+            last_sync_at: None,
+            issue: None,
+            check_error: None,
+            auto_commit: false,
+        };
+        let result = SyncItemResult { project_id: id.into(), outcome, commits: 1, reason: None };
+        SyncProgressEvent::Done { result, project, index: 0, total: 0 }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn snapshot_follows_events_and_retry() {
+        let mut s = SyncProgressSnapshot::default();
+        s.apply(&SyncProgressEvent::Begin { project_ids: ids(&["a", "b", "c"]), total: 3 });
+        s.apply(&SyncProgressEvent::Start { project_id: "a".into(), index: 0, total: 3 });
+        s.apply(&SyncProgressEvent::Progress {
+            project_id: "a".into(),
+            op: GitOp::Push,
+            phase: ProgressPhase::Uploading,
+            percent: 45,
+        });
+        assert_eq!(s.active[0].percent, Some(45));
+        assert_eq!(s.active[0].op, Some(GitOp::Push));
+        s.apply(&done("a", SyncOutcome::Pushed));
+        s.apply(&SyncProgressEvent::Start { project_id: "b".into(), index: 1, total: 3 });
+        s.apply(&done("b", SyncOutcome::Failed));
+        s.apply(&done("c", SyncOutcome::Failed));
+        assert!(s.active.is_empty());
+        assert_eq!(s.counts(), (3, 3));
+
+        // 等网络重试：接着这一轮，只把要重试的改回没完成
+        s.apply(&SyncProgressEvent::Retry { project_ids: ids(&["b"]), retry_at: "t".into() });
+        assert!(s.retry.is_some());
+        s.apply(&SyncProgressEvent::Begin { project_ids: ids(&["b"]), total: 1 });
+        assert!(s.retry.is_none());
+        assert_eq!(s.counts(), (2, 3));
+        s.apply(&done("b", SyncOutcome::Pulled));
+        assert_eq!(s.counts(), (3, 3));
+        assert_eq!(s.results.iter().filter(|r| r.project_id == "b").count(), 1);
+
+        // 没在等重试时的 Begin：新的一轮
+        s.apply(&SyncProgressEvent::Begin { project_ids: ids(&["x"]), total: 1 });
+        assert_eq!(s.counts(), (0, 1));
+    }
 }

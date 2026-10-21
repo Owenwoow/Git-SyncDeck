@@ -18,7 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
 use autosync::{Host, Switches};
-use model::{AutoSyncEvent, AutoSyncTrigger, Project, SyncResult};
+use model::{AutoSyncEvent, AutoSyncTrigger, Project, SyncProgressEvent, SyncResult};
 
 /// 开机自启时带的参数：带着它启动时窗口不显示，只进托盘
 pub const AUTOSTART_ARG: &str = "--autostart";
@@ -27,6 +27,8 @@ pub const AUTOSTART_ARG: &str = "--autostart";
 pub const EVENT_PROJECTS_CHANGED: &str = "projects-changed";
 pub const EVENT_AUTO_SYNC_STARTED: &str = "auto-sync-started";
 pub const EVENT_AUTO_SYNC_FINISHED: &str = "auto-sync-finished";
+/// 后台同步的进度：内容和一键同步的 SyncProgressEvent 一样
+pub const EVENT_AUTO_SYNC_PROGRESS: &str = "auto-sync-progress";
 
 /// 后台同步的结果：发给前端，按设置发系统通知
 struct AppHost {
@@ -42,6 +44,10 @@ impl AppHost {
 impl Host for AppHost {
     fn started(&self, trigger: AutoSyncTrigger) {
         let _ = self.app.emit(EVENT_AUTO_SYNC_STARTED, Self::event(trigger, None));
+    }
+
+    fn progress(&self, _trigger: AutoSyncTrigger, event: &SyncProgressEvent) {
+        let _ = self.app.emit(EVENT_AUTO_SYNC_PROGRESS, event);
     }
 
     fn finished(&self, trigger: AutoSyncTrigger, result: Option<&SyncResult>) {
