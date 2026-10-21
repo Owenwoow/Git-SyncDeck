@@ -176,7 +176,7 @@
 |---|---|
 | 入口 | 「添加项目」页顶部两个页签：本地扫描（原有）/ 从 GitHub 克隆 |
 | 输入 | 一个输入框，接受账号主页（`https://github.com/用户名`、`github.com/用户名`、末尾带 `/`）、纯用户名、单个仓库地址（`https://github.com/用户/仓库`、带 `.git`、`git@github.com:用户/仓库.git`）。用户名只允许字母、数字和 `-`（不以 `-` 开头），仓库名允许字母、数字和 `- _ .`，其他报中文错误。填账号 = 列出名下全部仓库，填仓库 = 只列这一个。第一次打开优先填上次的输入，没有就填 gh 当前登录的账号；输入保存在 `config.json` 的 `github_source` |
-| 列哪些仓库 | 只列自己名下的（含私有、fork、已归档）。排序：非 fork 非归档在前，各自按最近推送时间倒序。列表有搜索框（仓库名、描述） |
+| 列哪些仓库 | 只列自己名下的（含私有、fork、已归档）。排序：非 fork 非归档在前，各自按最近推送时间倒序。列表有搜索框（仓库名、描述）。v0.7.0 起加两排筛选标签，一次各选一个、可以叠加，都带数量：类型（全部 / 未在本地 / 已在本地 / 私有 / 公开 / fork / 已归档），最近推送（全部 / 30 天内 / 90 天内 / 一年内，按 GitHub 记录的最近一次推送算，没有推送时间的只在"全部"里）。类型的数量按当前时间范围算，时间的数量按当前类型算，搜索框不影响数量；筛选只影响显示，不影响勾选，「全选可克隆的」只勾筛选后看得到的；重新列出仓库时筛选回到"全部" |
 | 私有仓库怎么列 | 调用 GitHub CLI（gh）：`gh repo list <账号> --limit 1000 --json …`（单个仓库用 `gh repo view`）。SyncDeck 不碰令牌，守住"不读写凭据"；代价是每台电脑要装一次 gh 并 `gh auth login` |
 | gh 不可用时 | 没装 gh、gh 没登录（`gh api user` 失败）、gh 列仓库失败，都退到 GitHub 公开接口（不带任何凭据），用 Windows 自带的 `curl.exe` 请求，只能看到公开仓库，列表上方的提示条说明原因：没装写"装好 GitHub CLI（gh）并运行 gh auth login 后能看到私有仓库"，没登录写"gh 还没登录：运行 gh auth login 后能看到私有仓库"，gh 失败写出失败原因 |
 | gh 和 curl 的白名单 | gh 只允许三种完整写法：`api user --jq .login`、`repo list <账号> --limit 1000 --json <固定字段>`、`repo view <账号/仓库> --json <固定字段>`，不许 auth、`auth setup-git`、`repo clone`、api 的其他路径。curl 只允许 `-sS --fail --max-time 30` 加固定的两个请求头，地址只能是 `https://api.github.com/users/<账号>/repos?per_page=100&type=owner&sort=pushed&page=<1~10>`（最多翻 10 页，不足 100 条就停）或 `https://api.github.com/repos/<账号>/<仓库>`。两者都不弹窗、有 30 秒超时、超时终止，代理按设置里的代理模式（使用代理时设 `HTTPS_PROXY` / `HTTP_PROXY`，不用代理时去掉这些环境变量，curl 加 `-x` / `--noproxy *`） |

@@ -62,7 +62,8 @@ export function ProjectToolbar({
   );
 }
 
-function FilterChip({
+/** 筛选标签：文字 + 数量，选中时高亮；数量为 0 时变淡。「从 GitHub 克隆」页签也用它 */
+export function FilterChip({
   active,
   onClick,
   label,
