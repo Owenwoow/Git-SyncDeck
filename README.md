@@ -170,7 +170,7 @@ scripts/make-test-repos.mjs   测试仓库生成脚本
 | 异常操作按钮 / 提交弹窗 | `src/components/projects/ProjectActions.tsx` / `CommitPushDialog.tsx` |
 | 一键同步对话框 | `src/components/sync/SyncDialog.tsx` |
 | 添加项目 | `src/pages/AddProjectsPage.tsx` |
-| 设置 | `src/pages/SettingsPage.tsx` |
+| 设置（左侧分类目录 + 右侧单类内容；含「退出 SyncDeck」按钮、「关于」里的检查更新） | `src/pages/SettingsPage.tsx` |
 | 侧边栏 | `src/components/layout/Sidebar.tsx` |
 | 状态文案 / 颜色 | `src/lib/status.ts` / `src/index.css` |
 | 诊断文本格式 | `src/lib/diagnostic.ts` |
