@@ -424,6 +424,87 @@ pub struct DiagnosticInfo {
     pub recent_remote_commits: Vec<CommitInfo>,
 }
 
+// ---------------- 从 GitHub 克隆 ----------------
+
+/// GitHub 上的一个仓库（列表里显示用）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubRepo {
+    pub name: String,
+    /// `账号/仓库`
+    pub full_name: String,
+    /// https 克隆地址，以 .git 结尾
+    pub clone_url: String,
+    pub html_url: String,
+    pub private: bool,
+    pub fork: bool,
+    pub archived: bool,
+    pub pushed_at: Option<String>,
+    pub description: Option<String>,
+}
+
+/// 列表里的一行：仓库，加上"是否已在本地"和克隆目标
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubRepoEntry {
+    pub repo: GithubRepo,
+    /// 已在本地的仓库路径（默认代码目录下扫描到的仓库或监控清单里的项目，远程地址相同）
+    pub local: Option<String>,
+    /// 克隆到哪里：默认代码目录\仓库名
+    pub target: String,
+    pub target_exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubListing {
+    pub owner: String,
+    pub repos: Vec<GithubRepoEntry>,
+    /// "gh"（用 GitHub CLI 列，含私有仓库）或 "public"（公开接口，只有公开仓库）
+    pub source: String,
+    pub notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneDefaults {
+    /// 上次输入的 GitHub 地址
+    pub last_input: Option<String>,
+    /// gh 当前登录的账号；没装或没登录为 None
+    pub gh_login: Option<String>,
+    pub default_code_dir: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneRequest {
+    pub url: String,
+    /// 克隆到默认代码目录下的这个文件夹名
+    pub name: String,
+}
+
+/// 克隆的进度事件（按仓库地址区分）
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CloneProgressEvent {
+    #[serde(rename_all = "camelCase")]
+    Start { url: String },
+    #[serde(rename_all = "camelCase")]
+    Progress { url: String, phase: ProgressPhase, percent: u8 },
+    #[serde(rename_all = "camelCase")]
+    Done { url: String, ok: bool, error: Option<String>, project: Option<Project> },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneResult {
+    pub url: String,
+    pub name: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub project: Option<Project>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -47,6 +47,8 @@ pub struct StoredSettings {
     pub precommit_check: Option<bool>,
     /// 提交前检查的大文件上限（MB）；None 表示默认值
     pub big_file_limit_mb: Option<u64>,
+    /// 「添加项目 → 从 GitHub 克隆」上次输入的账号主页 / 用户名 / 仓库地址
+    pub github_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

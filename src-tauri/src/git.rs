@@ -220,8 +220,28 @@ fn runs_outside_repo(args: &[&str]) -> bool {
     match args {
         ["--version"] => true,
         ["config", "--global" | "--system", "-z", "--get-regexp", re] => *re == PROXY_CONFIG_REGEX,
+        // 克隆：此时 `dir` 是目标的上一级（默认代码目录），目标还不存在
+        ["clone", "--progress" | "--quiet", _, _] => true,
         _ => false,
     }
+}
+
+/// 要联网、需要加代理设置的不在仓库里执行的命令（只有克隆；读代理配置本身不需要）
+fn is_clone(args: &[&str]) -> bool {
+    matches!(args, ["clone", ..])
+}
+
+/// 克隆的地址：`https://` 开头，或本机绝对路径（`C:\…` / `C:/…`，测试时用本地裸仓库）。
+/// 不能有 `::`（禁止 `ext::` 这类传输）、不能以 `-` 开头
+fn clone_url_ok(url: &str) -> bool {
+    if url.is_empty() || url.starts_with('-') || url.contains("::") {
+        return false;
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    let b = url.as_bytes();
+    b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -324,7 +344,7 @@ fn prepare(dir: &Path, args: &[&str]) -> Result<(Command, String), GitError> {
     }
     let command = args.first().copied().unwrap_or("").to_string();
     // 代理设置只加在仓库里的命令上（读代理配置本身不需要）
-    let proxy = if outside_repo { ProxyPlan::default() } else { proxy_plan() };
+    let proxy = if outside_repo && !is_clone(args) { ProxyPlan::default() } else { proxy_plan() };
 
     let mut cmd = Command::new("git");
     cmd.args(["-c", "core.quotepath=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false"])
@@ -583,6 +603,14 @@ pub fn validate(args: &[&str]) -> Result<(), String> {
                 Err("pull 只允许 --ff-only --no-rebase（只快进，不合并、不变基）".into())
             }
         }
+        // 只允许 clone --progress|--quiet <地址> <目标路径>（见 clone_url_ok）。
+        // 不许 --config、-c、--upload-pack、--template、--depth、--recurse-submodules、--mirror、--bare、-b 等其他参数
+        "clone" => match rest {
+            ["--progress" | "--quiet", url, target] if clone_url_ok(url) && !target.is_empty() && !target.starts_with('-') => {
+                Ok(())
+            }
+            _ => Err("clone 只允许 clone --progress <https 地址或本机路径> <目标路径>".into()),
+        },
         "add" => {
             if rest == ["-A"] {
                 Ok(())
@@ -731,6 +759,70 @@ mod tests {
         ] {
             assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
         }
+    }
+
+    /// 克隆只允许两种完整写法，地址只能是 https 或本机绝对路径
+    #[test]
+    fn clone_whitelist() {
+        use super::runs_outside_repo;
+        for args in [
+            vec!["clone", "--progress", "https://github.com/Owenwoow/Git-SyncDeck.git", r"E:\Code\Git-SyncDeck"],
+            vec!["clone", "--quiet", "https://github.com/a/b.git", r"E:\Code\b"],
+            vec!["clone", "--progress", r"C:\Temp\remotes\synced.git", r"C:\Temp\code\synced"],
+            vec!["clone", "--quiet", "C:/Temp/remotes/synced.git", "C:/Temp/code/synced"],
+        ] {
+            assert!(validate(&args).is_ok(), "应当允许：{args:?}");
+            assert!(runs_outside_repo(&args), "克隆不需要仓库目录：{args:?}");
+        }
+        for args in [
+            // 其他参数
+            vec!["clone", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--depth", "1", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--depth=1", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--shallow-since=2020-01-01", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--config", "core.sshCommand=calc", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "-c", "core.fsmonitor=calc", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--upload-pack=calc", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "-u", "calc", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--template=x", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--separate-git-dir=x", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--recurse-submodules", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--mirror", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--bare", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "-b", "dev", "https://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "--quiet", "https://github.com/a/b.git", r"E:\b"],
+            // 缺参数 / 多参数
+            vec!["clone", "--progress"],
+            vec!["clone", "--progress", "https://github.com/a/b.git"],
+            vec!["clone", "--progress", "https://github.com/a/b.git", r"E:\b", "extra"],
+            vec!["clone"],
+            // 地址：不是 https 或本机绝对路径、传输方式、以 - 开头
+            vec!["clone", "--progress", "http://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "git@github.com:a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "ssh://git@github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "git://github.com/a/b.git", r"E:\b"],
+            vec!["clone", "--progress", "file:///C:/x.git", r"E:\b"],
+            vec!["clone", "--progress", "ext::sh -c calc", r"E:\b"],
+            vec!["clone", "--progress", "https://x::y/a.git", r"E:\b"],
+            vec!["clone", "--progress", "fd::3", r"E:\b"],
+            vec!["clone", "--progress", "https://", r"E:\b"],
+            vec!["clone", "--progress", "", r"E:\b"],
+            vec!["clone", "--progress", r"relative\path.git", r"E:\b"],
+            vec!["clone", "--progress", r"\\server\share\a.git", r"E:\b"],
+            vec!["clone", "--progress", "C:rel.git", r"E:\b"],
+            vec!["clone", "--progress", "-x", r"E:\b"],
+            vec!["clone", "--progress", "--upload-pack", r"E:\b"],
+            // 目标：不能为空、不能以 - 开头
+            vec!["clone", "--progress", "https://github.com/a/b.git", ""],
+            vec!["clone", "--progress", "https://github.com/a/b.git", "-b"],
+            vec!["clone", "--progress", "https://github.com/a/b.git", "--bare"],
+        ] {
+            assert!(validate(&args).is_err(), "应当拒绝：{args:?}");
+            assert!(!runs_outside_repo(&args) || args.len() == 4, "只有完整的两种写法才不需要仓库目录：{args:?}");
+        }
+        // 克隆要加代理，读代理配置和 --version 不加
+        assert!(super::is_clone(&["clone", "--progress", "https://github.com/a/b.git", r"E:\b"]));
+        assert!(!super::is_clone(&["--version"]));
     }
 
     #[test]
