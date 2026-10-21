@@ -7,6 +7,13 @@
       "runtimeArgs": ["run", "dev"],
       "port": 1420,
       "url": "http://127.0.0.1:1420"
+    },
+    {
+      "name": "mock-1432",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--mode", "mock", "--port", "1432", "--host", "127.0.0.1", "--strictPort"],
+      "port": 1432,
+      "url": "http://127.0.0.1:1432"
     }
   ]
 }
