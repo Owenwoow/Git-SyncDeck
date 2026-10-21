@@ -31,6 +31,7 @@
   - 本次跳过：异常标记保留在主页，直到下次同步成功或刷新到"已同步"。
   - 打开终端（Windows Terminal，没有就用 cmd）或 VS Code。
 - **添加项目**：选择目录后递归扫描（最多 3 层），可按名称、路径、仓库搜索，勾选加入或取消监控。
+- **从 GitHub 克隆**（v0.6.0 起，「添加项目」页的第二个页签）：填 GitHub 账号主页（或用户名、单个仓库地址），列出名下的仓库（含私有、fork、已归档），勾选后克隆到默认代码目录并自动加入监控、联网检查一次。已在本地的、同名文件夹已存在的不能勾；克隆时每个仓库显示百分比，一个失败不影响其他；超时留下的半截文件夹会删掉（只删这次新建的那个）。私有仓库靠 [GitHub CLI（gh）](https://cli.github.com/) 列出，每台电脑装一次、运行 `gh auth login`；没装或没登录时只列公开仓库，并在列表上方提示。SyncDeck 不读令牌、不改全局 git 配置：私有仓库能不能克隆，取决于你的 git 是否已经登录过 GitHub。
 - **设置**：默认代码目录、联网超时、代理、自动同步的各项开关、通知、自动提交的提交信息模板和本机名称、冲突与提交检查、浅色/深色主题、关于与检查更新。监控清单、设置、上次同步时间和遗留异常都会保存，重启后恢复。设置存在每台电脑自己的配置文件里，三台电脑可以设得不一样。
 
 ### 三台电脑怎么用
@@ -129,6 +130,7 @@ cd src-tauri; cargo test -- --nocapture
 - **中文和超时**：加 `-c core.quotepath=false`，输出按 UTF-8 解码。状态查询超时 10 秒，fetch / push / pull / commit 的超时在设置里选（1、3、5、10 分钟，默认 3 分钟），超时后终止。fetch 只拉当前分支的上游，云端分支已删除时退回拉整个远程。
 - **白名单**：只允许 status、fetch、push（显式 refspec，不带 +）、pull（`--ff-only --no-rebase --no-autostash`）、add -A、commit -m、merge-tree 预演、`merge --no-edit -m <信息> <提交>` 和 `merge --abort`、log、rev-parse、config 只读等。`--force`、reset、rebase、stash、clean、checkout、restore、`merge -s / -X / --squash` 等一律拒绝，有单元测试覆盖。
 - **自动合并的防护**：分支配置了 `branch.<分支>.mergeoptions` 时不自动合并；合并后核对结果和预演一致（没有 MERGE_HEAD、两个父提交、树哈希都对）才推送。
+- **克隆和 GitHub 列表**：git 只放行 `clone --progress|--quiet <https 地址或本机路径> <目标>`，不许 `--config`、`--depth`、`ext::` 等；列仓库的 gh 子进程只放行 `api user --jq .login`、`repo list`、`repo view` 三种写法，退到公开接口时只放行 curl 请求 `api.github.com` 的账号仓库列表和单个仓库，不带任何凭据。
 - **代理**：只通过 `-c http.proxy=…`（和 `http.<网址>.proxy`）以及子进程的环境变量生效，不改全局 git 配置。
 - **不碰凭据**：远程地址和错误输出里的账号或 token 一律去掉后才显示或保存。
 - **不动文件**：取消监控只改清单，不删除任何文件或仓库。
@@ -154,6 +156,7 @@ src-tauri/src/
 ├─ autosync.rs    离开 / 到达自动同步的调度（10 分钟限制、暂停、通知文案）
 ├─ sysevents.rs   Windows 系统事件：锁屏 / 解锁、唤醒
 ├─ tray.rs        托盘图标与菜单
+├─ github.rs      从 GitHub 列仓库：地址解析、gh / curl 白名单、JSON 解析
 ├─ scan.rs        目录扫描
 ├─ config.rs      config.json 读写
 ├─ system.rs      打开终端 / VS Code
@@ -171,7 +174,8 @@ scripts/make-test-repos.mjs   测试仓库生成脚本
 | 异常操作按钮 / 提交弹窗 | `src/components/projects/ProjectActions.tsx` / `CommitPushDialog.tsx` |
 | 一键同步 / 后台同步的进度和结果弹窗 | `src/components/sync/SyncDialog.tsx`（进度规则在 `src/state/syncProgress.ts`） |
 | 　进度按钮、"上次后台同步" | `src/pages/HomePage.tsx` |
-| 添加项目 | `src/pages/AddProjectsPage.tsx` |
+| 添加项目（页签：本地扫描 / 从 GitHub 克隆） | `src/pages/AddProjectsPage.tsx` |
+| 　从 GitHub 克隆页签 / 克隆进度状态 | `src/pages/add/GithubCloneTab.tsx` / `src/pages/add/cloneStore.ts`（后端 `src-tauri/src/github.rs`、`commands.rs` 的 `list_github_repos` / `clone_repos`） |
 | 设置（左侧分类目录 + 右侧单类内容；含「退出 SyncDeck」按钮、「关于」里的检查更新） | `src/pages/SettingsPage.tsx` |
 | 侧边栏 | `src/components/layout/Sidebar.tsx` |
 | 状态文案 / 颜色 | `src/lib/status.ts` / `src/index.css` |
