@@ -6,13 +6,17 @@ import type {
   AutoSyncState,
   CommitInfo,
   DiagnosticInfo,
+  AutoSyncTrigger,
   GitInfo,
+  GitOp,
   Project,
+  ProgressPhase,
   ProxyMode,
   ScannedRepo,
   Settings,
   SyncItemResult,
   SyncProgressEvent,
+  SyncProgressSnapshot,
   SyncResult,
   Unlisten,
   UpdateInfo,
@@ -127,14 +131,49 @@ function mergeConflictReason(files: string[]): string {
   return `本地和云端改了同一处，自动合并会冲突：${files.join("、")}。没有改动任何文件，可在详情里「复制给 AI」`;
 }
 
+/** 正在进行的一轮同步（一键同步或演示的后台同步）；同一时间只跑一轮，和真实实现一样 */
+let syncBusy = false;
+
 export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promise<SyncResult> {
+  if (syncBusy) throw new Error("正在同步中，请等这一轮结束");
+  syncBusy = true;
+  try {
+    // 刷新进行中时先等它结束，再复用刚检查过的结果
+    await refreshing?.catch(() => undefined);
+    return await runRound(onProgress, null, 1);
+  } finally {
+    syncBusy = false;
+  }
+}
+
+/** 演示：模拟 git 的进度，每 ~200 毫秒报一次百分比，用时约 `ms` 毫秒 */
+async function simulateGit(
+  projectId: string,
+  op: GitOp,
+  phase: ProgressPhase,
+  ms: number,
+  onProgress: (e: SyncProgressEvent) => void,
+) {
+  onProgress({ type: "progress", projectId, op, phase: "preparing", percent: 100 });
+  const steps = Math.max(2, Math.round(ms / 200));
+  for (let i = 1; i <= steps; i++) {
+    await delay(ms / steps);
+    onProgress({ type: "progress", projectId, op, phase, percent: Math.round((i / steps) * 100) });
+  }
+}
+
+/** 一轮同步的演示逻辑：`only` 只同步这些项目（离开时只挑要推的），`slow` 放慢倍数（后台同步慢一点，方便看进度） */
+async function runRound(
+  onProgress: (e: SyncProgressEvent) => void,
+  only: string[] | null,
+  slow: number,
+): Promise<SyncResult> {
   const startedAt = new Date().toISOString();
-  // 刷新进行中时先等它结束，再复用刚检查过的结果
-  await refreshing?.catch(() => undefined);
-  const queue = sortProjects(db.monitoredProjects());
+  const queue = sortProjects(db.monitoredProjects()).filter((p) => !only || only.includes(p.id));
   const total = queue.length;
   const items: SyncItemResult[] = [];
   const { autoMerge } = readSettings();
+  onProgress({ type: "begin", projectIds: queue.map((p) => p.id), total });
 
   for (const [index, original] of queue.entries()) {
     db.updateRepo(original.id, { status: "syncing" });
@@ -147,7 +186,16 @@ export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promi
     const merge = autoMerge && (original.status === "diverged" || (autoCommit && original.behind > 0));
     const conflicts = merge ? (mockConflicts[original.id] ?? []) : [];
     const needsWork = original.status === "ahead" || original.status === "behind" || autoCommit || merge;
-    await delay(needsWork ? jitter(800, 1200) : jitter(350, 600));
+    if (original.status === "behind") {
+      // 待拉取：要下载的东西在检查云端的 fetch 里下载
+      await simulateGit(original.id, "fetch", "downloading", jitter(700, 1200) * slow, onProgress);
+      await simulateGit(original.id, "fetch", "resolving", 300 * slow, onProgress);
+    } else if (needsWork && !(merge && conflicts.length)) {
+      await delay(jitter(150, 300) * slow);
+      await simulateGit(original.id, "push", "uploading", jitter(700, 1400) * slow, onProgress);
+    } else {
+      await delay((needsWork ? jitter(800, 1200) : jitter(350, 600)) * slow);
+    }
 
     /** 同步成功：自动提交 / 自动合并并推送后和云端一致 */
     const done = (outcome: "committed" | "merged", commits: number): [SyncItemResult, Project] => [
@@ -401,7 +449,7 @@ export async function onSettingsChanged(_cb: (s: Settings) => void): Promise<Unl
   return () => {};
 }
 
-// ---------------- 换电脑自动同步（演示：没有后台同步，只能暂停 / 恢复）----------------
+// ---------------- 换电脑自动同步（演示：切到别的窗口再切回来 = 解锁后同步）----------------
 
 /** 演示：暂停到本地时间明天 00:00 */
 export async function pauseAutoSync(): Promise<Settings> {
@@ -422,7 +470,7 @@ export async function resumeAutoSync(): Promise<Settings> {
 
 export async function getAutoSyncState(): Promise<AutoSyncState> {
   await delay(30);
-  return { running: null, startupSync: false };
+  return { running: clone(autoRunning), startupSync: false, progress: clone(autoProgress), last: clone(autoLast) };
 }
 
 /** 演示：不会真的退出 */
@@ -430,16 +478,108 @@ export async function quitApp(): Promise<void> {
   toast.info("演示模式不会真的退出");
 }
 
-/** 演示：没有后台同步，不会推送 */
-export async function onProjectsChanged(_cb: (list: Project[]) => void): Promise<Unlisten> {
-  return () => {};
+type AutoHandlers = {
+  started: (e: AutoSyncEvent) => void;
+  progress: (e: SyncProgressEvent) => void;
+  finished: (e: AutoSyncEvent) => void;
+};
+
+const autoListeners = new Set<AutoHandlers>();
+const projectsListeners = new Set<(list: Project[]) => void>();
+let autoRunning: AutoSyncEvent | null = null;
+let autoProgress: SyncProgressSnapshot | null = null;
+let autoLast: AutoSyncEvent | null = null;
+
+const AUTO_LABELS: Record<AutoSyncTrigger, string> = {
+  lock: "锁屏时同步",
+  startup: "启动时同步",
+  resume: "唤醒后同步",
+  unlock: "解锁后同步",
+  manual: "立即同步",
+  periodic: "定时检查云端",
+};
+
+/** 和 src-tauri/src/model.rs 的 SyncProgressSnapshot::apply 一样（演示里没有重试） */
+function applySnapshot(s: SyncProgressSnapshot, e: SyncProgressEvent): SyncProgressSnapshot {
+  switch (e.type) {
+    case "begin":
+      return { projectIds: e.projectIds, active: [], results: [], retry: null };
+    case "start":
+      return { ...s, active: [...s.active.filter((a) => a.projectId !== e.projectId), { projectId: e.projectId, op: null, phase: null, percent: null }] };
+    case "progress":
+      return {
+        ...s,
+        active: [
+          ...s.active.filter((a) => a.projectId !== e.projectId),
+          { projectId: e.projectId, op: e.op, phase: e.phase, percent: e.percent },
+        ],
+      };
+    case "done":
+      return {
+        ...s,
+        active: s.active.filter((a) => a.projectId !== e.result.projectId),
+        results: [...s.results.filter((r) => r.projectId !== e.result.projectId), e.result],
+      };
+    case "retry":
+      return { ...s, retry: { projectIds: e.projectIds, retryAt: e.retryAt } };
+  }
 }
 
-export async function onAutoSync(_handlers: {
-  started: (e: AutoSyncEvent) => void;
-  finished: (e: AutoSyncEvent) => void;
-}): Promise<Unlisten> {
-  return () => {};
+/** 演示一次后台同步：锁屏只推有东西要推的项目，其余（解锁、唤醒……）同步所有项目；比一键同步慢一些，方便看进度 */
+async function simulateAutoSync(trigger: AutoSyncTrigger = "unlock") {
+  if (syncBusy || autoRunning) return;
+  syncBusy = true;
+  const label = AUTO_LABELS[trigger];
+  autoRunning = { trigger, label, result: null };
+  autoProgress = { projectIds: [], active: [], results: [], retry: null };
+  autoListeners.forEach((h) => h.started(clone(autoRunning!)));
+  try {
+    await refreshing?.catch(() => undefined);
+    const only =
+      trigger === "lock"
+        ? db
+            .monitoredProjects()
+            .filter((p) => p.status === "ahead" || willAutoCommit(p))
+            .map((p) => p.id)
+        : null;
+    const result = await runRound(
+      (e) => {
+        autoProgress = applySnapshot(autoProgress!, e);
+        autoListeners.forEach((h) => h.progress(clone(e)));
+      },
+      only,
+      2.5,
+    );
+    autoLast = { trigger, label, result };
+  } finally {
+    syncBusy = false;
+    autoRunning = null;
+    autoProgress = null;
+  }
+  const list = clone(db.monitoredProjects());
+  projectsListeners.forEach((cb) => cb(list));
+  autoListeners.forEach((h) => h.finished(clone(autoLast!)));
+}
+
+// 演示的触发方式：窗口被切走 2 秒以上再切回来，当作"解锁后同步"；调界面时也可以在控制台里调用
+// window.__syncdeckDemo.autoSync("lock" | "unlock" | …)
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  let hiddenAt = 0;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) hiddenAt = Date.now();
+    else if (hiddenAt && Date.now() - hiddenAt > 2000) void simulateAutoSync("unlock");
+  });
+  (window as unknown as { __syncdeckDemo: unknown }).__syncdeckDemo = { autoSync: simulateAutoSync };
+}
+
+export async function onProjectsChanged(cb: (list: Project[]) => void): Promise<Unlisten> {
+  projectsListeners.add(cb);
+  return () => projectsListeners.delete(cb);
+}
+
+export async function onAutoSync(handlers: AutoHandlers): Promise<Unlisten> {
+  autoListeners.add(handlers);
+  return () => autoListeners.delete(handlers);
 }
 
 // ---------------- 应用更新（演示）----------------

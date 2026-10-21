@@ -11,36 +11,17 @@ import {
 import { toast } from "sonner";
 import * as api from "@/api";
 import { sortProjects } from "@/lib/status";
-import type { AutoSyncEvent, Project, SyncItemResult, SyncStatus } from "@/types";
+import type { AutoSyncEvent, Project, SyncProgressEvent, SyncResult, SyncStatus } from "@/types";
+import {
+  applyEvent,
+  backgroundFinished,
+  backgroundStarted,
+  fromSnapshot,
+  idleSync,
+  type SyncState,
+} from "./syncProgress";
 
-export interface SyncState {
-  phase: "idle" | "running" | "done";
-  open: boolean;
-  /** 同步开始时的处理顺序 */
-  order: string[];
-  /** 同步开始时各项目的原始状态（用来显示"正在推送 2 个提交"之类的文字） */
-  before: Record<string, Pick<Project, "status" | "ahead" | "behind">>;
-  /** 正在处理的项目（最多 8 个并行） */
-  activeIds: string[];
-  doneCount: number;
-  results: Record<string, SyncItemResult>;
-  /** 结果里点了"本次跳过"的项目 */
-  skipped: string[];
-  /** 结果里通过"提交并推送"解决了的项目 */
-  resolved: string[];
-}
-
-const idleSync: SyncState = {
-  phase: "idle",
-  open: false,
-  order: [],
-  before: {},
-  activeIds: [],
-  doneCount: 0,
-  results: {},
-  skipped: [],
-  resolved: [],
-};
+export type { SyncState } from "./syncProgress";
 
 interface ProjectsContextValue {
   projects: Project[];
@@ -56,12 +37,21 @@ interface ProjectsContextValue {
   setAutoCommit: (id: string, enabled: boolean) => Promise<Project>;
   /** 取消监控：只从清单里移除，不动任何文件 */
   removeProject: (id: string) => Promise<void>;
+  /** 窗口里的一键同步 */
   sync: SyncState;
   startSync: () => Promise<void>;
+  /** 打开 / 关掉一键同步的进度或结果弹窗（进行中也能关，同步照常进行） */
+  openSync: () => void;
   closeSync: () => void;
   skipInSync: (id: string) => void;
   /** 正在进行的后台自动同步（锁屏、解锁、托盘立即同步……）；null 表示没有 */
   autoSync: AutoSyncEvent | null;
+  /** 后台同步：正在进行的那一轮；没在进行时是最近一次的结果（只在内存里）；都没有为 null */
+  background: SyncState | null;
+  backgroundOpen: boolean;
+  openBackground: () => void;
+  closeBackground: () => void;
+  skipInBackground: (id: string) => void;
 }
 
 const ProjectsContext = createContext<ProjectsContextValue | null>(null);
@@ -101,7 +91,16 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
   /** 刷新轮次：连续触发两次刷新时，只有最后一轮结束才算刷新结束 */
   const refreshRound = useRef(0);
   const [sync, setSync] = useState<SyncState>(idleSync);
+  /** 一键同步的弹窗现在是否开着（同步结束时决定要不要提示"查看结果"） */
+  const syncOpenRef = useRef(false);
+  useEffect(() => {
+    syncOpenRef.current = sync.open;
+  }, [sync.open]);
   const [autoSync, setAutoSync] = useState<AutoSyncEvent | null>(null);
+  /** 正在进行的后台同步的进度、最近一次后台同步的结果、后台同步弹窗是否打开 */
+  const [bgRun, setBgRun] = useState<SyncState | null>(null);
+  const [bgLast, setBgLast] = useState<SyncState | null>(null);
+  const [backgroundOpen, setBackgroundOpen] = useState(false);
   /** 最后一次后台推来的列表和序号：读列表（reload）期间收到的后台结果不能被读到的旧数据盖掉 */
   const background = useRef<{ seq: number; list: Project[] | null }>({ seq: 0, list: null });
   const started = useRef(false);
@@ -123,6 +122,17 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
   const setStatus = useCallback((id: string, status: SyncStatus) => {
     setProjects((list) => list.map((p) => (p.id === id ? { ...p, status } : p)));
   }, []);
+
+  const latest = useCallback((id: string) => projectsRef.current.find((p) => p.id === id), []);
+
+  /** 进度事件里和列表有关的部分：开始处理的那一行显示"同步中"，处理完换成最新状态 */
+  const applyToList = useCallback(
+    (e: SyncProgressEvent) => {
+      if (e.type === "start") setStatus(e.projectId, "syncing");
+      else if (e.type === "done") replaceProject(e.project);
+    },
+    [setStatus, replaceProject],
+  );
 
   const reload = useCallback(async () => {
     const seq = background.current.seq;
@@ -171,9 +181,24 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
           setProjects((cur) => applyBackground(cur, list));
         }),
         api.onAutoSync({
-          started: setAutoSync,
-          // 只清掉同一轮的
-          finished: (e) => setAutoSync((cur) => (cur && cur.trigger !== e.trigger ? cur : null)),
+          started: (e) => {
+            setAutoSync(e);
+            setBgRun(backgroundStarted(e));
+          },
+          progress: (e) => {
+            // 先记下开始时的状态，再把那一行改成"同步中"
+            setBgRun((cur) => (cur ? applyEvent(cur, e, latest) : cur));
+            applyToList(e);
+          },
+          finished: (e) => {
+            // 只清掉同一轮的
+            setAutoSync((cur) => (cur && cur.trigger !== e.trigger ? cur : null));
+            setBgRun((cur) => {
+              const done = backgroundFinished(cur, e);
+              if (done) setBgLast(done);
+              return null;
+            });
+          },
         }),
       ]).catch(() => undefined);
       const git = await api.checkGit().catch(() => ({ installed: false, version: null }));
@@ -184,8 +209,15 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
         });
       }
       await reload();
-      const auto = await api.getAutoSyncState().catch(() => ({ running: null, startupSync: false }));
+      const auto = await api
+        .getAutoSyncState()
+        .catch(() => ({ running: null, startupSync: false, progress: null, last: null }));
       setAutoSync((cur) => cur ?? auto.running);
+      // 窗口中途打开：补上正在进行的后台同步的进度和最近一次的结果（已经从事件收到的为准）
+      const running = auto.running;
+      if (running) setBgRun((cur) => (cur && cur.order.length ? cur : fromSnapshot(running, auto.progress, latest)));
+      const last = auto.last;
+      if (last) setBgLast((cur) => cur ?? backgroundFinished(null, last));
       if (git.installed && !auto.startupSync) {
         await refresh().catch(() => undefined);
       } else if (auto.startupSync && !auto.running) {
@@ -194,7 +226,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
         await reload();
       }
     })();
-  }, [reload, refresh]);
+  }, [reload, refresh, latest, applyToList]);
 
   const startSync = useCallback(async () => {
     const ordered = sortProjects(projects);
@@ -208,40 +240,41 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       ),
     });
 
+    let result: SyncResult | null = null;
     try {
-      await api.syncAll((e) => {
-        if (e.type === "start") {
-          // 刷新途中点的一键同步：后端等刷新结束才开始，这时用刷新后的状态显示"正在推送 N 个提交"
-          const latest = projectsRef.current.find((p) => p.id === e.projectId);
-          setStatus(e.projectId, "syncing");
-          setSync((s) => ({
-            ...s,
-            activeIds: [...s.activeIds, e.projectId],
-            before:
-              latest && latest.status !== "syncing"
-                ? { ...s.before, [e.projectId]: { status: latest.status, ahead: latest.ahead, behind: latest.behind } }
-                : s.before,
-          }));
-        } else {
-          replaceProject(e.project);
-          setSync((s) => ({
-            ...s,
-            activeIds: s.activeIds.filter((id) => id !== e.result.projectId),
-            doneCount: e.index + 1,
-            results: { ...s.results, [e.result.projectId]: e.result },
-          }));
-        }
+      // 刷新途中点的一键同步：后端等刷新结束才开始，这时用刷新后的状态显示"正在推送 N 个提交"
+      result = await api.syncAll((e) => {
+        setSync((s) => applyEvent(s, e, latest));
+        applyToList(e);
       });
     } catch (e) {
       toast.error("一键同步失败", { description: errorMessage(e) });
       await reload();
     }
 
-    setSync((s) => ({ ...s, phase: "done", activeIds: [] }));
-  }, [projects, replaceProject, setStatus, reload]);
+    setSync((s) => ({ ...s, phase: "done", active: {}, finishedAt: new Date().toISOString() }));
+    // 弹窗关着时同步做完了：提示一下，可以点开看结果
+    if (result && !syncOpenRef.current) {
+      const bad = result.failedCount;
+      const text = `一键同步完成：${result.syncedCount} 个已同步${bad ? `，${bad} 个需要处理` : ""}`;
+      const action = { label: "查看结果", onClick: () => setSync((cur) => ({ ...cur, open: true })) };
+      if (bad) toast.warning(text, { action, duration: 10000 });
+      else toast.success(text, { action });
+    }
+  }, [projects, latest, applyToList, reload]);
+
+  const openSync = useCallback(() => {
+    setSync((s) => (s.phase === "idle" ? s : { ...s, open: true }));
+  }, []);
 
   const closeSync = useCallback(() => {
-    setSync((s) => (s.phase === "running" ? s : { ...s, open: false }));
+    setSync((s) => ({ ...s, open: false }));
+  }, []);
+
+  const openBackground = useCallback(() => setBackgroundOpen(true), []);
+  const closeBackground = useCallback(() => setBackgroundOpen(false), []);
+  const skipInBackground = useCallback((id: string) => {
+    setBgLast((s) => (!s || s.skipped.includes(id) ? s : { ...s, skipped: [...s.skipped, id] }));
   }, []);
 
   const skipInSync = useCallback((id: string) => {
@@ -253,9 +286,10 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       try {
         const updated = await api.commitAndPush(id, message);
         replaceProject(updated);
-        setSync((s) =>
-          s.results[id] && !s.resolved.includes(id) ? { ...s, resolved: [...s.resolved, id] } : s,
-        );
+        const markResolved = (s: SyncState) =>
+          s.results[id] && !s.resolved.includes(id) ? { ...s, resolved: [...s.resolved, id] } : s;
+        setSync(markResolved);
+        setBgLast((s) => (s ? markResolved(s) : s));
         return updated;
       } catch (e) {
         // 可能已经提交到本地但没推送（比如发现落后于云端），重新读取一次状态
@@ -293,9 +327,15 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       removeProject,
       sync,
       startSync,
+      openSync,
       closeSync,
       skipInSync,
       autoSync,
+      background: bgRun ?? bgLast,
+      backgroundOpen,
+      openBackground,
+      closeBackground,
+      skipInBackground,
     }),
     [
       projects,
@@ -309,9 +349,16 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       removeProject,
       sync,
       startSync,
+      openSync,
       closeSync,
       skipInSync,
       autoSync,
+      bgRun,
+      bgLast,
+      backgroundOpen,
+      openBackground,
+      closeBackground,
+      skipInBackground,
     ],
   );
 

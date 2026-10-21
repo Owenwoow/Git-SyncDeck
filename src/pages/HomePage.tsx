@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { FolderPlus, RefreshCw, SearchX, ArrowUpDown, Loader2, PauseCircle, Play } from "lucide-react";
+import { FolderPlus, RefreshCw, SearchX, ArrowUpDown, Loader2, PauseCircle, Play, History, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -10,10 +10,14 @@ import { ProjectDetailSheet } from "@/components/projects/ProjectDetailSheet";
 import { sortProjects } from "@/lib/status";
 import { useProjects } from "@/state/projects";
 import { activePause, describePauseUntil, useSettings } from "@/state/settings";
+import { headline, overall, resultSummary, shortLabel, type SyncState } from "@/state/syncProgress";
+import { formatClock } from "@/lib/time";
+import { useNow } from "@/lib/useNow";
 
 /** 主页：监控中的项目 */
 export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
-  const { projects, loading, refreshing, checkingIds, refresh, sync, startSync, autoSync } = useProjects();
+  const { projects, loading, refreshing, checkingIds, refresh, sync, startSync, openSync, autoSync, background, openBackground } =
+    useProjects();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -28,6 +32,19 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
   const selected = projects.find((p) => p.id === selectedId) ?? null;
   // 后台自动同步进行中时也不能再点一键同步 / 刷新（后端同一时间只跑一轮）
   const syncing = sync.phase === "running" || autoSync !== null;
+  // 正在进行的那一轮（一键同步优先）：一键同步按钮变成进度按钮，点开看每个项目的进度
+  const runningRound = sync.phase === "running" ? sync : background?.phase === "running" ? background : null;
+  const lastBackground = background?.phase === "done" ? background : null;
+  const now = useNow(runningRound?.retry != null);
+  const nameOf = (id: string) => projects.find((p) => p.id === id)?.name;
+  // 列表里正在处理的行显示百分比
+  const percents = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const a of Object.values(runningRound?.active ?? {})) {
+      if (a.percent !== null && a.phase && a.phase !== "preparing") map.set(a.projectId, a.percent);
+    }
+    return map;
+  }, [runningRound]);
 
   async function handleRefresh() {
     try {
@@ -45,11 +62,32 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">监控中的项目</h1>
-          {autoSync ? (
+          {runningRound ? (
+            <p className="mt-0.5 flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground" role="status">
+              <Loader2 className="size-3.5 shrink-0 animate-spin" />
+              <span className="truncate tabular-nums">
+                {runningRound.label ?? "一键同步"} · {headline(runningRound, nameOf, now)}
+              </span>
+            </p>
+          ) : autoSync ? (
             <p className="mt-0.5 flex items-center gap-1.5 text-sm text-muted-foreground" role="status">
               <Loader2 className="size-3.5 animate-spin" />
               正在后台{autoSync.label}…
             </p>
+          ) : lastBackground ? (
+            <button
+              type="button"
+              onClick={openBackground}
+              className="mt-0.5 flex max-w-full items-center gap-1 text-left text-sm text-muted-foreground hover:text-foreground"
+            >
+              <History className="size-3.5 shrink-0" />
+              <span className="truncate">
+                上次后台同步：
+                {lastBackground.finishedAt ? `${formatClock(lastBackground.finishedAt)} ` : ""}
+                {shortLabel(lastBackground.label)} · {resultSummary(lastBackground)}
+              </span>
+              <ChevronRight className="size-3.5 shrink-0" />
+            </button>
           ) : (
             <p className="mt-0.5 text-sm text-muted-foreground">
               离开和回到这台电脑时会在后台自动同步（可在设置里调整），也可以随时点"一键同步"。
@@ -61,11 +99,15 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
             <RefreshCw className={refreshing ? "animate-spin" : undefined} />
             {refreshing ? "正在刷新…" : "刷新状态"}
           </Button>
-          {/* 刷新途中也可以点：后端会等这一轮检查结束，再复用刚检查过的结果 */}
-          <Button onClick={startSync} disabled={syncing || loading || projects.length === 0}>
-            <ArrowUpDown />
-            一键同步
-          </Button>
+          {runningRound ? (
+            <ProgressButton round={runningRound} onClick={runningRound === sync ? openSync : openBackground} />
+          ) : (
+            // 刷新途中也可以点：后端会等这一轮检查结束，再复用刚检查过的结果
+            <Button onClick={startSync} disabled={syncing || loading || projects.length === 0}>
+              <ArrowUpDown />
+              一键同步
+            </Button>
+          )}
         </div>
       </header>
 
@@ -87,7 +129,13 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
           />
           {visible.length ? (
             // 刷新时不再整体变灰：每个项目检查完就更新那一行，没检查完的行在状态旁转圈
-            <ProjectList projects={visible} selectedId={selectedId} onSelect={setSelectedId} checkingIds={checkingIds} />
+            <ProjectList
+              projects={visible}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+              checkingIds={checkingIds}
+              percents={percents}
+            />
           ) : (
             <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed py-12 text-sm text-muted-foreground">
               <SearchX className="size-6" />
@@ -109,6 +157,28 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
 
       <ProjectDetailSheet project={selected} onClose={() => setSelectedId(null)} />
     </div>
+  );
+}
+
+/** 同步进行中的「一键同步」按钮（GitHub Desktop 的样子）：底色按总进度填充，文字"正在同步 3/7"，点开看详细进度 */
+function ProgressButton({ round, onClick }: { round: SyncState; onClick: () => void }) {
+  const { done, total, fraction } = overall(round);
+  const text = `${round.label ? "后台同步" : "正在同步"} ${total ? `${done}/${total}` : "…"}`;
+  return (
+    <Button
+      variant="outline"
+      onClick={onClick}
+      className="relative min-w-32 overflow-hidden tabular-nums"
+      aria-label={`${text}，点击查看详细进度`}
+    >
+      <span
+        aria-hidden
+        className="absolute inset-y-0 left-0 bg-primary/20 transition-[width] duration-300"
+        style={{ width: `${Math.round(fraction * 100)}%` }}
+      />
+      <Loader2 className="relative animate-spin" />
+      <span className="relative">{text}</span>
+    </Button>
   );
 }
 

@@ -1,36 +1,60 @@
 import { useState } from "react";
-import { AlertTriangle, CheckCircle2, ChevronRight, Clock, PartyPopper } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronRight, Clock, PartyPopper, WifiOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { StatusBadge } from "@/components/StatusBadge";
 import { ProjectActions } from "@/components/projects/ProjectActions";
+import { formatClock } from "@/lib/time";
+import { useNow } from "@/lib/useNow";
 import { cn } from "@/lib/utils";
-import { useProjects, type SyncState } from "@/state/projects";
+import { useProjects } from "@/state/projects";
 import { useSettings } from "@/state/settings";
+import { activeText, headline, overall, shortLabel, type SyncState } from "@/state/syncProgress";
 import type { Project, SyncItemResult } from "@/types";
 
-/** 一键同步对话框：进行中显示逐个进度，结束后显示结果与异常处理 */
+/** 一键同步和后台同步的弹窗：进行中显示逐个进度（随时可以关掉，同步照常进行），结束后显示结果与异常处理 */
 export function SyncDialog() {
-  const { sync, closeSync, projects } = useProjects();
-  const running = sync.phase === "running";
+  const { sync, closeSync, skipInSync, background, backgroundOpen, closeBackground, skipInBackground } = useProjects();
+  return (
+    <>
+      <SyncProgressDialog state={sync} open={sync.open} onClose={closeSync} onSkip={skipInSync} />
+      {background && (
+        <SyncProgressDialog
+          state={background}
+          open={backgroundOpen}
+          onClose={closeBackground}
+          onSkip={skipInBackground}
+        />
+      )}
+    </>
+  );
+}
+
+type DialogProps = { state: SyncState; open: boolean; onClose: () => void; onSkip: (id: string) => void };
+
+function SyncProgressDialog({ state, open, onClose, onSkip }: DialogProps) {
+  const { projects } = useProjects();
+  const running = state.phase === "running";
   const byId = new Map(projects.map((p) => [p.id, p]));
 
   return (
-    <Dialog open={sync.open} onOpenChange={(o) => !o && closeSync()}>
-      <DialogContent
-        showCloseButton={!running}
-        onInteractOutside={(e) => running && e.preventDefault()}
-        onEscapeKeyDown={(e) => running && e.preventDefault()}
-        className="flex max-h-[85vh] flex-col gap-0 p-0 sm:max-w-2xl"
-      >
-        {running ? <RunningView sync={sync} byId={byId} /> : <DoneView sync={sync} byId={byId} />}
-        {!running && (
-          <DialogFooter className="border-t px-6 py-3.5">
-            <Button onClick={closeSync}>完成</Button>
-          </DialogFooter>
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="flex max-h-[85vh] flex-col gap-0 p-0 sm:max-w-2xl">
+        {running ? (
+          <RunningView sync={state} byId={byId} />
+        ) : (
+          <DoneView sync={state} byId={byId} onSkip={onSkip} />
         )}
+        <DialogFooter className="items-center border-t px-6 py-3.5">
+          {running && (
+            <span className="mr-auto text-xs text-muted-foreground">关掉这个窗口不会中断同步，进度会继续显示在主页上</span>
+          )}
+          <Button variant={running ? "outline" : "default"} onClick={onClose}>
+            {running ? "关闭" : "完成"}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
@@ -41,21 +65,29 @@ type ViewProps = { sync: SyncState; byId: Map<string, Project> };
 // ---------------- 进行中 ----------------
 
 function RunningView({ sync, byId }: ViewProps) {
-  const total = sync.order.length;
-  const current = Math.min(sync.doneCount + 1, total);
+  const { done, total, fraction } = overall(sync);
+  const now = useNow(sync.retry !== null);
+  const title = sync.label ? `正在后台${sync.label}` : "正在同步";
   return (
     <>
       <DialogHeader className="gap-3 px-6 pt-6 pb-4">
-        <div className="flex items-baseline justify-between pr-2">
-          <DialogTitle className="text-base">正在同步</DialogTitle>
+        <div className="flex items-baseline justify-between pr-6">
+          <DialogTitle className="text-base">{title}</DialogTitle>
           <span className="text-sm text-muted-foreground tabular-nums">
-            {current} / {total}
+            {done} / {total}
           </span>
         </div>
-        <DialogDescription className="sr-only">正在逐个同步所有监控中的项目</DialogDescription>
-        <Progress value={(sync.doneCount / Math.max(total, 1)) * 100} />
+        <DialogDescription className="sr-only">逐个同步项目的进度</DialogDescription>
+        <Progress value={fraction * 100} />
+        {sync.retry && (
+          <p className="flex items-center gap-1.5 text-sm text-muted-foreground" role="status">
+            <WifiOff className="size-4" />
+            {headline(sync, (id) => byId.get(id)?.name, now)}
+          </p>
+        )}
       </DialogHeader>
       <ul className="min-h-0 flex-1 divide-y overflow-y-auto border-t px-6">
+        {sync.order.length === 0 && <li className="py-6 text-center text-sm text-muted-foreground">准备中…</li>}
         {sync.order.map((id) => {
           const p = byId.get(id);
           if (!p) return null;
@@ -68,18 +100,24 @@ function RunningView({ sync, byId }: ViewProps) {
 
 function ProgressRow({ project: p, sync }: { project: Project; sync: SyncState }) {
   const result = sync.results[p.id];
-  const active = sync.activeIds.includes(p.id) && !result;
-  const before = sync.before[p.id];
+  const progress = sync.active[p.id];
+  const active = !!progress && !result;
+  const waitingRetry = !result && !active && sync.retry?.projectIds.includes(p.id);
   const autoMerge = useSettings().settings?.autoMerge ?? true;
 
   let text: React.ReactNode;
   if (result) text = <OutcomeText result={result} />;
-  else if (active) text = <span className="text-status-syncing">{activeText(before, p.autoCommit, autoMerge)}</span>;
+  else if (active)
+    text = (
+      <span className="text-status-syncing tabular-nums">
+        {activeText(sync.before[p.id], progress, p.autoCommit, autoMerge)}
+      </span>
+    );
   else
     text = (
       <span className="inline-flex items-center gap-1 text-muted-foreground">
         <Clock className="size-3.5" />
-        等待中
+        {waitingRetry ? "等待重试" : "等待中"}
       </span>
     );
 
@@ -93,27 +131,6 @@ function ProgressRow({ project: p, sync }: { project: Project; sync: SyncState }
       <StatusBadge status={p.status} className="w-28 justify-center" />
     </li>
   );
-}
-
-function activeText(
-  before: SyncState["before"][string] | undefined,
-  autoCommit: boolean,
-  autoMerge: boolean,
-): string {
-  switch (before?.status) {
-    case "dirty":
-      return autoCommit ? "正在自动提交并推送…" : "正在检查…";
-    case "ahead":
-      return `正在推送 ${before.ahead} 个提交…`;
-    case "behind":
-      return `正在拉取 ${before.behind} 个提交…`;
-    case "synced":
-      return "正在检查云端…";
-    case "diverged":
-      return autoMerge ? "正在预演合并…" : "正在检查…";
-    default:
-      return "正在检查…";
-  }
 }
 
 function OutcomeText({ result }: { result: SyncItemResult }) {
@@ -135,8 +152,7 @@ function OutcomeText({ result }: { result: SyncItemResult }) {
 
 // ---------------- 结束后 ----------------
 
-function DoneView({ sync, byId }: ViewProps) {
-  const { skipInSync } = useProjects();
+function DoneView({ sync, byId, onSkip }: ViewProps & { onSkip: (id: string) => void }) {
   const [showSynced, setShowSynced] = useState(false);
 
   const results = sync.order.map((id) => sync.results[id]).filter(Boolean);
@@ -144,12 +160,15 @@ function DoneView({ sync, byId }: ViewProps) {
   const succeeded = results.filter((r) => r.outcome !== "failed");
   const unresolved = failed.filter((r) => !sync.resolved.includes(r.projectId));
   const syncedCount = succeeded.length + (failed.length - unresolved.length);
+  const title = sync.label
+    ? `上次后台同步${sync.finishedAt ? `：${formatClock(sync.finishedAt)} ${shortLabel(sync.label)}` : ""}`
+    : "同步完成";
 
   return (
     <>
       <DialogHeader className="gap-3 px-6 pt-6 pb-5">
-        <DialogTitle className="text-base">同步完成</DialogTitle>
-        <DialogDescription className="sr-only">一键同步的结果</DialogDescription>
+        <DialogTitle className="text-base">{title}</DialogTitle>
+        <DialogDescription className="sr-only">同步的结果</DialogDescription>
         <div className="flex flex-wrap gap-2.5">
           <SummaryPill
             icon={<CheckCircle2 className="size-4" />}
@@ -174,7 +193,7 @@ function DoneView({ sync, byId }: ViewProps) {
         {failed.length === 0 && (
           <div className="flex items-center gap-2 rounded-lg bg-status-synced/10 px-3 py-2.5 text-sm text-status-synced">
             <PartyPopper className="size-4" />
-            全部项目都已同步，可以放心切换电脑了。
+            {sync.label ? "这一轮的项目都已同步。" : "全部项目都已同步，可以放心切换电脑了。"}
           </div>
         )}
 
@@ -194,7 +213,7 @@ function DoneView({ sync, byId }: ViewProps) {
                     reason={r.reason}
                     skipped={sync.skipped.includes(r.projectId)}
                     resolved={sync.resolved.includes(r.projectId)}
-                    onSkip={() => skipInSync(r.projectId)}
+                    onSkip={() => onSkip(r.projectId)}
                   />
                 );
               })}

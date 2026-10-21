@@ -160,13 +160,15 @@ export function onProjectsChanged(cb: (list: Project[]) => void): Promise<Unlist
   return listen<Project[]>("projects-changed", (e) => cb(e.payload));
 }
 
-/** 后台自动同步开始 / 结束 */
+/** 后台自动同步开始 / 进度 / 结束 */
 export async function onAutoSync(handlers: {
   started: (e: AutoSyncEvent) => void;
+  progress: (e: SyncProgressEvent) => void;
   finished: (e: AutoSyncEvent) => void;
 }): Promise<Unlisten> {
   const offs = await Promise.all([
     listen<AutoSyncEvent>("auto-sync-started", (e) => handlers.started(e.payload)),
+    listen<SyncProgressEvent>("auto-sync-progress", (e) => handlers.progress(e.payload)),
     listen<AutoSyncEvent>("auto-sync-finished", (e) => handlers.finished(e.payload)),
   ]);
   return () => offs.forEach((off) => off());

@@ -80,10 +80,38 @@ export interface SyncItemResult {
   reason: string | null;
 }
 
-/** 一键同步的进度事件：start 表示开始处理某项目，done 表示该项目处理完毕（附带最新状态） */
+/** 正在进行的联网 git 操作 */
+export type GitOp = "fetch" | "push" | "pull" | "clone";
+
+/** git 进度的阶段：准备中（统计、压缩）/ 上传 / 下载 / 处理差异 / 写出文件（克隆后检出） */
+export type ProgressPhase = "preparing" | "uploading" | "downloading" | "resolving" | "checkout";
+
+/** 一键同步（和后台同步）的进度事件：
+ *  begin 这一轮要处理的项目（等网络重试时会再来一次，只列要重试的）；start 开始处理某项目；
+ *  progress 该项目 git 的阶段和百分比（每个项目最多 200 毫秒一次）；done 处理完毕（附带最新状态）；
+ *  retry 后台同步时联网失败的项目等一会儿再试 */
 export type SyncProgressEvent =
+  | { type: "begin"; projectIds: string[]; total: number }
   | { type: "start"; projectId: string; index: number; total: number }
-  | { type: "done"; result: SyncItemResult; project: Project; index: number; total: number };
+  | { type: "progress"; projectId: string; op: GitOp; phase: ProgressPhase; percent: number }
+  | { type: "done"; result: SyncItemResult; project: Project; index: number; total: number }
+  | { type: "retry"; projectIds: string[]; retryAt: string };
+
+/** 正在处理的项目和它最近一次的 git 进度 */
+export interface ActiveSync {
+  projectId: string;
+  op: GitOp | null;
+  phase: ProgressPhase | null;
+  percent: number | null;
+}
+
+/** 一轮同步到现在的进度（后端按进度事件累积，窗口中途打开时用它补上） */
+export interface SyncProgressSnapshot {
+  projectIds: string[];
+  active: ActiveSync[];
+  results: SyncItemResult[];
+  retry: { projectIds: string[]; retryAt: string } | null;
+}
 
 /** 刷新状态的进度事件：每个项目检查完立即发一次，index 为完成顺序（从 0 开始） */
 export type RefreshProgressEvent = { type: "done"; project: Project; index: number; total: number };
@@ -187,6 +215,10 @@ export interface AutoSyncState {
   running: AutoSyncEvent | null;
   /** 启动时的到达同步由后端负责（正在做或已做完）：前端启动时不用再自己刷新 */
   startupSync: boolean;
+  /** 正在进行的后台同步到现在的进度；没有后台同步时为 null */
+  progress: SyncProgressSnapshot | null;
+  /** 最近一次后台同步的结果（只在内存里，重启后没有） */
+  last: AutoSyncEvent | null;
 }
 
 /** 取消事件监听 */
