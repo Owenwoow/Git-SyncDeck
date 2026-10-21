@@ -4,11 +4,17 @@ import { toast } from "sonner";
 import type {
   AutoSyncEvent,
   AutoSyncState,
+  CloneDefaults,
+  CloneProgressEvent,
+  CloneRequest,
+  CloneResult,
   CommitInfo,
   DiagnosticInfo,
   AutoSyncTrigger,
   GitInfo,
   GitOp,
+  GithubListing,
+  GithubRepoEntry,
   Project,
   ProgressPhase,
   ProxyMode,
@@ -34,6 +40,7 @@ import {
 } from "@/lib/status";
 import { formatDateTime } from "@/lib/time";
 import { clone, db, delay, jitter } from "./db";
+import { EXISTING_FOLDERS, MOCK_OWNER, mockGithubRepos } from "./github";
 import { mockConflicts } from "./projects";
 import { defaultSettings, demoHostName, demoSystemProxy, pickableDirs } from "./repos";
 
@@ -122,6 +129,141 @@ export async function scanDirectory(dir: string): Promise<ScannedRepo[]> {
         projectId: monitored ? r.id : null,
       };
     });
+}
+
+// ---------------- 从 GitHub 克隆 ----------------
+
+const CLONE_INPUT_KEY = "syncdeck-mock-github-input";
+
+export async function getCloneDefaults(): Promise<CloneDefaults> {
+  await delay(200);
+  let lastInput: string | null = null;
+  try {
+    lastInput = localStorage.getItem(CLONE_INPUT_KEY);
+  } catch {
+    // 读不到就当没有
+  }
+  return { lastInput, ghLogin: MOCK_OWNER, defaultCodeDir: readSettings().defaultCodeDir };
+}
+
+/** 演示：输入里带 public-only 模拟没装 gh（只列公开仓库），带 not-logged 模拟 gh 没登录；写成 账号/仓库 只列那一个仓库 */
+export async function listGithubRepos(input: string): Promise<GithubListing> {
+  await delay(jitter(500, 900));
+  const text = input.trim();
+  if (!text) throw new Error("请填写 GitHub 账号主页、用户名或仓库地址");
+  try {
+    localStorage.setItem(CLONE_INPUT_KEY, text);
+  } catch {
+    // 记不住也不影响
+  }
+  const lower = text.toLowerCase();
+  const publicOnly = lower.includes("public-only");
+  const notLoggedIn = lower.includes("not-logged");
+  const path = text.replace(/^https?:\/\//i, "").replace(/^(www\.)?github\.com\//i, "").replace(/[?#].*$/, "").replace(/\/+$/, "");
+  const [first, second] = path.split("/");
+  const isDemoAccount = publicOnly || notLoggedIn || !first || first.toLowerCase() === MOCK_OWNER.toLowerCase();
+  if (!isDemoAccount) throw new Error(`找不到 GitHub 账号 ${first}（演示数据里只有 ${MOCK_OWNER}）`);
+
+  const onlyPublic = publicOnly || notLoggedIn;
+  let repos = mockGithubRepos.filter((r) => !onlyPublic || !r.private);
+  if (second) {
+    const name = second.replace(/\.git$/i, "").toLowerCase();
+    repos = repos.filter((r) => r.name.toLowerCase() === name);
+    if (!repos.length) throw new Error(`找不到 GitHub 仓库 ${MOCK_OWNER}/${second}（地址写错了，或者它是私有的、需要先用 gh 登录）`);
+  }
+
+  const { defaultCodeDir } = readSettings();
+  const entries: GithubRepoEntry[] = repos.map((repo) => {
+    const target = `${defaultCodeDir.replace(/[\\/]+$/, "")}\\${repo.name}`;
+    const local = db.allRepos().find((r) => r.remoteUrl === repo.cloneUrl && (db.isMonitored(r.id) || r.path.toLowerCase().startsWith(defaultCodeDir.toLowerCase())));
+    return {
+      repo: clone(repo),
+      local: local?.path ?? null,
+      target,
+      targetExists: EXISTING_FOLDERS.includes(repo.name) || !!db.findRepoByPath(target),
+    };
+  });
+  return {
+    owner: MOCK_OWNER,
+    repos: entries,
+    source: onlyPublic ? "public" : "gh",
+    notice: publicOnly
+      ? "装好 GitHub CLI（gh）并运行 gh auth login 后能看到私有仓库"
+      : notLoggedIn
+        ? "gh 还没登录：运行 gh auth login 后能看到私有仓库"
+        : null,
+  };
+}
+
+/** 演示：每个仓库 2~4 秒，下载 → 处理差异 → 检出，每 200 毫秒报一次百分比；名字含 huge 的模拟超时失败；最多同时 3 个 */
+export async function cloneRepos(
+  items: CloneRequest[],
+  onProgress: (e: CloneProgressEvent) => void,
+): Promise<CloneResult[]> {
+  const { defaultCodeDir } = readSettings();
+  const results: CloneResult[] = new Array(items.length);
+
+  async function one(index: number) {
+    const { url, name } = items[index];
+    onProgress({ type: "start", url });
+    const target = `${defaultCodeDir.replace(/[\\/]+$/, "")}\\${name}`;
+    let error: string | null = null;
+    let project: Project | null = null;
+    if (EXISTING_FOLDERS.includes(name) || db.findRepoByPath(target)) {
+      error = `文件夹已存在：${target}，没有覆盖`;
+    } else {
+      const total = jitter(2000, 4000);
+      const failing = name.toLowerCase().includes("huge");
+      const phases: [ProgressPhase, number][] = [
+        ["downloading", 0.6],
+        ["resolving", 0.15],
+        ["checkout", 0.25],
+      ];
+      outer: for (const [phase, share] of phases) {
+        const steps = Math.max(2, Math.round((total * share) / 200));
+        for (let i = 1; i <= steps; i++) {
+          await delay(200);
+          const percent = Math.round((i / steps) * 100);
+          // 超时：下载到一半停住
+          if (failing && phase === "downloading" && percent >= 40) {
+            error = "git clone 超时（180 秒），已终止";
+            break outer;
+          }
+          onProgress({ type: "progress", url, phase, percent });
+        }
+      }
+      if (!error) {
+        project = clone(
+          db.addRepo({
+            id: `p-${name}`,
+            name,
+            path: target,
+            branch: "main",
+            remoteUrl: url,
+            upstream: "origin/main",
+            status: "synced",
+            ahead: 0,
+            behind: 0,
+            changes: [],
+            lastSyncAt: null,
+            issue: null,
+            checkError: null,
+            autoCommit: false,
+          }),
+        );
+        db.monitor(project.id);
+      }
+    }
+    results[index] = { url, name, ok: !error, error, project };
+    onProgress({ type: "done", url, ok: !error, error, project });
+  }
+
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) await one(next++);
+  };
+  await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
+  return results;
 }
 
 // ---------------- 同步 ----------------

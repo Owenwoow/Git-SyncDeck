@@ -86,6 +86,69 @@ export type GitOp = "fetch" | "push" | "pull" | "clone";
 /** git 进度的阶段：准备中（统计、压缩）/ 上传 / 下载 / 处理差异 / 写出文件（克隆后检出） */
 export type ProgressPhase = "preparing" | "uploading" | "downloading" | "resolving" | "checkout";
 
+// ---------------- 从 GitHub 克隆（对应 src-tauri/src/model.rs）----------------
+
+/** GitHub 上的一个仓库 */
+export interface GithubRepo {
+  name: string;
+  /** 账号/仓库 */
+  fullName: string;
+  /** https 克隆地址，以 .git 结尾 */
+  cloneUrl: string;
+  htmlUrl: string;
+  private: boolean;
+  fork: boolean;
+  archived: boolean;
+  /** 最近推送时间（ISO 8601） */
+  pushedAt: string | null;
+  description: string | null;
+}
+
+/** 列表里的一行：仓库 + 是否已在本地 + 克隆目标 */
+export interface GithubRepoEntry {
+  repo: GithubRepo;
+  /** 已在本地的仓库路径（默认代码目录下或监控清单里，远程地址相同）；没有为 null */
+  local: string | null;
+  /** 克隆到哪里：默认代码目录\仓库名 */
+  target: string;
+  targetExists: boolean;
+}
+
+export interface GithubListing {
+  owner: string;
+  repos: GithubRepoEntry[];
+  /** gh：用 GitHub CLI 列的（含私有仓库）；public：公开接口（只有公开仓库） */
+  source: "gh" | "public";
+  notice: string | null;
+}
+
+export interface CloneDefaults {
+  /** 上次输入的 GitHub 地址 */
+  lastInput: string | null;
+  /** gh 当前登录的账号；没装或没登录为 null */
+  ghLogin: string | null;
+  defaultCodeDir: string;
+}
+
+export interface CloneRequest {
+  url: string;
+  /** 克隆到默认代码目录下的这个文件夹名 */
+  name: string;
+}
+
+export type CloneProgressEvent =
+  | { type: "start"; url: string }
+  | { type: "progress"; url: string; phase: ProgressPhase; percent: number }
+  | { type: "done"; url: string; ok: boolean; error: string | null; project: Project | null };
+
+export interface CloneResult {
+  url: string;
+  name: string;
+  ok: boolean;
+  error: string | null;
+  project: Project | null;
+}
+
 /** 一键同步（和后台同步）的进度事件：
  *  begin 这一轮要处理的项目（等网络重试时会再来一次，只列要重试的）；start 开始处理某项目；
  *  progress 该项目 git 的阶段和百分比（每个项目最多 200 毫秒一次）；done 处理完毕（附带最新状态）；
