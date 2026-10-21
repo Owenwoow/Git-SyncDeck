@@ -425,6 +425,11 @@ export async function getAutoSyncState(): Promise<AutoSyncState> {
   return { running: null, startupSync: false };
 }
 
+/** 演示：不会真的退出 */
+export async function quitApp(): Promise<void> {
+  toast.info("演示模式不会真的退出");
+}
+
 /** 演示：没有后台同步，不会推送 */
 export async function onProjectsChanged(_cb: (list: Project[]) => void): Promise<Unlisten> {
   return () => {};

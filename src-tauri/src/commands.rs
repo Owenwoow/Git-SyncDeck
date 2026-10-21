@@ -886,6 +886,12 @@ pub fn get_auto_sync_state(state: State<'_, Shared>) -> AutoSyncState {
     state.auto.state()
 }
 
+/// 退出 SyncDeck（设置页「退出 SyncDeck」按钮；和托盘菜单「退出」同一个逻辑）
+#[tauri::command]
+pub fn quit_app<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    crate::tray::quit(&app);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
