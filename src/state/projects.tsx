@@ -52,6 +52,9 @@ interface ProjectsContextValue {
   openBackground: () => void;
   closeBackground: () => void;
   skipInBackground: (id: string) => void;
+  /** 正在从 GitHub 克隆仓库；由「添加项目」页的克隆标签页设置 */
+  cloning: boolean;
+  setCloning: (on: boolean) => void;
 }
 
 const ProjectsContext = createContext<ProjectsContextValue | null>(null);
@@ -97,6 +100,8 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     syncOpenRef.current = sync.open;
   }, [sync.open]);
   const [autoSync, setAutoSync] = useState<AutoSyncEvent | null>(null);
+  /** 「添加项目 → 从 GitHub 克隆」正在克隆（退出前要确认） */
+  const [cloning, setCloning] = useState(false);
   /** 正在进行的后台同步的进度、最近一次后台同步的结果、后台同步弹窗是否打开 */
   const [bgRun, setBgRun] = useState<SyncState | null>(null);
   const [bgLast, setBgLast] = useState<SyncState | null>(null);
@@ -336,6 +341,8 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       openBackground,
       closeBackground,
       skipInBackground,
+      cloning,
+      setCloning,
     }),
     [
       projects,
@@ -359,6 +366,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       openBackground,
       closeBackground,
       skipInBackground,
+      cloning,
     ],
   );
 

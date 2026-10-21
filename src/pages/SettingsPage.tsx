@@ -582,16 +582,15 @@ function PauseCard() {
 }
 
 /**
- * 现在是否在忙：一键同步进行中、后台自动同步进行中、有项目处于"同步中"。
- * 以后加上"正在克隆"，在这里补一个条件就行。
+ * 现在是否在忙：一键同步进行中、后台自动同步进行中、有项目处于"同步中"、正在从 GitHub 克隆。
  */
-function isAppBusy(sync: SyncState, autoSync: AutoSyncEvent | null, projects: Project[]): boolean {
-  return sync.phase === "running" || autoSync !== null || projects.some((p) => p.status === "syncing");
+function isAppBusy(sync: SyncState, autoSync: AutoSyncEvent | null, projects: Project[], cloning: boolean): boolean {
+  return sync.phase === "running" || autoSync !== null || cloning || projects.some((p) => p.status === "syncing");
 }
 
 /** 「退出 SyncDeck」：没在做事直接退出，正在同步先确认；演示模式只弹提示 */
 function QuitRow() {
-  const { sync, autoSync, projects } = useProjects();
+  const { sync, autoSync, projects, cloning } = useProjects();
   const [confirming, setConfirming] = useState(false);
 
   async function quit() {
@@ -608,7 +607,7 @@ function QuitRow() {
       toast.info("演示模式不会真的退出");
       return;
     }
-    if (isAppBusy(sync, autoSync, projects)) setConfirming(true);
+    if (isAppBusy(sync, autoSync, projects, cloning)) setConfirming(true);
     else void quit();
   }
 
@@ -628,7 +627,7 @@ function QuitRow() {
         <DialogContent showCloseButton={false}>
           <DialogHeader>
             <DialogTitle>退出 SyncDeck</DialogTitle>
-            <DialogDescription>退出会中断正在进行的同步，确定退出吗？</DialogDescription>
+            <DialogDescription>退出会中断正在进行的同步或克隆，确定退出吗？</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setConfirming(false)}>

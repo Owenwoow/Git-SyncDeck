@@ -11,9 +11,61 @@ import { cn } from "@/lib/utils";
 import { useProjects } from "@/state/projects";
 import { useSettings } from "@/state/settings";
 import type { ScannedRepo } from "@/types";
+import { GithubCloneTab } from "./add/GithubCloneTab";
 
-/** 添加项目：选择目录 → 扫描 → 勾选要监控的仓库（也可以在这里取消监控） */
+type Tab = "local" | "github";
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: "local", label: "本地扫描" },
+  { id: "github", label: "从 GitHub 克隆" },
+];
+
+/** 添加项目：本地扫描（选目录 → 勾选要监控的仓库），或从 GitHub 克隆自己的仓库。两个页签都保持挂载，切换时各自的状态不丢 */
 export function AddProjectsPage() {
+  const [tab, setTab] = useState<Tab>("local");
+  return (
+    <div className="space-y-5 pb-4">
+      <header>
+        <h1 className="text-xl font-semibold tracking-tight">添加项目</h1>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          {tab === "local"
+            ? "选择存放代码的目录，自动找出其中的 Git 仓库，勾选后加入监控。"
+            : "填入 GitHub 账号主页，列出名下的仓库，勾选后克隆到默认代码目录并加入监控。"}
+        </p>
+      </header>
+
+      <div role="tablist" className="flex gap-1 border-b">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.id}
+            onClick={() => setTab(t.id)}
+            className={cn(
+              "-mb-px border-b-2 px-3 py-2 text-sm transition-colors",
+              tab === t.id
+                ? "border-primary font-medium text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div role="tabpanel" hidden={tab !== "local"}>
+        <LocalScanTab />
+      </div>
+      <div role="tabpanel" hidden={tab !== "github"}>
+        <GithubCloneTab />
+      </div>
+    </div>
+  );
+}
+
+/** 本地扫描：选择目录 → 扫描 → 勾选要监控的仓库（也可以在这里取消监控） */
+function LocalScanTab() {
   const { settings } = useSettings();
   const { reload, refresh } = useProjects();
   const [dir, setDir] = useState<string | null>(null);
@@ -103,12 +155,7 @@ export function AddProjectsPage() {
   }, [repos, query]);
 
   return (
-    <div className="space-y-5 pb-4">
-      <header>
-        <h1 className="text-xl font-semibold tracking-tight">添加项目</h1>
-        <p className="mt-0.5 text-sm text-muted-foreground">选择存放代码的目录，自动找出其中的 Git 仓库，勾选后加入监控。</p>
-      </header>
-
+    <div className="space-y-5">
       <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
         <FolderOpen className="size-5 shrink-0 text-muted-foreground" />
         <div className="min-w-0 flex-1">
