@@ -195,6 +195,7 @@ pub fn run() {
             commands::pause_auto_sync,
             commands::resume_auto_sync,
             commands::get_auto_sync_state,
+            commands::quit_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

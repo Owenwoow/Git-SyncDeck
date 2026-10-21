@@ -150,6 +150,11 @@ export function getAutoSyncState(): Promise<AutoSyncState> {
   return call("get_auto_sync_state");
 }
 
+/** 彻底退出 SyncDeck（和托盘菜单「退出」一样） */
+export function quitApp(): Promise<void> {
+  return call("quit_app");
+}
+
 /** 后台检查 / 同步之后的最新项目列表 */
 export function onProjectsChanged(cb: (list: Project[]) => void): Promise<Unlisten> {
   return listen<Project[]>("projects-changed", (e) => cb(e.payload));

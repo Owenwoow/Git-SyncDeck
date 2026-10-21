@@ -1,11 +1,18 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { Check, CircleAlert, Download, FolderSearch, Loader2, Pause, Play, RefreshCw, RotateCcw } from "lucide-react";
+import { Check, CircleAlert, Download, FolderSearch, Loader2, Pause, Play, Power, RefreshCw, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -17,11 +24,147 @@ import {
   renderCommitMessage,
 } from "@/lib/status";
 import { cn } from "@/lib/utils";
+import { useProjects, type SyncState } from "@/state/projects";
 import { activePause, describePauseUntil, useSettings } from "@/state/settings";
-import type { ProxyMode, Settings, Theme, UpdateInfo, UpdateProgress } from "@/types";
+import type { AutoSyncEvent, Project, ProxyMode, Settings, Theme, UpdateInfo, UpdateProgress } from "@/types";
 
-/** 设置：默认代码目录、联网超时、代理、自动同步、提交信息模板与本机名称、浅色/深色主题、关于与检查更新。pendingUpdate 是启动时已发现的新版本 */
-export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateInfo | null }) {
+// ---------------- 页面骨架：左边分类目录，右边只显示一类 ----------------
+
+export type SettingsCategory = "general" | "network" | "autosync" | "commit" | "appearance" | "about";
+
+const CATEGORIES: { id: SettingsCategory; label: string }[] = [
+  { id: "general", label: "常规" },
+  { id: "network", label: "网络" },
+  { id: "autosync", label: "自动同步" },
+  { id: "commit", label: "提交与合并" },
+  { id: "appearance", label: "外观" },
+  { id: "about", label: "关于" },
+];
+
+/** 一组设置项：圆角卡片，项与项之间有分隔线 */
+function Group({ children }: { children: React.ReactNode }) {
+  return <div className="divide-y rounded-lg border bg-card">{children}</div>;
+}
+
+/** 分组标题（可带一段说明），放在 Group 上面 */
+function GroupHeading({ title, description }: { title: string; description?: string }) {
+  return (
+    <div className="mb-2 px-0.5">
+      <h3 className="text-sm font-medium">{title}</h3>
+      {description && <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>}
+    </div>
+  );
+}
+
+/** 一行设置项：左边标题和说明，右边控件（control）；要填较长文字的放进 children，占满下一行 */
+function Row({
+  title,
+  description,
+  htmlFor,
+  control,
+  children,
+}: {
+  title: string;
+  description?: React.ReactNode;
+  htmlFor?: string;
+  control?: React.ReactNode;
+  children?: React.ReactNode;
+}) {
+  const heading = htmlFor ? (
+    <label htmlFor={htmlFor} className="cursor-pointer text-sm font-medium">
+      {title}
+    </label>
+  ) : (
+    <div className="text-sm font-medium">{title}</div>
+  );
+  return (
+    <div className="px-4 py-3.5">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1">
+          {heading}
+          {description && <div className="mt-0.5 text-xs text-muted-foreground">{description}</div>}
+        </div>
+        {control && <div className="shrink-0">{control}</div>}
+      </div>
+      {children && <div className="mt-3">{children}</div>}
+    </div>
+  );
+}
+
+/** 分段选择（联网超时、代理共用） */
+function Segmented({ children, label }: { children: React.ReactNode; label: string }) {
+  return (
+    <div className="inline-flex rounded-md border p-0.5" role="radiogroup" aria-label={label}>
+      {children}
+    </div>
+  );
+}
+
+/** 设置页：左边分类目录，点哪类右边只显示那一类。category 由 App 保存，切到别的页面再回来停在上次看的分类 */
+export function SettingsPage({
+  pendingUpdate = null,
+  category,
+  onCategoryChange,
+}: {
+  pendingUpdate?: UpdateInfo | null;
+  category: SettingsCategory;
+  onCategoryChange: (c: SettingsCategory) => void;
+}) {
+  return (
+    <div className="mx-auto max-w-[1000px] space-y-6">
+      <header>
+        <h1 className="text-xl font-semibold tracking-tight">设置</h1>
+      </header>
+
+      <div className="flex items-start gap-6">
+        <nav aria-label="设置分类" className="sticky top-0 w-32 shrink-0 space-y-0.5">
+          {CATEGORIES.map(({ id, label }) => {
+            const active = id === category;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => onCategoryChange(id)}
+                aria-current={active ? "page" : undefined}
+                className={cn(
+                  "flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-sm transition-colors",
+                  active
+                    ? "bg-accent font-medium text-accent-foreground"
+                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+                )}
+              >
+                <span>{label}</span>
+                {id === "about" && pendingUpdate && (
+                  <span className="size-2 rounded-full bg-status-ahead" aria-label="有新版本" />
+                )}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="min-w-0 flex-1 space-y-6">
+          {category === "general" && <GeneralSection />}
+          {category === "network" && (
+            <>
+              <Group>
+                <NetworkTimeoutCard />
+              </Group>
+              <Group>
+                <ProxyCard />
+              </Group>
+            </>
+          )}
+          {category === "autosync" && <AutoSyncSection />}
+          {category === "commit" && <CommitAndMergeSection />}
+          {category === "appearance" && <AppearanceSection />}
+          {category === "about" && <AboutSection pendingUpdate={pendingUpdate} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GeneralSection() {
   const { settings, updateSettings } = useSettings();
   const [picking, setPicking] = useState(false);
 
@@ -39,65 +182,45 @@ export function SettingsPage({ pendingUpdate = null }: { pendingUpdate?: UpdateI
   }
 
   return (
-    <div className="max-w-2xl space-y-8">
-      <header>
-        <h1 className="text-xl font-semibold tracking-tight">设置</h1>
-      </header>
-
-      <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">常规</h2>
-        <div className="rounded-lg border bg-card p-4">
-          <div className="text-sm font-medium">默认代码目录</div>
-          <p className="mt-0.5 text-xs text-muted-foreground">"添加项目"页面会默认扫描这个目录。</p>
-          <div className="mt-3 flex gap-2">
-            <Input readOnly value={settings?.defaultCodeDir ?? ""} className="font-mono select-text" />
-            <Button variant="outline" onClick={pickDir} disabled={picking || !settings}>
-              {picking ? <Loader2 className="animate-spin" /> : <FolderSearch />}
-              选择…
-            </Button>
-          </div>
+    <Group>
+      <Row title="默认代码目录" description={'"添加项目"页面会默认扫描这个目录。'}>
+        <div className="flex gap-2">
+          <Input readOnly value={settings?.defaultCodeDir ?? ""} className="font-mono select-text" />
+          <Button variant="outline" onClick={pickDir} disabled={picking || !settings}>
+            {picking ? <Loader2 className="animate-spin" /> : <FolderSearch />}
+            选择…
+          </Button>
         </div>
-        <NetworkTimeoutCard />
-        <ProxyCard />
-      </section>
-
-      <AutoSyncSection />
-
-      <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">自动提交</h2>
-        <CommitTemplateCard />
-      </section>
-
-      <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">冲突与提交检查</h2>
-        <MergeAndCheckCard />
-      </section>
-
-      <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">外观</h2>
-        <div className="rounded-lg border bg-card p-4">
-          <div className="text-sm font-medium">主题</div>
-          <div className="mt-3 grid grid-cols-2 gap-3" role="radiogroup" aria-label="主题">
-            <ThemeCard
-              theme="light"
-              label="浅色"
-              active={settings?.theme === "light"}
-              onSelect={() => updateSettings({ theme: "light" })}
-            />
-            <ThemeCard
-              theme="dark"
-              label="深色"
-              active={settings?.theme === "dark"}
-              onSelect={() => updateSettings({ theme: "dark" })}
-            />
-          </div>
-        </div>
-      </section>
-
-      <AboutSection pendingUpdate={pendingUpdate} />
-    </div>
+      </Row>
+    </Group>
   );
 }
+
+function AppearanceSection() {
+  const { settings, updateSettings } = useSettings();
+  return (
+    <Group>
+      <Row title="主题">
+        <div className="grid max-w-md grid-cols-2 gap-3" role="radiogroup" aria-label="主题">
+          <ThemeCard
+            theme="light"
+            label="浅色"
+            active={settings?.theme === "light"}
+            onSelect={() => updateSettings({ theme: "light" })}
+          />
+          <ThemeCard
+            theme="dark"
+            label="深色"
+            active={settings?.theme === "dark"}
+            onSelect={() => updateSettings({ theme: "dark" })}
+          />
+        </div>
+      </Row>
+    </Group>
+  );
+}
+
+// ---------------- 网络 ----------------
 
 /** 联网超时：fetch、push、pull 超过这个时间就终止，点选即保存 */
 function NetworkTimeoutCard() {
@@ -114,33 +237,33 @@ function NetworkTimeoutCard() {
   }
 
   return (
-    <div className="rounded-lg border bg-card p-4">
-      <div className="text-sm font-medium">联网超时</div>
-      <p className="mt-0.5 text-xs text-muted-foreground">
-        一键同步、提交并推送时连接 GitHub 超过这个时间就停止（刷新状态只是看一眼，最多等 30 秒）。网络慢或者一次要拉取的内容很多时，可以调长一些。
-      </p>
-      <div className="mt-3 inline-flex rounded-md border p-0.5" role="radiogroup" aria-label="联网超时">
-        {NETWORK_TIMEOUT_CHOICES.map((secs) => {
-          const active = settings?.networkTimeoutSecs === secs;
-          return (
-            <button
-              key={secs}
-              type="button"
-              role="radio"
-              aria-checked={active}
-              disabled={!settings}
-              onClick={() => choose(secs)}
-              className={cn(
-                "rounded px-3 py-1 text-sm transition-colors",
-                active ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {secs / 60} 分钟
-            </button>
-          );
-        })}
-      </div>
-    </div>
+    <Row
+      title="联网超时"
+      description="一键同步、提交并推送时连接 GitHub 超过这个时间就停止（刷新状态只是看一眼，最多等 30 秒）。网络慢或者一次要拉取的内容很多时，可以调长一些。"
+      control={
+        <Segmented label="联网超时">
+          {NETWORK_TIMEOUT_CHOICES.map((secs) => {
+            const active = settings?.networkTimeoutSecs === secs;
+            return (
+              <button
+                key={secs}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                disabled={!settings}
+                onClick={() => choose(secs)}
+                className={cn(
+                  "rounded px-3 py-1 text-sm transition-colors",
+                  active ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {secs / 60} 分钟
+              </button>
+            );
+          })}
+        </Segmented>
+      }
+    />
   );
 }
 
@@ -244,35 +367,35 @@ function ProxyCard() {
   }
 
   return (
-    <div className="rounded-lg border bg-card p-4">
-      <div className="text-sm font-medium">代理</div>
-      <p className="mt-0.5 text-xs text-muted-foreground">
-        自动：git 自己配了代理就用 git 的；没配而 Windows 系统代理开着，就用系统代理。只对 SyncDeck 调用的 git 生效，不改全局 git
-        配置。
-      </p>
-      <div className="mt-3 inline-flex rounded-md border p-0.5" role="radiogroup" aria-label="代理">
-        {PROXY_MODE_OPTIONS.map(({ mode: m, label }) => {
-          const active = mode === m;
-          return (
-            <button
-              key={m}
-              type="button"
-              role="radio"
-              aria-checked={active}
-              disabled={!settings || saving}
-              // 不让地址输入框先失焦保存一次草稿
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => void choose(m)}
-              className={cn(
-                "rounded px-3 py-1 text-sm transition-colors",
-                active ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {label}
-            </button>
-          );
-        })}
-      </div>
+    <Row
+      title="代理"
+      description="自动：git 自己配了代理就用 git 的；没配而 Windows 系统代理开着，就用系统代理。只对 SyncDeck 调用的 git 生效，不改全局 git 配置。"
+      control={
+        <Segmented label="代理">
+          {PROXY_MODE_OPTIONS.map(({ mode: m, label }) => {
+            const active = mode === m;
+            return (
+              <button
+                key={m}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                disabled={!settings || saving}
+                // 不让地址输入框先失焦保存一次草稿
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => void choose(m)}
+                className={cn(
+                  "rounded px-3 py-1 text-sm transition-colors",
+                  active ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </Segmented>
+      }
+    >
       {mode === "manual" && (
         <Input
           ref={inputRef}
@@ -282,15 +405,15 @@ function ProxyCard() {
           onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
           placeholder="如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
           disabled={!settings || saving}
-          className="mt-3 font-mono"
+          className="mb-3 font-mono"
           aria-label="代理地址"
         />
       )}
-      <p className="mt-3 text-sm break-all">{current ? describeProxy(current) : "当前：正在检测…"}</p>
+      <p className="text-sm break-all">{current ? describeProxy(current) : "当前：正在检测…"}</p>
       <p className="mt-1 text-xs text-muted-foreground">
         只影响 https 地址的仓库，SSH 地址的仓库不受影响；仓库里单独配置的 remote.&lt;远程名&gt;.proxy 也不受这里影响
       </p>
-    </div>
+    </Row>
   );
 }
 
@@ -318,13 +441,11 @@ const BACKGROUND_SWITCHES: SwitchItem[] = [
   {
     key: "closeToTray",
     label: "关窗口时隐藏到托盘",
-    description: "关掉窗口后继续在托盘里运行；要彻底退出，在托盘图标上右键选「退出」",
+    description: "关掉窗口后继续在托盘里运行；要彻底退出，用下面的「退出 SyncDeck」，或在托盘图标上右键选「退出」",
   },
 ];
 
-const LEAVE_SWITCHES: SwitchItem[] = [
-  { key: "syncOnLock", label: "锁屏" },
-];
+const LEAVE_SWITCHES: SwitchItem[] = [{ key: "syncOnLock", label: "锁屏" }];
 
 const ARRIVE_SWITCHES: SwitchItem[] = [
   { key: "syncOnStartup", label: "启动 SyncDeck 时", description: "包括开机自启" },
@@ -359,18 +480,27 @@ function SwitchRow({
 }) {
   const id = useId();
   return (
-    <div className="flex items-start justify-between gap-4 py-2">
-      <label htmlFor={id} className="min-w-0 cursor-pointer">
-        <div className="text-sm">{item.label}</div>
-        {item.description && <p className="mt-0.5 text-xs text-muted-foreground">{item.description}</p>}
-      </label>
-      <Switch id={id} checked={checked} onCheckedChange={onChange} disabled={disabled} className="mt-0.5" />
-    </div>
+    <Row
+      title={item.label}
+      description={item.description}
+      htmlFor={id}
+      control={<Switch id={id} checked={checked} onCheckedChange={onChange} disabled={disabled} className="mt-0.5" />}
+    />
   );
 }
 
-/** 一张卡片：标题、说明和若干开关 */
-function SwitchCard({ title, description, items }: { title: string; description?: string; items: SwitchItem[] }) {
+/** 一组开关：上面是标题和说明，下面每个开关一行；extra 是接在最后的其他行 */
+function SwitchGroup({
+  title,
+  description,
+  items,
+  extra,
+}: {
+  title: string;
+  description?: string;
+  items: SwitchItem[];
+  extra?: React.ReactNode;
+}) {
   const { settings, updateSettings } = useSettings();
 
   async function toggle(key: SwitchKey, value: boolean) {
@@ -384,10 +514,9 @@ function SwitchCard({ title, description, items }: { title: string; description?
   }
 
   return (
-    <div className="rounded-lg border bg-card p-4">
-      <div className="text-sm font-medium">{title}</div>
-      {description && <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>}
-      <div className="mt-2 divide-y">
+    <div>
+      <GroupHeading title={title} description={description} />
+      <Group>
         {items.map((item) => (
           <SwitchRow
             key={item.key}
@@ -397,7 +526,8 @@ function SwitchCard({ title, description, items }: { title: string; description?
             onChange={(v) => void toggle(item.key, v)}
           />
         ))}
-      </div>
+        {extra}
+      </Group>
     </div>
   );
 }
@@ -421,61 +551,138 @@ function PauseCard() {
   }
 
   return (
-    <div className="flex items-center justify-between gap-4 rounded-lg border bg-card p-4">
-      <div className="min-w-0">
-        <div className="text-sm font-medium">暂停自动同步</div>
-        <p className="mt-0.5 text-xs text-muted-foreground">
-          {until
+    <Group>
+      <Row
+        title="暂停自动同步"
+        description={
+          until
             ? `已暂停到 ${describePauseUntil(until)}，期间离开和回到电脑时都不会自动同步（托盘里的「立即同步」照常可用）。`
-            : "临时不想自动同步时，可以暂停到明天 00:00。托盘菜单里也能暂停和恢复。"}
-        </p>
-      </div>
-      {until ? (
-        <Button variant="outline" onClick={() => run(resumeAutoSync, "已恢复自动同步")} disabled={busy || !settings}>
-          {busy ? <Loader2 className="animate-spin" /> : <Play />}
-          恢复
-        </Button>
-      ) : (
-        <Button variant="outline" onClick={() => run(pauseAutoSync, "自动同步已暂停到明天 00:00")} disabled={busy || !settings}>
-          {busy ? <Loader2 className="animate-spin" /> : <Pause />}
-          暂停到明天
-        </Button>
-      )}
-    </div>
+            : "临时不想自动同步时，可以暂停到明天 00:00。托盘菜单里也能暂停和恢复。"
+        }
+        control={
+          until ? (
+            <Button variant="outline" onClick={() => run(resumeAutoSync, "已恢复自动同步")} disabled={busy || !settings}>
+              {busy ? <Loader2 className="animate-spin" /> : <Play />}
+              恢复
+            </Button>
+          ) : (
+            <Button
+              variant="outline"
+              onClick={() => run(pauseAutoSync, "自动同步已暂停到明天 00:00")}
+              disabled={busy || !settings}
+            >
+              {busy ? <Loader2 className="animate-spin" /> : <Pause />}
+              暂停到明天
+            </Button>
+          )
+        }
+      />
+    </Group>
   );
 }
 
-/** 换电脑自动同步：后台运行、离开 / 到达时同步、定时检查、通知、暂停 */
+/**
+ * 现在是否在忙：一键同步进行中、后台自动同步进行中、有项目处于"同步中"。
+ * 以后加上"正在克隆"，在这里补一个条件就行。
+ */
+function isAppBusy(sync: SyncState, autoSync: AutoSyncEvent | null, projects: Project[]): boolean {
+  return sync.phase === "running" || autoSync !== null || projects.some((p) => p.status === "syncing");
+}
+
+/** 「退出 SyncDeck」：没在做事直接退出，正在同步先确认；演示模式只弹提示 */
+function QuitRow() {
+  const { sync, autoSync, projects } = useProjects();
+  const [confirming, setConfirming] = useState(false);
+
+  async function quit() {
+    setConfirming(false);
+    try {
+      await api.quitApp();
+    } catch (e) {
+      toast.error("退出失败", { description: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  function onClick() {
+    if (api.isDemoMode) {
+      toast.info("演示模式不会真的退出");
+      return;
+    }
+    if (isAppBusy(sync, autoSync, projects)) setConfirming(true);
+    else void quit();
+  }
+
+  return (
+    <>
+      <Row
+        title="退出 SyncDeck"
+        description="彻底退出程序，托盘图标也会消失，之后不再自动同步，直到下次启动。"
+        control={
+          <Button variant="outline" onClick={onClick}>
+            <Power />
+            退出 SyncDeck
+          </Button>
+        }
+      />
+      <Dialog open={confirming} onOpenChange={setConfirming}>
+        <DialogContent showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>退出 SyncDeck</DialogTitle>
+            <DialogDescription>退出会中断正在进行的同步，确定退出吗？</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirming(false)}>
+              取消
+            </Button>
+            <Button variant="destructive" onClick={() => void quit()}>
+              退出
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+/** 换电脑自动同步：后台运行、离开 / 到达时同步、检查云端、通知、暂停 */
 function AutoSyncSection() {
   return (
-    <section className="space-y-3">
-      <h2 className="text-sm font-medium text-muted-foreground">自动同步</h2>
-      <SwitchCard title="后台运行" items={BACKGROUND_SWITCHES} />
-      <SwitchCard
+    <div className="space-y-6">
+      <SwitchGroup title="后台运行" items={BACKGROUND_SWITCHES} extra={<QuitRow />} />
+      <SwitchGroup
         title="离开这台电脑时同步"
         description="只推送本机还没推上去的提交（打开了自动提交的项目先提交再推送）；没有要推的就完全不联网。关机和睡眠前不同步，没推上去的下次开机、唤醒或解锁时补上。"
         items={LEAVE_SWITCHES}
       />
-      <SwitchCard
+      <SwitchGroup
         title="回到这台电脑时同步"
         description="对所有项目跑一遍一键同步：拉取云端的新提交，补推上次没推完的。同一种自动同步 10 分钟内只做一次。"
         items={ARRIVE_SWITCHES}
       />
-      <SwitchCard title="检查云端" items={CHECK_SWITCHES} />
-      <SwitchCard
+      <SwitchGroup title="检查云端" items={CHECK_SWITCHES} />
+      <SwitchGroup
         title="通知"
         description="只在后台自动同步和托盘「立即同步」之后发；窗口里点的一键同步直接看结果。"
         items={NOTIFY_SWITCHES}
       />
       <PauseCard />
-    </section>
+    </div>
   );
 }
 
-// ---------------- 自动提交 ----------------
+// ---------------- 提交与合并 ----------------
 
 /** 预览里电脑名的占位文字（还没读到设置时用） */
 const HOST_PREVIEW = "本机电脑名";
+
+function CommitAndMergeSection() {
+  return (
+    <div className="space-y-6">
+      <CommitTemplateCard />
+      <MergeAndCheckCard />
+    </div>
+  );
+}
 
 /** 自动提交的提交信息模板：失焦或回车保存，空值恢复默认；下面是本机名称（模板里的 {host}） */
 function CommitTemplateCard() {
@@ -520,69 +727,71 @@ function CommitTemplateCard() {
   }
 
   return (
-    <div className="rounded-lg border bg-card p-4">
-      <div className="text-sm font-medium">提交信息模板</div>
-      <p className="mt-0.5 text-xs text-muted-foreground">
-        在项目详情里打开"一键同步时自动提交"的项目，一键同步时会用这个格式提交所有改动并推送。
-      </p>
-      <div className="mt-3 flex gap-2">
-        <Input
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={() => save(draft)}
-          onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
-          placeholder={DEFAULT_COMMIT_TEMPLATE}
-          disabled={!settings}
-          className="font-mono"
-          aria-label="提交信息模板"
-        />
-        <Button
-          variant="outline"
-          // 不让输入框先失焦保存一次草稿
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => save(DEFAULT_COMMIT_TEMPLATE)}
-          disabled={!settings || (saved === DEFAULT_COMMIT_TEMPLATE && draft === saved)}
+    <div>
+      <GroupHeading title="自动提交" />
+      <Group>
+        <Row
+          title="提交信息模板"
+          description={'在项目详情里打开"一键同步时自动提交"的项目，一键同步时会用这个格式提交所有改动并推送。'}
         >
-          <RotateCcw />
-          恢复默认
-        </Button>
-      </div>
-      <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
-        <li>
-          <code className="rounded bg-muted px-1 py-px font-mono text-foreground/80">{"{date}"}</code>{" "}
-          同步时的本地时间，如 2026-10-07 14:30
-        </li>
-        <li>
-          <code className="rounded bg-muted px-1 py-px font-mono text-foreground/80">{"{host}"}</code>{" "}
-          这台电脑的名字，就是下面的"本机名称"
-        </li>
-      </ul>
-      <div className="mt-4 border-t pt-4">
-        <label htmlFor="host-name" className="text-sm font-medium">
-          本机名称
-        </label>
-        <p className="mt-0.5 text-xs text-muted-foreground">
-          如"家里台式机""学校笔记本"，在 GitHub 上一眼看出是哪台电脑提交的；不填就用电脑名
-          {settings?.defaultHostName ? ` ${settings.defaultHostName}` : ""}。
-        </p>
-        <Input
-          id="host-name"
-          value={hostDraft}
-          onChange={(e) => setHostDraft(e.target.value)}
-          onBlur={() => saveHost(hostDraft)}
-          onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
-          placeholder={settings?.defaultHostName ?? ""}
-          disabled={!settings}
-          maxLength={40}
-          className="mt-3 max-w-xs"
-        />
-      </div>
-      <div className="mt-3 rounded-md bg-muted/50 px-3 py-2 text-xs">
-        <span className="text-muted-foreground">预览：</span>
-        <span className="font-mono break-all select-text">
-          {renderCommitMessage(draft, new Date(), hostPreview)}
-        </span>
-      </div>
+          <div className="flex gap-2">
+            <Input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={() => save(draft)}
+              onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+              placeholder={DEFAULT_COMMIT_TEMPLATE}
+              disabled={!settings}
+              className="font-mono"
+              aria-label="提交信息模板"
+            />
+            <Button
+              variant="outline"
+              // 不让输入框先失焦保存一次草稿
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => save(DEFAULT_COMMIT_TEMPLATE)}
+              disabled={!settings || (saved === DEFAULT_COMMIT_TEMPLATE && draft === saved)}
+            >
+              <RotateCcw />
+              恢复默认
+            </Button>
+          </div>
+          <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
+            <li>
+              <code className="rounded bg-muted px-1 py-px font-mono text-foreground/80">{"{date}"}</code>{" "}
+              同步时的本地时间，如 2026-10-07 14:30
+            </li>
+            <li>
+              <code className="rounded bg-muted px-1 py-px font-mono text-foreground/80">{"{host}"}</code>{" "}
+              这台电脑的名字，就是下面的"本机名称"
+            </li>
+          </ul>
+          <div className="mt-3 rounded-md bg-muted/50 px-3 py-2 text-xs">
+            <span className="text-muted-foreground">预览：</span>
+            <span className="font-mono break-all select-text">
+              {renderCommitMessage(draft, new Date(), hostPreview)}
+            </span>
+          </div>
+        </Row>
+        <Row
+          title="本机名称"
+          htmlFor="host-name"
+          description={`如"家里台式机""学校笔记本"，在 GitHub 上一眼看出是哪台电脑提交的；不填就用电脑名${
+            settings?.defaultHostName ? ` ${settings.defaultHostName}` : ""
+          }。`}
+        >
+          <Input
+            id="host-name"
+            value={hostDraft}
+            onChange={(e) => setHostDraft(e.target.value)}
+            onBlur={() => saveHost(hostDraft)}
+            onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+            placeholder={settings?.defaultHostName ?? ""}
+            disabled={!settings}
+            maxLength={40}
+          />
+        </Row>
+      </Group>
     </div>
   );
 }
@@ -621,56 +830,59 @@ function MergeAndCheckCard() {
   const precommitCheck = settings?.precommitCheck ?? true;
 
   return (
-    <div className="divide-y rounded-lg border bg-card">
-      <div className="flex gap-2.5 p-4">
-        <Checkbox
-          id="setting-auto-merge"
-          checked={autoMerge}
-          disabled={!settings}
-          onCheckedChange={(c) =>
-            save({ autoMerge: c === true }, c === true ? "已打开无冲突时自动合并" : "已关闭自动合并")
+    <div>
+      <GroupHeading title="冲突与提交检查" />
+      <Group>
+        <Row
+          title="无冲突时自动合并"
+          htmlFor="setting-auto-merge"
+          description={
+            <div className="space-y-1">
+              <p>
+                本地和云端分叉时，一键同步先在内存里预演合并（不碰工作区）：没有冲突就自动合并并推送；有冲突就什么都不动，项目标红，可以在详情里「复制给
+                AI」。关掉后分叉照旧记为异常。
+              </p>
+              <p>
+                合并提交信息：
+                <span className="font-mono text-foreground/80 select-text">
+                  {MERGE_MESSAGE_TEMPLATE.split("{host}").join(HOST_PREVIEW)}
+                </span>
+              </p>
+            </div>
           }
-          className="mt-px"
-        />
-        <div className="min-w-0 space-y-1">
-          <Label htmlFor="setting-auto-merge" className="cursor-pointer">
-            无冲突时自动合并
-          </Label>
-          <p className="text-xs text-muted-foreground">
-            本地和云端分叉时，一键同步先在内存里预演合并（不碰工作区）：没有冲突就自动合并并推送；有冲突就什么都不动，项目标红，可以在详情里「复制给
-            AI」。关掉后分叉照旧记为异常。
-          </p>
-          <p className="text-xs text-muted-foreground">
-            合并提交信息：
-            <span className="font-mono text-foreground/80 select-text">
-              {MERGE_MESSAGE_TEMPLATE.split("{host}").join(HOST_PREVIEW)}
-            </span>
-          </p>
-        </div>
-      </div>
-
-      <div className="flex gap-2.5 p-4">
-        <Checkbox
-          id="setting-precommit-check"
-          checked={precommitCheck}
-          disabled={!settings}
-          onCheckedChange={(c) =>
-            save({ precommitCheck: c === true }, c === true ? "已打开提交前检查" : "已关闭提交前检查")
+          control={
+            <Checkbox
+              id="setting-auto-merge"
+              checked={autoMerge}
+              disabled={!settings}
+              onCheckedChange={(c) =>
+                save({ autoMerge: c === true }, c === true ? "已打开无冲突时自动合并" : "已关闭自动合并")
+              }
+              className="mt-px"
+            />
           }
-          className="mt-px"
         />
-        <div className="min-w-0 space-y-1">
-          <Label htmlFor="setting-precommit-check" className="cursor-pointer">
-            提交前检查
-          </Label>
-          <p className="text-xs text-muted-foreground">
-            自动提交前检查要提交的文件：有超过上限的大文件，或者没被 .gitignore 忽略的疑似密钥文件（.env、*.pem、*.key、id_rsa
-            等），这次就不提交，记为异常并列出文件。手动"提交并推送"不检查。
-          </p>
-          <div className="flex items-center gap-2 pt-2">
-            <Label htmlFor="setting-big-file-limit" className="text-xs font-normal text-muted-foreground">
-              大文件上限（MB）
-            </Label>
+        <Row
+          title="提交前检查"
+          htmlFor="setting-precommit-check"
+          description="自动提交前检查要提交的文件：有超过上限的大文件，或者没被 .gitignore 忽略的疑似密钥文件（.env、*.pem、*.key、id_rsa 等），这次就不提交，记为异常并列出文件。手动“提交并推送”不检查。"
+          control={
+            <Checkbox
+              id="setting-precommit-check"
+              checked={precommitCheck}
+              disabled={!settings}
+              onCheckedChange={(c) =>
+                save({ precommitCheck: c === true }, c === true ? "已打开提交前检查" : "已关闭提交前检查")
+              }
+              className="mt-px"
+            />
+          }
+        />
+        <Row
+          title="大文件上限（MB）"
+          htmlFor="setting-big-file-limit"
+          description="超过这个大小的文件不会被自动提交；需要先打开上面的“提交前检查”。"
+          control={
             <Input
               id="setting-big-file-limit"
               inputMode="numeric"
@@ -681,9 +893,9 @@ function MergeAndCheckCard() {
               disabled={!settings || !precommitCheck}
               className="h-8 w-24 font-mono"
             />
-          </div>
-        </div>
-      </div>
+          }
+        />
+      </Group>
     </div>
   );
 }
@@ -740,7 +952,6 @@ function ThemeCard({
     </button>
   );
 }
-
 
 // ---------------- 关于与应用更新 ----------------
 
@@ -803,51 +1014,44 @@ function AboutSection({ pendingUpdate }: { pendingUpdate: UpdateInfo | null }) {
   const showUpdate = update !== null && (phase === "available" || phase === "installing" || phase === "error");
 
   return (
-    <section className="space-y-3">
-      <h2 className="text-sm font-medium text-muted-foreground">关于</h2>
-      <div className="rounded-lg border bg-card p-4">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <div className="text-sm font-medium">Git SyncDeck</div>
-            <p className="mt-0.5 text-xs text-muted-foreground">当前版本 {version ? `v${version}` : "未知"}</p>
-          </div>
+    <Group>
+      <Row
+        title="Git SyncDeck"
+        description={`当前版本 ${version ? `v${version}` : "未知"}`}
+        control={
           <Button variant="outline" onClick={check} disabled={busy}>
             {phase === "checking" ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             {phase === "checking" ? "检查中…" : "检查更新"}
           </Button>
-        </div>
+        }
+      />
 
-        {phase === "latest" && (
-          <p className="mt-3 flex items-center gap-1.5 text-sm text-muted-foreground">
-            <Check className="size-4" />
-            已是最新版本
-          </p>
-        )}
+      {phase === "latest" && (
+        <p className="flex items-center gap-1.5 px-4 py-3 text-sm text-muted-foreground">
+          <Check className="size-4" />
+          已是最新版本
+        </p>
+      )}
 
-        {phase === "error" && error && (
-          <p className="mt-3 flex items-start gap-1.5 text-sm text-destructive">
-            <CircleAlert className="mt-0.5 size-4 shrink-0" />
-            <span className="min-w-0 break-words">检查或安装更新失败：{error}</span>
-          </p>
-        )}
+      {phase === "error" && error && (
+        <p className="flex items-start gap-1.5 px-4 py-3 text-sm text-destructive">
+          <CircleAlert className="mt-0.5 size-4 shrink-0" />
+          <span className="min-w-0 break-words">检查或安装更新失败：{error}</span>
+        </p>
+      )}
 
-        {showUpdate && update && (
-          <div className="mt-4 space-y-3 border-t pt-4">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <div className="text-sm font-medium">发现新版本 v{update.version}</div>
-                {update.date && (
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    发布于 {new Date(update.date).toLocaleDateString("zh-CN")}
-                  </p>
-                )}
-              </div>
-              <Button onClick={install} disabled={busy}>
-                {phase === "installing" ? <Loader2 className="animate-spin" /> : <Download />}
-                {phase === "installing" ? "正在下载…" : "下载并安装"}
-              </Button>
-            </div>
-
+      {showUpdate && update && (
+        <Row
+          title={`发现新版本 v${update.version}`}
+          description={update.date ? `发布于 ${new Date(update.date).toLocaleDateString("zh-CN")}` : undefined}
+          control={
+            <Button onClick={install} disabled={busy}>
+              {phase === "installing" ? <Loader2 className="animate-spin" /> : <Download />}
+              {phase === "installing" ? "正在下载…" : "下载并安装"}
+            </Button>
+          }
+        >
+          <div className="space-y-3">
             {update.notes && (
               <div>
                 <div className="text-xs font-medium text-muted-foreground">更新说明</div>
@@ -868,8 +1072,8 @@ function AboutSection({ pendingUpdate }: { pendingUpdate: UpdateInfo | null }) {
               </div>
             )}
           </div>
-        )}
-      </div>
-    </section>
+        </Row>
+      )}
+    </Group>
   );
 }

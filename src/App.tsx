@@ -7,7 +7,7 @@ import { Sidebar, type Page } from "@/components/layout/Sidebar";
 import { SyncDialog } from "@/components/sync/SyncDialog";
 import { HomePage } from "@/pages/HomePage";
 import { AddProjectsPage } from "@/pages/AddProjectsPage";
-import { SettingsPage } from "@/pages/SettingsPage";
+import { SettingsPage, type SettingsCategory } from "@/pages/SettingsPage";
 import { ProjectsProvider } from "@/state/projects";
 import { SettingsProvider, useSettings } from "@/state/settings";
 import type { UpdateInfo } from "@/types";
@@ -26,6 +26,8 @@ export default function App() {
 
 function Shell() {
   const [page, setPage] = useState<Page>("home");
+  // 设置页停在哪一类：只记在内存里，切到别的页面再回来还是上次看的；第一次是「常规」
+  const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>("general");
   const { settings } = useSettings();
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const checkedRef = useRef(false);
@@ -41,7 +43,13 @@ function Shell() {
         toast(`发现新版本 v${info.version}`, {
           description: `当前版本 v${info.currentVersion}，可以在设置页下载并安装。`,
           duration: 12000,
-          action: { label: "去更新", onClick: () => setPage("settings") },
+          action: {
+            label: "去更新",
+            onClick: () => {
+              setSettingsCategory("about");
+              setPage("settings");
+            },
+          },
         });
       },
       () => {},
@@ -56,7 +64,13 @@ function Shell() {
         <div className="mx-auto max-w-5xl px-6 py-6 wide:px-8">
           {page === "home" && <HomePage onAddProjects={() => setPage("add")} />}
           {page === "add" && <AddProjectsPage />}
-          {page === "settings" && <SettingsPage pendingUpdate={update} />}
+          {page === "settings" && (
+            <SettingsPage
+              pendingUpdate={update}
+              category={settingsCategory}
+              onCategoryChange={setSettingsCategory}
+            />
+          )}
         </div>
       </main>
       <SyncDialog />

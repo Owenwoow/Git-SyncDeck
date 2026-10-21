@@ -38,6 +38,7 @@ export const {
   pauseAutoSync,
   resumeAutoSync,
   getAutoSyncState,
+  quitApp,
   onProjectsChanged,
   onAutoSync,
   getAppVersion,
