@@ -1107,8 +1107,14 @@ async fn clone_one(st: &AppState, dir: &Path, req: &CloneRequest, sink: &CloneSi
         return Err(format!("文件夹名不合法：{}", req.name));
     }
     let target = dir.join(&req.name);
-    if target.exists() {
-        return Err(format!("文件夹已存在：{}，没有覆盖", target.display()));
+    // 先自己建好空的目标文件夹（已存在就失败，git 接受空文件夹作为克隆目标）：
+    // 检查和新建是同一步，同一批里同名的两个仓库并发克隆时，失败的那个不会删掉另一个刚克隆好的
+    match std::fs::create_dir(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("文件夹已存在：{}，没有覆盖", target.display()));
+        }
+        Err(e) => return Err(format!("无法新建文件夹 {}：{e}", target.display())),
     }
     let target_str = target.to_string_lossy().into_owned();
     let (cb_sink, cb_url) = (sink.clone(), req.url.clone());
@@ -1117,7 +1123,7 @@ async fn clone_one(st: &AppState, dir: &Path, req: &CloneRequest, sink: &CloneSi
     };
     let args = ["clone", "--progress", req.url.as_str(), target_str.as_str()];
     if let Err(e) = crate::git::run_git_progress(dir, &args, crate::git::network_timeout(), &on_progress).await {
-        // 超时或中途失败可能留下半截文件夹：目标是这次新建的（开始前不存在），只删这一个
+        // 超时或中途失败可能留下半截文件夹：目标是上面这次新建的，只删这一个
         let _ = std::fs::remove_dir_all(&target);
         return Err(clone_error_text(&e));
     }
