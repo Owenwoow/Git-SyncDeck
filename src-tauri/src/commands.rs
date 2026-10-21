@@ -23,6 +23,7 @@ use crate::git::{
     proxy_from_env, refresh_timeout, set_network_timeout, set_proxy_plan, ProxyOverride, ProxyPlan,
     DEFAULT_NETWORK_TIMEOUT_SECS, NETWORK_TIMEOUT_CHOICES,
 };
+use crate::github::{self, GhStatus};
 use crate::ops::GitProxyConfig;
 use crate::util::SystemProxy;
 use crate::url::{display_proxy, validate_proxy_url};
@@ -722,11 +723,7 @@ pub async fn open_in_editor(state: State<'_, Shared>, project_id: String) -> Res
 fn settings_of(c: &AppConfig, proxy: &ResolvedProxy) -> Settings {
     let sw = Switches::from_stored(&c.settings);
     Settings {
-        default_code_dir: c
-            .settings
-            .default_code_dir
-            .clone()
-            .unwrap_or_else(|| std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into())),
+        default_code_dir: code_dir_of(c),
         theme: c.settings.theme.clone(),
         commit_template: commit_template_of(c),
         network_timeout_secs: network_timeout_of(c),
@@ -942,9 +939,235 @@ pub fn quit_app<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     crate::tray::quit(&app);
 }
 
+// ---------------- 从 GitHub 克隆 ----------------
+
+/// 默认代码目录（没设置过时是用户目录）
+fn code_dir_of(c: &AppConfig) -> String {
+    c.settings
+        .default_code_dir
+        .clone()
+        .unwrap_or_else(|| std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into()))
+}
+
+/// 打开「从 GitHub 克隆」时的默认值：上次输入的地址、gh 登录的账号、默认代码目录
+#[tauri::command]
+pub async fn get_clone_defaults(state: State<'_, Shared>) -> Result<CloneDefaults, String> {
+    let st = state.inner().clone();
+    refresh_proxy(&st).await;
+    let gh_login = match github::gh_status().await {
+        GhStatus::LoggedIn(login) => Some(login),
+        _ => None,
+    };
+    Ok(st.config.read(|c| CloneDefaults {
+        last_input: c.settings.github_source.clone(),
+        gh_login,
+        default_code_dir: code_dir_of(c),
+    }))
+}
+
+/// 本地已有的仓库：默认代码目录下扫描到的 + 监控清单里的，按规范化后的远程地址对应到路径
+async fn local_remotes(st: &AppState, code_dir: &str) -> HashMap<String, String> {
+    let mut paths: Vec<String> = st.config.read(|c| c.projects.iter().map(|p| p.path.clone()).collect());
+    let root = PathBuf::from(normalize_path(code_dir));
+    if root.is_dir() {
+        let found = tokio::task::spawn_blocking(move || scan::find_repos(&root)).await.unwrap_or_default();
+        for p in found {
+            let p = p.to_string_lossy().into_owned();
+            if !paths.iter().any(|x| same_path(x, &p)) {
+                paths.push(p);
+            }
+        }
+    }
+    let briefs = map_limited(paths, CONCURRENCY, |path| async move {
+        let (_, remote) = ops::repo_brief(Path::new(&path)).await;
+        (path, remote)
+    })
+    .await;
+    let mut map = HashMap::new();
+    for (path, remote) in briefs {
+        if let Some(url) = remote {
+            map.entry(github::normalize_remote(&url)).or_insert(path);
+        }
+    }
+    map
+}
+
+/// 公开接口列仓库，失败翻成人话
+async fn list_public(source: &github::Source) -> Result<Vec<GithubRepo>, String> {
+    github::public_list(source).await.map_err(|e| github::public_error_text(&e, source))
+}
+
+/// 列出 GitHub 账号名下的仓库（或单个仓库）。优先用 gh（能看到私有仓库），没装 / 没登录 / 失败时退到公开接口
+#[tauri::command]
+pub async fn list_github_repos(state: State<'_, Shared>, input: String) -> Result<GithubListing, String> {
+    let st = state.inner().clone();
+    let source = github::parse_source(&input)?;
+    refresh_proxy(&st).await;
+    let saved = input.trim().to_string();
+    st.config.update(|c| c.settings.github_source = Some(saved))?;
+
+    let (repos, kind, notice) = match github::gh_status().await {
+        GhStatus::LoggedIn(_) => match github::gh_list(&source).await {
+            Ok(repos) => (repos, "gh", None),
+            Err(e) => {
+                let notice = format!("gh 列出仓库失败（{}），已改用公开接口，只能看到公开仓库", e.message());
+                (list_public(&source).await?, "public", Some(notice))
+            }
+        },
+        GhStatus::NotLoggedIn => (
+            list_public(&source).await?,
+            "public",
+            Some("gh 还没登录：运行 gh auth login 后能看到私有仓库".to_string()),
+        ),
+        GhStatus::Missing => (
+            list_public(&source).await?,
+            "public",
+            Some("装好 GitHub CLI（gh）并运行 gh auth login 后能看到私有仓库".to_string()),
+        ),
+    };
+
+    let code_dir = st.config.read(code_dir_of);
+    let locals = local_remotes(&st, &code_dir).await;
+    let repos = repos
+        .into_iter()
+        .map(|repo| {
+            let target = PathBuf::from(normalize_path(&code_dir)).join(&repo.name);
+            GithubRepoEntry {
+                local: locals.get(&github::normalize_remote(&repo.clone_url)).cloned(),
+                target: target.to_string_lossy().into_owned(),
+                target_exists: target.exists(),
+                repo,
+            }
+        })
+        .collect();
+    Ok(GithubListing { owner: source.owner().to_string(), repos, source: kind.to_string(), notice })
+}
+
+/// 克隆进度的回调（前端的 Channel）
+pub type CloneSink = Arc<dyn Fn(CloneProgressEvent) + Send + Sync>;
+
+/// 同时克隆的仓库数上限
+const CLONE_CONCURRENCY: usize = 3;
+
+/// 私有仓库没有凭据时的提示
+const CLONE_AUTH_HINT: &str = "如果是私有仓库，请先在命令行里用 git 登录一次 GitHub（比如 git clone 一次或 gh auth login 后按提示配置 git），SyncDeck 不会替你改 git 的全局配置";
+
+/// 克隆失败的原因（已去掉账号）；认证失败 / 找不到仓库时补一句私有仓库的提示
+pub fn clone_error_text(err: &crate::git::GitError) -> String {
+    let msg = err.message();
+    if let crate::git::GitError::Failed { stderr, .. } = err {
+        let lower = stderr.to_lowercase();
+        if ["authentication failed", "could not read username", "repository not found"].iter().any(|k| lower.contains(k)) {
+            return format!("{msg}\n{CLONE_AUTH_HINT}");
+        }
+    }
+    msg
+}
+
+/// 克隆到默认代码目录，完成后加入监控并联网检查一次。进度通过 Channel 推给前端
+#[tauri::command]
+pub async fn clone_repos(
+    state: State<'_, Shared>,
+    items: Vec<CloneRequest>,
+    on_event: Channel<CloneProgressEvent>,
+) -> Result<Vec<CloneResult>, String> {
+    run_clone(state.inner(), items, Arc::new(move |e| {
+        let _ = on_event.send(e);
+    }))
+    .await
+}
+
+pub async fn run_clone(st: &Shared, items: Vec<CloneRequest>, sink: CloneSink) -> Result<Vec<CloneResult>, String> {
+    // 和刷新、一键同步互斥
+    let _net = st.net_lock.lock().await;
+    refresh_proxy(st).await;
+    let code_dir = PathBuf::from(normalize_path(&st.config.read(code_dir_of)));
+    if !code_dir.is_dir() {
+        return Err(format!("默认代码目录不存在：{}，请先在设置里改一下", code_dir.display()));
+    }
+    let st = st.clone();
+    Ok(map_limited(items, CLONE_CONCURRENCY, move |req| {
+        let (st, sink, dir) = (st.clone(), sink.clone(), code_dir.clone());
+        async move {
+            sink(CloneProgressEvent::Start { url: req.url.clone() });
+            let outcome = clone_one(&st, &dir, &req, &sink).await;
+            let (ok, error, project) = match outcome {
+                Ok(p) => (true, None, Some(p)),
+                Err(e) => (false, Some(e), None),
+            };
+            sink(CloneProgressEvent::Done { url: req.url.clone(), ok, error: error.clone(), project: project.clone() });
+            CloneResult { url: req.url, name: req.name, ok, error, project }
+        }
+    })
+    .await)
+}
+
+async fn clone_one(st: &AppState, dir: &Path, req: &CloneRequest, sink: &CloneSink) -> Result<Project, String> {
+    if !github::valid_repo_name(&req.name) {
+        return Err(format!("文件夹名不合法：{}", req.name));
+    }
+    let target = dir.join(&req.name);
+    // 先自己建好空的目标文件夹（已存在就失败，git 接受空文件夹作为克隆目标）：
+    // 检查和新建是同一步，同一批里同名的两个仓库并发克隆时，失败的那个不会删掉另一个刚克隆好的
+    match std::fs::create_dir(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("文件夹已存在：{}，没有覆盖", target.display()));
+        }
+        Err(e) => return Err(format!("无法新建文件夹 {}：{e}", target.display())),
+    }
+    let target_str = target.to_string_lossy().into_owned();
+    let (cb_sink, cb_url) = (sink.clone(), req.url.clone());
+    let on_progress = move |p: GitProgress| {
+        cb_sink(CloneProgressEvent::Progress { url: cb_url.clone(), phase: p.phase, percent: p.percent })
+    };
+    let args = ["clone", "--progress", req.url.as_str(), target_str.as_str()];
+    if let Err(e) = crate::git::run_git_progress(dir, &args, crate::git::network_timeout(), &on_progress).await {
+        // 超时或中途失败可能留下半截文件夹：目标是上面这次新建的，只删这一个
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(clone_error_text(&e));
+    }
+
+    let path = normalize_path(&target_str);
+    let sp = st.config.update(|c| {
+        if let Some(existing) = c.projects.iter().find(|p| same_path(&p.path, &path)) {
+            return existing.clone();
+        }
+        let sp = StoredProject { id: project_id(&path), path, last_sync_at: None, issue: None, auto_commit: false };
+        c.projects.push(sp.clone());
+        sp
+    })?;
+    match remote_project(st, &sp).await {
+        Some(p) => Ok(p),
+        None => Ok(local_project(st, &sp).await),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_error_hint_only_for_auth_failures() {
+        use crate::git::GitError;
+        let failed = |stderr: &str| GitError::Failed {
+            command: "clone".into(),
+            code: Some(128),
+            stderr: stderr.into(),
+            stdout: String::new(),
+        };
+        for s in [
+            "remote: Repository not found.\nfatal: repository 'https://github.com/a/b.git/' not found",
+            "fatal: Authentication failed for 'https://github.com/a/b.git/'",
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        ] {
+            let text = clone_error_text(&failed(s));
+            assert!(text.contains("如果是私有仓库") && text.contains(s.lines().next().unwrap()), "{text}");
+        }
+        let text = clone_error_text(&failed("fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host"));
+        assert!(!text.contains("私有仓库"), "{text}");
+        assert!(!clone_error_text(&GitError::Timeout { command: "clone".into(), secs: 180 }).contains("私有仓库"));
+    }
 
     #[test]
     fn skip_fetch_only_right_after_successful_check() {

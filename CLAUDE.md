@@ -33,7 +33,8 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 
 ### Rust 端
 
-- **所有 git 子进程只能从 `git.rs` 的 `run_git` 创建**。它负责：不弹窗口（`CREATE_NO_WINDOW`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`）、超时（状态查询 10 秒；联网默认 180 秒，设置里可改，见 `network_timeout()`）、UTF-8 加 `core.quotepath=false`，还有**命令白名单**。force push、reset、rebase、stash、clean、checkout、restore、`merge -s/-X/--squash` 等一律拒绝，有单元测试覆盖。新增 git 操作要先扩白名单、再补测试。不需要仓库目录的例外只有 `--version` 和读代理配置的 `config --global|--system -z --get-regexp ^http\.(.+\.)?proxy$`。
+- **所有 git 子进程只能从 `git.rs` 的 `run_git` / `run_git_progress` 创建**（后者边运行边读 stderr，把 `--progress` 输出解析成阶段和百分比，中英文提示都认，200 毫秒节流）。它负责：不弹窗口（`CREATE_NO_WINDOW`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`）、超时（状态查询 10 秒；联网默认 180 秒，设置里可改，见 `network_timeout()`）、UTF-8 加 `core.quotepath=false`，还有**命令白名单**。force push、reset、rebase、stash、clean、checkout、restore、`merge -s/-X/--squash` 等一律拒绝，有单元测试覆盖。新增 git 操作要先扩白名单、再补测试。不需要仓库目录的例外只有 `--version`、读代理配置的 `config --global|--system -z --get-regexp ^http\.(.+\.)?proxy$`，以及克隆 `clone --progress|--quiet <https 地址或本机绝对路径> <目标>`（地址不许有 `::`，其他参数一律拒绝）。
+- `github.rs`：「从 GitHub 克隆」用的 `gh` 和 Windows 自带 `curl.exe` 子进程只从这里创建，同样不弹窗、有超时、走 SyncDeck 的代理，并各有白名单：gh 只许 `api user --jq .login`、`repo list|view … --json <固定字段>`（不许 auth、setup-git 等），curl 只许不带凭据请求 `api.github.com` 的两种公开地址。SyncDeck 不读取、不保存任何令牌。
 - 代理：`git.rs` 的 `ProxyPlan` 决定给 `run_git` 加 `-c http.proxy=…`（以及覆盖 `http.<网址>.proxy`，它比 `-c http.proxy` 优先）和子进程环境变量；用系统代理时把注册表的绕过列表转成 `NO_PROXY`。每轮刷新 / 同步前由 `commands::refresh_proxy` 重新解析。
 - `status.rs` 解析 `git status --porcelain=v2`，按固定优先级判定 7 种状态：未关联云端 > 有未提交改动 > 分叉 > 待推送 > 待拉取 > 已同步（"同步中"只在前端出现）。
 - `ops.rs`：fetch / push（显式 refspec，不带 `+`）/ `pull --ff-only --no-rebase --no-autostash` / 提交并推送 / 最近提交。分叉时先用 `merge-tree --write-tree` 预演，无冲突才 `merge --no-edit`，合并后用 `verify_merge` 核对（无 MERGE_HEAD、两个父提交、树哈希和预演一致）才推送；配了 `branch.<分支>.mergeoptions` 的不自动合并。自动提交先本地提交再按分叉处理，提交前检查大文件和疑似密钥文件。`ops::SyncOptions` 是同步选项，只由 `commands::sync_options_for` 构造。
@@ -57,7 +58,7 @@ Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界�
 ## 项目约束
 
 - **测试只用临时仓库**（`make-test-repos.mjs` 生成的），不要对用户真实项目跑 push / pull / commit。
-- 不修改用户的全局 git 配置（包括 `safe.directory`），不读写凭据；取消监控只改清单，不删除任何文件。
+- 不修改用户的全局 git 配置（包括 `safe.directory`），不读写凭据；取消监控只改清单，不删除任何文件。唯一的例外：克隆失败或超时时，删掉**这次克隆自己新建的**目标文件夹（克隆前用 `create_dir` 新建，已存在就不克隆、不覆盖）。
 - 开发服务器固定监听 `127.0.0.1:1420`（`strictPort`）：部分 Windows 机器上 `localhost` 只解析到 `::1`，Tauri CLI 会一直等不到开发服务器。
 - 调试时用环境变量 `SYNCDECK_CONFIG_DIR` 指定配置目录，以免改到真实配置 `%APPDATA%\com.gitsyncdeck.desktop\config.json`。
 - 发布：先写这个版本的发布说明 `docs/release-notes/v<版本>.md`（每个版本单独写，流水线缺这个文件会直接失败），再把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 三处的版本号改成同一个，一起提交，然后推 `v*` 标签。`.github/workflows/release.yml` 会先跑测试，再构建 Windows 安装包并发布到 Releases，同时上传应用内更新用的 `latest.json` 和 `.sig`（需要仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`）。`tauri.conf.json` 里的 updater 公钥和这把私钥是一对，换私钥等于让所有已安装版本收不到更新。

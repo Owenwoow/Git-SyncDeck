@@ -2,6 +2,7 @@ pub mod autosync;
 pub mod commands;
 pub mod config;
 pub mod git;
+pub mod github;
 pub mod model;
 pub mod ops;
 pub mod scan;
@@ -196,6 +197,9 @@ pub fn run() {
             commands::resume_auto_sync,
             commands::get_auto_sync_state,
             commands::quit_app,
+            commands::get_clone_defaults,
+            commands::list_github_repos,
+            commands::clone_repos,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

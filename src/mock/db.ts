@@ -24,6 +24,11 @@ export const db = {
     const key = path.toLowerCase();
     return [...repos.values()].find((p) => p.path.toLowerCase() === key);
   },
+  /** 新增一个"磁盘上"的仓库（克隆演示用） */
+  addRepo(repo: Project): Project {
+    repos.set(repo.id, structuredClone(repo));
+    return repo;
+  },
   updateRepo(id: string, patch: Partial<Project>): Project {
     const current = repos.get(id);
     if (!current) throw new Error(`找不到项目 ${id}`);

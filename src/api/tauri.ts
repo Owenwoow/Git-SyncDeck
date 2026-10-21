@@ -9,8 +9,13 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import type {
   AutoSyncEvent,
   AutoSyncState,
+  CloneDefaults,
+  CloneProgressEvent,
+  CloneRequest,
+  CloneResult,
   DiagnosticInfo,
   GitInfo,
+  GithubListing,
   Project,
   RefreshProgressEvent,
   ScannedRepo,
@@ -82,6 +87,28 @@ export function syncAll(onProgress: (e: SyncProgressEvent) => void): Promise<Syn
   const onEvent = new Channel<SyncProgressEvent>();
   onEvent.onmessage = onProgress;
   return call("sync_all", { onEvent });
+}
+
+// ---------------- 从 GitHub 克隆 ----------------
+
+/** 打开「从 GitHub 克隆」时的默认值：上次输入的地址、gh 登录的账号、默认代码目录 */
+export function getCloneDefaults(): Promise<CloneDefaults> {
+  return call("get_clone_defaults");
+}
+
+/** 列出 GitHub 账号名下的仓库（或单个仓库）；输入可以是账号主页、用户名或仓库地址 */
+export function listGithubRepos(input: string): Promise<GithubListing> {
+  return call("list_github_repos", { input });
+}
+
+/** 克隆到默认代码目录并加入监控；进度通过 Tauri Channel 实时推送，一个失败不影响其他 */
+export function cloneRepos(
+  items: CloneRequest[],
+  onProgress: (e: CloneProgressEvent) => void,
+): Promise<CloneResult[]> {
+  const onEvent = new Channel<CloneProgressEvent>();
+  onEvent.onmessage = onProgress;
+  return call("clone_repos", { items, onEvent });
 }
 
 export function commitAndPush(projectId: string, message: string): Promise<Project> {
