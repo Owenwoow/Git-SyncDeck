@@ -191,6 +191,7 @@ pub fn run() {
             commands::get_diagnostic_info,
             commands::open_in_terminal,
             commands::open_in_editor,
+            commands::open_project_homepage,
             commands::get_settings,
             commands::save_settings,
             commands::pause_auto_sync,

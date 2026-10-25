@@ -35,6 +35,7 @@ export const {
   getAiPromptText,
   openInTerminal,
   openInEditor,
+  openProjectHomepage,
   getSettings,
   saveSettings,
   onSettingsChanged,

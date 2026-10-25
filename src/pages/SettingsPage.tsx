@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { Check, CircleAlert, Download, FolderSearch, Loader2, Pause, Play, Power, RefreshCw, RotateCcw } from "lucide-react";
+import { Check, CircleAlert, Download, ExternalLink, FolderSearch, Loader2, Pause, Play, Power, RefreshCw, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
 import { Button } from "@/components/ui/button";
@@ -1031,6 +1031,21 @@ function AboutSection({ pendingUpdate }: { pendingUpdate: UpdateInfo | null }) {
           已是最新版本
         </p>
       )}
+
+      <Row
+        title="GitHub 仓库"
+        description="Owenwoow/Git-SyncDeck"
+        control={
+          <Button variant="outline" onClick={() => {
+            api.openProjectHomepage().catch((e: unknown) => {
+              toast.error(e instanceof Error ? e.message : String(e));
+            });
+          }}>
+            <ExternalLink />
+            访问仓库
+          </Button>
+        }
+      />
 
       {phase === "error" && error && (
         <p className="flex items-start gap-1.5 px-4 py-3 text-sm text-destructive">

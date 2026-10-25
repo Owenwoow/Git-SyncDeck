@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react
 import { AlertCircle, Check, CircleDashed, Info, Loader2, ListFilter, Search, X } from "lucide-react";
 import { toast } from "sonner";
 import * as api from "@/api";
-import { FilterChip } from "@/components/projects/ProjectToolbar";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -25,42 +24,6 @@ function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-type TypeFilter = "all" | "missing" | "local" | "private" | "public" | "fork" | "archived";
-/** 最近多少天内有过推送；"all" 不限 */
-type TimeFilter = "all" | 30 | 90 | 365;
-
-const TYPE_FILTERS: { key: Exclude<TypeFilter, "all">; label: string; match: (e: GithubRepoEntry) => boolean }[] = [
-  { key: "missing", label: "未在本地", match: (e) => !e.local },
-  { key: "local", label: "已在本地", match: (e) => !!e.local },
-  { key: "private", label: "私有", match: (e) => e.repo.private },
-  { key: "public", label: "公开", match: (e) => !e.repo.private },
-  { key: "fork", label: "fork", match: (e) => e.repo.fork },
-  { key: "archived", label: "已归档", match: (e) => e.repo.archived },
-];
-
-const TIME_FILTERS: { days: Exclude<TimeFilter, "all">; label: string }[] = [
-  { days: 30, label: "30 天内" },
-  { days: 90, label: "90 天内" },
-  { days: 365, label: "一年内" },
-];
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-function matchesType(e: GithubRepoEntry, filter: TypeFilter): boolean {
-  return filter === "all" || TYPE_FILTERS.some((f) => f.key === filter && f.match(e));
-}
-
-/** 按 GitHub 记录的最近一次推送时间筛选；没有推送时间的只在"全部"里出现 */
-function pushedWithin(e: GithubRepoEntry, filter: TimeFilter, now: number): boolean {
-  if (filter === "all") return true;
-  const t = e.repo.pushedAt ? Date.parse(e.repo.pushedAt) : Number.NaN;
-  return !Number.isNaN(t) && now - t <= filter * DAY_MS;
-}
-
-function matchesQuery(e: GithubRepoEntry, q: string): boolean {
-  return !q || [e.repo.name, e.repo.description ?? ""].some((s) => s.toLowerCase().includes(q));
-}
-
 /** 从 GitHub 克隆：填账号主页（或用户名、仓库地址）→ 列出仓库 → 勾选 → 克隆到默认代码目录并加入监控 */
 export function GithubCloneTab() {
   const { settings } = useSettings();
@@ -75,8 +38,6 @@ export function GithubCloneTab() {
   /** 勾选的仓库（克隆地址） */
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
-  const [timeFilter, setTimeFilter] = useState<TimeFilter>("all");
 
   // 第一次打开：输入框优先填上次的地址，没有就填 gh 登录的账号
   useEffect(() => {
@@ -118,30 +79,17 @@ export function GithubCloneTab() {
   function submit(ev: FormEvent) {
     ev.preventDefault();
     if (!input.trim() || loading || clone.running) return;
-    clearFilters();
-    void list(input.trim(), false);
-  }
-
-  function clearFilters() {
     setQuery("");
-    setTypeFilter("all");
-    setTimeFilter("all");
+    void list(input.trim(), false);
   }
 
   const entries = listing?.repos ?? [];
   const selectable = useMemo(() => entries.filter((e) => !unselectableReason(e)), [entries]);
-  // "30 天内"按列出仓库的那一刻算
-  const listedAt = useMemo(() => Date.now(), [listing]);
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return entries.filter(
-      (e) => matchesType(e, typeFilter) && pushedWithin(e, timeFilter, listedAt) && matchesQuery(e, q),
-    );
-  }, [entries, query, typeFilter, timeFilter, listedAt]);
-  const filtering = query.trim() !== "" || typeFilter !== "all" || timeFilter !== "all";
-  // 类型的数量按当前时间范围算，时间的数量按当前类型算，和列表对得上；搜索框不影响数量
-  const inTime = entries.filter((e) => pushedWithin(e, timeFilter, listedAt));
-  const ofType = entries.filter((e) => matchesType(e, typeFilter));
+    if (!q) return entries;
+    return entries.filter((e) => [e.repo.name, e.repo.description ?? ""].some((s) => s.toLowerCase().includes(q)));
+  }, [entries, query]);
   const visibleSelectable = visible.filter((e) => !unselectableReason(e));
   const allVisibleChecked = visibleSelectable.length > 0 && visibleSelectable.every((e) => checked.has(e.repo.cloneUrl));
   const chosen = selectable.filter((e) => checked.has(e.repo.cloneUrl));
@@ -254,7 +202,7 @@ export function GithubCloneTab() {
                   </button>
                 )}
               </div>
-              {filtering && (
+              {query.trim() && (
                 <span className="text-xs text-muted-foreground">
                   匹配 {visible.length} / {entries.length} 个
                 </span>
@@ -271,57 +219,15 @@ export function GithubCloneTab() {
             </div>
           )}
 
-          {entries.length > 0 && (
-            // 筛选只影响显示，不影响勾选；「全选可克隆的」只管筛选后看得到的
-            <div className="mb-3 space-y-1.5">
-              <div className="flex flex-wrap items-center gap-1" role="radiogroup" aria-label="按类型筛选">
-                <span className="w-14 shrink-0 text-xs text-muted-foreground">类型</span>
-                <FilterChip
-                  active={typeFilter === "all"}
-                  onClick={() => setTypeFilter("all")}
-                  label="全部"
-                  count={inTime.length}
-                />
-                {TYPE_FILTERS.map((f) => (
-                  <FilterChip
-                    key={f.key}
-                    active={typeFilter === f.key}
-                    onClick={() => setTypeFilter(f.key)}
-                    label={f.label}
-                    count={inTime.filter(f.match).length}
-                  />
-                ))}
-              </div>
-              <div className="flex flex-wrap items-center gap-1" role="radiogroup" aria-label="按最近推送时间筛选">
-                <span className="w-14 shrink-0 text-xs text-muted-foreground">最近推送</span>
-                <FilterChip
-                  active={timeFilter === "all"}
-                  onClick={() => setTimeFilter("all")}
-                  label="全部"
-                  count={ofType.length}
-                />
-                {TIME_FILTERS.map((f) => (
-                  <FilterChip
-                    key={f.days}
-                    active={timeFilter === f.days}
-                    onClick={() => setTimeFilter(f.days)}
-                    label={f.label}
-                    count={ofType.filter((e) => pushedWithin(e, f.days, listedAt)).length}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
           {entries.length === 0 ? (
             <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
               这个账号下没有仓库
             </div>
           ) : visible.length === 0 ? (
             <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
-              没有符合筛选条件的仓库
-              <Button variant="link" size="sm" onClick={clearFilters}>
-                清除筛选
+              没有匹配"{query.trim()}"的仓库
+              <Button variant="link" size="sm" onClick={() => setQuery("")}>
+                清除搜索
               </Button>
             </div>
           ) : (

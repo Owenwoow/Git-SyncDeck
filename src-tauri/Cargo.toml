@@ -1,6 +1,6 @@
 [package]
 name = "git-syncdeck"
-version = "0.7.0"
+version = "0.7.1"
 description = "Git SyncDeck - 统一管理多个本地 Git 项目与 GitHub 的同步状态"
 authors = ["Owenwoow"]
 edition = "2021"
@@ -43,6 +43,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_RemoteDesktop",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]

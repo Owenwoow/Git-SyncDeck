@@ -1,4 +1,4 @@
-//! 打开终端 / VS Code。这里启动的是给用户看的窗口，所以不加 CREATE_NO_WINDOW。
+//! 打开终端 / VS Code / 项目主页。这里启动的是给用户看的窗口。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,6 +8,33 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+/// 只打开固定的项目主页，不接受前端传入网址或命令。
+pub fn open_project_homepage() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        let url: Vec<u16> = "https://github.com/Owenwoow/Git-SyncDeck\0".encode_utf16().collect();
+        // ShellExecuteW 交给系统默认浏览器；返回值大于 32 表示启动成功。
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                url.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+        if result > 32 {
+            Ok(())
+        } else {
+            Err(format!("无法打开默认浏览器（系统错误码：{result}），请手动访问 https://github.com/Owenwoow/Git-SyncDeck"))
+        }
+    }
+    #[cfg(not(windows))]
+    Err("此功能仅支持 Windows，请手动访问 https://github.com/Owenwoow/Git-SyncDeck".into())
+}
 
 /// 终端优先用 Windows Terminal（wt -d 路径），没有则用 cmd
 pub fn open_terminal(dir: &Path) -> Result<(), String> {
