@@ -1,0 +1,71 @@
+@~/.Codex/workflows/dev-collab.md
+
+# AGENTS.md
+
+This file provides guidance to Codex (claude.ai/code) when working with code in this repository.
+
+# Git SyncDeck
+
+Windows 桌面工具（Tauri 2 + React 19 + TypeScript + Rust）：在一个界面里查看多个本地 Git 项目与 GitHub 的同步状态，并一键推送/拉取。界面文案全部是简体中文。需求和第二阶段的实现决定见 `docs/requirements.md`，用户文档见 `README.md`。
+
+## 常用命令
+
+- 安装依赖：`npm install`
+- 启动（桌面窗口 + 真实数据）：`npm run tauri dev`
+- 启动（假数据）：`npm run tauri:mock`（桌面窗口），`npm run dev:mock`（浏览器，http://127.0.0.1:1420）
+- 类型检查 + 前端构建：`npm run build`（没有 ESLint，`tsc` 就是代码检查）
+- 全量测试：`cd src-tauri; cargo test`（CI 跑的就是 `npm run build` + `cargo test`）
+- 单个集成测试：`cd src-tauri; cargo test --test repo_states -- --nocapture`，或 `--test commands_flow`
+- 单元测试（例如 git 白名单）：`cd src-tauri; cargo test --lib git::`
+- 打包：`npm run tauri build`，产物在 `src-tauri\target\release\bundle\`。因为开了 `createUpdaterArtifacts`，必须先设置环境变量 `TAURI_SIGNING_PRIVATE_KEY`（私钥在 `%USERPROFILE%\.tauri\git-syncdeck.key`，绝不进仓库），否则打包最后一步会失败
+- 手动体验用测试仓库：`npm run test:repos`，生成在 `%TEMP%\syncdeck-test`，再在应用里"添加项目"选 `repos` 子目录
+
+集成测试会自己调用 `node scripts/make-test-repos.mjs`，在 `%TEMP%` 里重新生成测试仓库（本地裸仓库充当云端），所以 PATH 里要有 `node` 和 `git`。`commands_flow` 用 `tauri::test::mock_builder()` 调全部命令，并用 `SYNCDECK_CONFIG_DIR` 把配置写到临时目录。
+
+## 架构
+
+### 前后端契约（改接口时四处一起改）
+
+- `src/api/index.ts` 是界面拿数据的**唯一入口**，组件只能 `import from "@/api"`，不能引用 `src/mock/`。
+- 有两套实现，签名必须一致：真实实现是 `src/api/tauri.ts`，调用 Tauri 命令；假数据实现是 `src/mock/api.ts`。`const impl: typeof real = ...` 这行会在编译期检查两边签名是否一致，所以新增或修改一个 API 时，两边都要改。
+- `VITE_USE_MOCK=1`，或者不在 Tauri 窗口里（`__TAURI_INTERNALS__` 不存在）时，自动用假数据，侧边栏显示"演示数据"。
+- 类型 `src/types/index.ts` 和 `src-tauri/src/model.rs`（serde）一一对应；命令 `src-tauri/src/commands.rs` 和 `src/api/tauri.ts` 一一对应，新命令还要在 `src-tauri/src/lib.rs` 的 `generate_handler!` 里注册。
+
+### Rust 端
+
+- **所有 git 子进程只能从 `git.rs` 的 `run_git` / `run_git_progress` 创建**（后者边运行边读 stderr，把 `--progress` 输出解析成阶段和百分比，中英文提示都认，200 毫秒节流）。它负责：不弹窗口（`CREATE_NO_WINDOW`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`）、超时（状态查询 10 秒；联网默认 180 秒，设置里可改，见 `network_timeout()`）、UTF-8 加 `core.quotepath=false`，还有**命令白名单**。force push、reset、rebase、stash、clean、checkout、restore、`merge -s/-X/--squash` 等一律拒绝，有单元测试覆盖。新增 git 操作要先扩白名单、再补测试。不需要仓库目录的例外只有 `--version`、读代理配置的 `config --global|--system -z --get-regexp ^http\.(.+\.)?proxy$`，以及克隆 `clone --progress|--quiet <https 地址或本机绝对路径> <目标>`（地址不许有 `::`，其他参数一律拒绝）。
+- `github.rs`：「从 GitHub 克隆」用的 `gh` 和 Windows 自带 `curl.exe` 子进程只从这里创建，同样不弹窗、有超时、走 SyncDeck 的代理，并各有白名单：gh 只许 `api user --jq .login`、`repo list|view … --json <固定字段>`（不许 auth、setup-git 等），curl 只许不带凭据请求 `api.github.com` 的两种公开地址。SyncDeck 不读取、不保存任何令牌。
+- 代理：`git.rs` 的 `ProxyPlan` 决定给 `run_git` 加 `-c http.proxy=…`（以及覆盖 `http.<网址>.proxy`，它比 `-c http.proxy` 优先）和子进程环境变量；用系统代理时把注册表的绕过列表转成 `NO_PROXY`。每轮刷新 / 同步前由 `commands::refresh_proxy` 重新解析。
+- `status.rs` 解析 `git status --porcelain=v2`，按固定优先级判定 7 种状态：未关联云端 > 有未提交改动 > 分叉 > 待推送 > 待拉取 > 已同步（"同步中"只在前端出现）。
+- `ops.rs`：fetch / push（显式 refspec，不带 `+`）/ `pull --ff-only --no-rebase --no-autostash` / 提交并推送 / 最近提交。分叉时先用 `merge-tree --write-tree` 预演，无冲突才 `merge --no-edit`，合并后用 `verify_merge` 核对（无 MERGE_HEAD、两个父提交、树哈希和预演一致）才推送；配了 `branch.<分支>.mergeoptions` 的不自动合并。自动提交先本地提交再按分叉处理，提交前检查大文件和疑似密钥文件。`ops::SyncOptions` 是同步选项，只由 `commands::sync_options_for` 构造。
+- `commands.rs` 的 `AppState`：
+  - `config` 持久化到 `config.json`（`config.rs`，先写临时文件再改名）
+  - `cache` 在内存里保存每个项目最近一次的检查结果，检查失败时保留上一次的状态，另外附上"检查失败：原因"
+  - `checked_at` 记每个项目最近一次 fetch 成功的时间，一键同步时 1 分钟内检查过的跳过 fetch；刷新时 fetch 超时 = min(30 秒, 联网超时)
+  - `net_lock` 让联网操作（刷新、一键同步、提交推送、后台自动同步）互斥
+  - `util::map_limited` 最多 8 个项目并行
+  - `run_sync` / `run_refresh` 是同步和刷新的主体，前端命令和后台自动同步共用
+- 一键同步和刷新的进度由 Rust 端通过 Tauri 2 `Channel<SyncProgressEvent>` / `Channel<RefreshProgressEvent>` 推给前端，并行时 `index` 是完成顺序；后台发起的同步用 Tauri 事件（`projects-changed` 等）通知前端。
+- 自动同步：`autosync.rs` 是调度（纯函数 `decide`：离开 / 到达各自 10 分钟冷却、暂停到次日 00:00、各开关），`sysevents.rs` 用一个隐藏的 0×0 顶层窗口收锁屏 / 解锁和唤醒消息（关机、睡眠前不同步），`tray.rs` 是托盘。单实例插件只在发布版启用；调试版的开机自启项叫"Git SyncDeck (dev)"，不会覆盖安装版。
+- `url.rs` 负责把远程地址、代理地址和 git 错误输出里的账号、token 去掉，之后才能显示或保存。
+
+### 前端
+
+- `src/state/` 管理项目列表、一键同步进度、设置和主题；`src/lib/status.ts` 管状态文案和排序；颜色在 `src/index.css`，浅色和深色各一套。
+- `src/components/ui/` 是 shadcn/ui 生成的组件；路径别名 `@` → `src`。
+- 页面和文件的对照表见 `README.md` 的「页面与文件对照」。
+
+## 项目约束
+
+- **测试只用临时仓库**（`make-test-repos.mjs` 生成的），不要对用户真实项目跑 push / pull / commit。
+- 不修改用户的全局 git 配置（包括 `safe.directory`），不读写凭据；取消监控只改清单，不删除任何文件。唯一的例外：克隆失败或超时时，删掉**这次克隆自己新建的**目标文件夹（克隆前用 `create_dir` 新建，已存在就不克隆、不覆盖）。
+- 开发服务器固定监听 `127.0.0.1:1420`（`strictPort`）：部分 Windows 机器上 `localhost` 只解析到 `::1`，Tauri CLI 会一直等不到开发服务器。
+- 调试时用环境变量 `SYNCDECK_CONFIG_DIR` 指定配置目录，以免改到真实配置 `%APPDATA%\com.gitsyncdeck.desktop\config.json`。
+- 发布：先写这个版本的发布说明 `docs/release-notes/v<版本>.md`（每个版本单独写，流水线缺这个文件会直接失败），再把 `src-tauri/tauri.conf.json`、`package.json`、`src-tauri/Cargo.toml` 三处的版本号改成同一个，一起提交，然后推 `v*` 标签。`.github/workflows/release.yml` 会先跑测试，再构建 Windows 安装包并发布到 Releases，同时上传应用内更新用的 `latest.json` 和 `.sig`（需要仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`）。`tauri.conf.json` 里的 updater 公钥和这把私钥是一对，换私钥等于让所有已安装版本收不到更新。
+- 自动同步只在换电脑的时刻触发（离开：锁屏；到达：开机、唤醒、解锁；关机和睡眠前不同步），不做按固定间隔的后台提交；自动提交只对打开了开关的项目进行。分叉时只在 `merge-tree` 预演无冲突时才合并，有冲突什么都不动、交给用户。详见 `docs/requirements.md` 第 7 节。
+
+## 本项目例外
+
+- **每次会话收尾自动发版**（覆盖 dev-collab.md 里"不许 push"那条）：用户在本次会话里交代的所有任务都做完、合回 `main` 并且测试全绿之后，Codex 自己推送 `main`，再按 `.Codex/skills/release/SKILL.md` 升版本号、打 `v*` 标签发布新版本，不用再问。
+  - 用户在当前会话里另有要求（"这次先别发""攒着下次一起发""只推不发"等）时，以用户为准。
+  - 本次改动没碰应用本身（只改了 `docs/`、`README.md`、`.Codex/`、`AGENTS.md`、测试或脚本）时只推 `main`，不发版，汇报时说一声。
