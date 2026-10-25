@@ -43,6 +43,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_RemoteDesktop",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]

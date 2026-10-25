@@ -458,6 +458,10 @@ export async function getAiPromptText(projectId: string): Promise<string> {
 
 // ---------------- 系统 ----------------
 
+export async function openProjectHomepage(): Promise<void> {
+  window.open("https://github.com/Owenwoow/Git-SyncDeck", "_blank", "noopener,noreferrer");
+}
+
 export async function openInTerminal(projectId: string): Promise<string> {
   await delay(100);
   return db.getRepo(projectId)?.path ?? "";

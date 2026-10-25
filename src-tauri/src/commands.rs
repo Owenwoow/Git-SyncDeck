@@ -714,6 +714,11 @@ pub async fn open_in_terminal(state: State<'_, Shared>, project_id: String) -> R
 }
 
 #[tauri::command]
+pub async fn open_project_homepage() -> Result<(), String> {
+    system::open_project_homepage()
+}
+
+#[tauri::command]
 pub async fn open_in_editor(state: State<'_, Shared>, project_id: String) -> Result<String, String> {
     let sp = state.stored(&project_id).ok_or("项目不存在")?;
     system::open_editor(Path::new(&sp.path))?;

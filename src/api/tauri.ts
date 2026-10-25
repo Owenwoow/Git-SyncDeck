@@ -135,6 +135,10 @@ export function openInEditor(projectId: string): Promise<string> {
   return call("open_in_editor", { projectId });
 }
 
+export function openProjectHomepage(): Promise<void> {
+  return call("open_project_homepage");
+}
+
 // ---------------- 设置（%APPDATA%\com.gitsyncdeck.desktop\config.json）----------------
 
 function systemTheme(): Theme {
