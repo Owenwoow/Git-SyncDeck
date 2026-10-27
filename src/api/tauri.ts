@@ -16,6 +16,8 @@ import type {
   DiagnosticInfo,
   GitInfo,
   GithubListing,
+  GithubRepo,
+  GithubRepoEntry,
   Project,
   RefreshProgressEvent,
   ScannedRepo,
@@ -97,18 +99,24 @@ export function getCloneDefaults(): Promise<CloneDefaults> {
 }
 
 /** 列出 GitHub 账号名下的仓库（或单个仓库）；输入可以是账号主页、用户名或仓库地址 */
-export function listGithubRepos(input: string): Promise<GithubListing> {
-  return call("list_github_repos", { input });
+export function listGithubRepos(input: string, parentDir?: string): Promise<GithubListing> {
+  return call("list_github_repos", { input, parentDir });
 }
 
-/** 克隆到默认代码目录并加入监控；进度通过 Tauri Channel 实时推送，一个失败不影响其他 */
+/** 只读更新本地状态和目标占用情况，不重新请求 GitHub。 */
+export function inspectGithubTargets(repos: GithubRepo[], parentDir: string): Promise<GithubRepoEntry[]> {
+  return call("inspect_github_targets", { repos, parentDir });
+}
+
+/** 克隆到本批保存目录并加入监控；未指定时用默认目录，一个失败不影响其他 */
 export function cloneRepos(
   items: CloneRequest[],
   onProgress: (e: CloneProgressEvent) => void,
+  parentDir?: string,
 ): Promise<CloneResult[]> {
   const onEvent = new Channel<CloneProgressEvent>();
   onEvent.onmessage = onProgress;
-  return call("clone_repos", { items, onEvent });
+  return call("clone_repos", { items, onEvent, parentDir });
 }
 
 export function commitAndPush(projectId: string, message: string): Promise<Project> {

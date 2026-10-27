@@ -29,6 +29,7 @@ export const {
   syncAll,
   getCloneDefaults,
   listGithubRepos,
+  inspectGithubTargets,
   cloneRepos,
   commitAndPush,
   getDiagnosticText,

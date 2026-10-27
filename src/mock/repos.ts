@@ -109,7 +109,11 @@ export const unmonitoredRepos: Project[] = [
 ];
 
 /** "选择目录"时依次返回的假目录 */
-export const pickableDirs = ["E:\\work", "D:\\code"];
+export const pickableDirs = [
+  "E:\\work",
+  "D:\\code",
+  "E:\\work\\大学课程与安全实践\\计算机系统基础\\课程实验与个人项目\\长期归档的学习资料和示例代码",
+];
 
 export const defaultSettings = {
   defaultCodeDir: "D:\\code",

@@ -1,6 +1,6 @@
 //! 从 GitHub 克隆的后端流程：用 Tauri 的模拟运行时调用 `clone_repos`，
 //! 克隆 scripts/make-test-repos.mjs 生成的本地裸仓库（充当云端），不连真实 GitHub。
-//! 覆盖 克隆成功（事件、加入监控、状态已同步）→ 同名文件夹已存在时不覆盖 → 克隆失败后不留半截文件夹 → 默认代码目录不存在。
+//! 覆盖克隆成功与事件、默认及自定义目录、设置不变、本地目标检查、目录校验、已有目标保护、并发同名与失败清理。
 //! 用 GIT_CONFIG_GLOBAL / GIT_CONFIG_NOSYSTEM 把 git 的全局配置换成空的临时文件；这个文件里只有一个测试，因为它要改本进程的环境变量。
 //! 运行：cd src-tauri && cargo test --test clone_flow -- --nocapture
 
@@ -13,7 +13,7 @@ use tauri::Manager;
 
 use git_syncdeck_lib::commands::{self, AppState, Shared};
 use git_syncdeck_lib::config::ConfigStore;
-use git_syncdeck_lib::model::{CloneRequest, CloneResult, SettingsPatch, SyncStatus};
+use git_syncdeck_lib::model::{CloneRequest, CloneResult, GithubRepo, SettingsPatch, SyncStatus};
 
 fn fixtures(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(name);
@@ -33,6 +33,14 @@ async fn clone(
     app: &tauri::App<tauri::test::MockRuntime>,
     items: &[(&str, &str)],
 ) -> (Vec<CloneResult>, Vec<serde_json::Value>) {
+    clone_in(app, items, None).await
+}
+
+async fn clone_in(
+    app: &tauri::App<tauri::test::MockRuntime>,
+    items: &[(&str, &str)],
+    parent: Option<&Path>,
+) -> (Vec<CloneResult>, Vec<serde_json::Value>) {
     let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
     let sink = events.clone();
     let channel = Channel::new(move |body| {
@@ -42,9 +50,17 @@ async fn clone(
         Ok(())
     });
     let items = items.iter().map(|(url, name)| CloneRequest { url: url.to_string(), name: name.to_string() }).collect();
-    let results = commands::clone_repos(app.state(), items, channel).await.unwrap();
+    let results = commands::clone_repos(app.state(), items, channel, parent.map(|p| p.to_string_lossy().into_owned())).await.unwrap();
     let events = events.lock().unwrap().clone();
     (results, events)
+}
+
+fn repo(name: &str, url: &str) -> GithubRepo {
+    GithubRepo {
+        name: name.into(), full_name: format!("test/{name}"), clone_url: url.into(),
+        html_url: "https://github.com/test/repo".into(), private: false, fork: false, archived: false,
+        pushed_at: None, description: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -79,6 +95,7 @@ async fn clone_flow() {
         app.state(),
         vec![CloneRequest { url: remote.clone(), name: "synced".into() }],
         channel,
+        None,
     )
     .await
     .unwrap_err();
@@ -143,4 +160,66 @@ async fn clone_flow() {
     assert!(!code_dir.join("plain-http").exists() && !code_dir.join("ext").exists());
     assert!(results[1].error.as_deref().unwrap().contains("已拒绝"), "{:?}", results[1].error);
     assert_eq!(commands::list_projects(app.state()).await.unwrap().len(), 2);
+
+    // 5. 自定义目录含空格和中文，预览按该目录判断占用；不改变设置。
+    let custom_root = fresh_dir("syncdeck-clone-custom");
+    let custom = custom_root.join("本次 代码目录");
+    std::fs::create_dir(&custom).unwrap();
+    let custom_text = custom.to_string_lossy().into_owned();
+    let preview = vec![repo("occupied", &missing), repo("custom-repo", &remote)];
+    let before = commands::inspect_github_targets(app.state(), preview.clone(), custom_text.clone()).await.unwrap();
+    assert!(!before[0].target_exists);
+    assert_eq!(PathBuf::from(&before[0].target), custom.join("occupied"));
+    assert!(before[1].local.is_some(), "监控中的远程地址相同仓库仍应识别");
+    std::fs::create_dir(custom.join("occupied")).unwrap();
+    std::fs::write(custom.join("occupied").join("keep.txt"), "保留").unwrap();
+    let after = commands::inspect_github_targets(app.state(), preview, custom_text.clone()).await.unwrap();
+    assert!(after[0].target_exists);
+    let (results, _) = clone_in(&app, &[(&remote, "custom-repo"), (&missing, "broken-custom"), (&remote, "occupied")], Some(&custom)).await;
+    assert!(results[0].ok, "{:?}", results[0].error);
+    assert_eq!(PathBuf::from(&results[0].project.as_ref().unwrap().path), custom.join("custom-repo"));
+    assert!(custom.join("custom-repo").join(".git").exists());
+    assert!(!code_dir.join("custom-repo").exists());
+    assert!(!results[1].ok && !custom.join("broken-custom").exists());
+    assert!(!results[2].ok);
+    assert_eq!(std::fs::read_to_string(custom.join("occupied").join("keep.txt")).unwrap(), "保留");
+    assert_eq!(commands::get_settings(app.state()).await.unwrap().default_code_dir, code_dir.to_string_lossy());
+
+    // 6. 不传本批目录仍回退到默认目录；同批同名目标只有一个成功，不清理成功者。
+    let (results, _) = clone(&app, &[(&remote, "default-again")]).await;
+    assert!(results[0].ok && code_dir.join("default-again").join(".git").exists());
+    let (results, _) = clone_in(&app, &[(&remote, "same-name"), (&remote, "same-name")], Some(&custom)).await;
+    assert_eq!(results.iter().filter(|r| r.ok).count(), 1, "{results:?}");
+    assert!(custom.join("same-name").join(".git").exists());
+
+    // 7. 默认目录与本次目录里未监控的仓库也能识别，切换目录只读、不改监控清单。
+    let custom_remote = root.join("remotes").join("ahead.git").to_string_lossy().into_owned();
+    let (unique, _) = clone_in(&app, &[(&custom_remote, "custom-only")], Some(&custom)).await;
+    assert!(unique[0].ok);
+    let empty = fresh_dir("syncdeck-clone-empty");
+    let monitored = commands::inspect_github_targets(app.state(), vec![repo("other-name", &custom_remote)], empty.to_string_lossy().into()).await.unwrap();
+    assert_eq!(PathBuf::from(monitored[0].local.as_ref().unwrap()), custom.join("custom-only"));
+    commands::remove_project(app.state(), unique[0].project.as_ref().unwrap().id.clone()).await.unwrap();
+    let custom_entries = commands::inspect_github_targets(app.state(), vec![repo("other-name", &custom_remote)], custom_text.clone()).await.unwrap();
+    assert_eq!(PathBuf::from(custom_entries[0].local.as_ref().unwrap()), custom.join("custom-only"));
+    let monitored_ids: Vec<_> = commands::list_projects(app.state()).await.unwrap().into_iter().map(|p| p.id).collect();
+    // 切换到没有本地仓库的目录，也要识别默认目录中未监控的远程仓库。
+    for p in commands::list_projects(app.state()).await.unwrap() {
+        commands::remove_project(app.state(), p.id).await.unwrap();
+    }
+    let default_entries = commands::inspect_github_targets(app.state(), vec![repo("other-name", &remote)], empty.to_string_lossy().into()).await.unwrap();
+    assert!(default_entries[0].local.as_ref().unwrap().starts_with(code_dir.to_str().unwrap()));
+    assert!(commands::list_projects(app.state()).await.unwrap().is_empty());
+    assert!(!monitored_ids.is_empty());
+
+    // 8. 预览与实际执行都拒绝非法父目录；预览仓库名同样防止目录穿越。
+    let ordinary_file = custom_root.join("file.txt");
+    std::fs::write(&ordinary_file, "file").unwrap();
+    for dir in ["".to_string(), "relative".into(), "C:relative".into(), custom_root.join("missing").to_string_lossy().into(), ordinary_file.to_string_lossy().into()] {
+        assert!(commands::inspect_github_targets(app.state(), vec![repo("safe", &remote)], dir.clone()).await.is_err(), "{dir}");
+        let channel = Channel::new(|_| Ok(()));
+        assert!(commands::clone_repos(app.state(), vec![CloneRequest { url: remote.clone(), name: "safe".into() }], channel, Some(dir.clone())).await.is_err(), "{dir}");
+    }
+    assert!(commands::inspect_github_targets(app.state(), vec![repo("..\\escape", &remote)], custom_text).await.is_err());
+    assert!(!custom_root.join("escape").exists());
 }

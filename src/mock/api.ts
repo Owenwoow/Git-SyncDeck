@@ -14,6 +14,7 @@ import type {
   GitInfo,
   GitOp,
   GithubListing,
+  GithubRepo,
   GithubRepoEntry,
   Project,
   ProgressPhase,
@@ -147,7 +148,7 @@ export async function getCloneDefaults(): Promise<CloneDefaults> {
 }
 
 /** 演示：输入里带 public-only 模拟没装 gh（只列公开仓库），带 not-logged 模拟 gh 没登录；写成 账号/仓库 只列那一个仓库 */
-export async function listGithubRepos(input: string): Promise<GithubListing> {
+export async function listGithubRepos(input: string, parentDir?: string): Promise<GithubListing> {
   await delay(jitter(500, 900));
   const text = input.trim();
   if (!text) throw new Error("请填写 GitHub 账号主页、用户名或仓库地址");
@@ -172,17 +173,7 @@ export async function listGithubRepos(input: string): Promise<GithubListing> {
     if (!repos.length) throw new Error(`找不到 GitHub 仓库 ${MOCK_OWNER}/${second}（地址写错了，或者它是私有的、需要先用 gh 登录）`);
   }
 
-  const { defaultCodeDir } = readSettings();
-  const entries: GithubRepoEntry[] = repos.map((repo) => {
-    const target = `${defaultCodeDir.replace(/[\\/]+$/, "")}\\${repo.name}`;
-    const local = db.allRepos().find((r) => r.remoteUrl === repo.cloneUrl && (db.isMonitored(r.id) || r.path.toLowerCase().startsWith(defaultCodeDir.toLowerCase())));
-    return {
-      repo: clone(repo),
-      local: local?.path ?? null,
-      target,
-      targetExists: EXISTING_FOLDERS.includes(repo.name) || !!db.findRepoByPath(target),
-    };
-  });
+  const entries = await inspectGithubTargets(repos, parentDir ?? readSettings().defaultCodeDir);
   return {
     owner: MOCK_OWNER,
     repos: entries,
@@ -195,23 +186,61 @@ export async function listGithubRepos(input: string): Promise<GithubListing> {
   };
 }
 
+function directoryKey(path: string): string {
+  return path.trim().replace(/\//g, "\\").replace(/[\\]+$/, "").toLowerCase();
+}
+
+function cloneDirectory(parentDir?: string): string {
+  const dir = (parentDir ?? readSettings().defaultCodeDir).trim().replace(/\//g, "\\");
+  if (!/^(?:[a-z]:\\|\\\\[^\\]+\\[^\\]+)/i.test(dir)) throw new Error("保存目录必须是绝对路径");
+  return dir.replace(/\\+$/, "") + "\\";
+}
+
+function validCloneName(name: string): boolean {
+  return name.length <= 100 && /^[a-z\d_.-]+$/i.test(name) && name !== "." && name !== "..";
+}
+
+/** 演示中的占用文件夹只存在于默认代码目录，切换目录后可重新克隆。 */
+function occupiedTarget(parentDir: string, name: string): boolean {
+  return (directoryKey(parentDir) === directoryKey(readSettings().defaultCodeDir) && EXISTING_FOLDERS.includes(name))
+    || !!db.findRepoByPath(`${parentDir.replace(/[\\/]+$/, "")}\\${name}`);
+}
+
+export async function inspectGithubTargets(repos: GithubRepo[], parentDir: string): Promise<GithubRepoEntry[]> {
+  const dir = cloneDirectory(parentDir);
+  if (repos.some((r) => !validCloneName(r.name))) throw new Error("文件夹名不合法");
+  await delay(150);
+  const roots = [readSettings().defaultCodeDir, dir].map((p) => directoryKey(p) + "\\");
+  return repos.map((repo) => {
+    const target = `${dir}${repo.name}`;
+    const local = db.allRepos().find((r) => r.remoteUrl?.toLowerCase() === repo.cloneUrl.toLowerCase()
+      && (db.isMonitored(r.id) || roots.some((root) => directoryKey(r.path).startsWith(root))));
+    return { repo: clone(repo), local: local?.path ?? null, target, targetExists: occupiedTarget(dir, repo.name) };
+  });
+}
+
 /** 演示：每个仓库 2~4 秒，下载 → 处理差异 → 检出，每 200 毫秒报一次百分比；名字含 huge 的模拟超时失败；最多同时 3 个 */
 export async function cloneRepos(
   items: CloneRequest[],
   onProgress: (e: CloneProgressEvent) => void,
+  parentDir?: string,
 ): Promise<CloneResult[]> {
-  const { defaultCodeDir } = readSettings();
+  const dir = cloneDirectory(parentDir);
   const results: CloneResult[] = new Array(items.length);
+  const reserved = new Set<string>();
 
   async function one(index: number) {
     const { url, name } = items[index];
     onProgress({ type: "start", url });
-    const target = `${defaultCodeDir.replace(/[\\/]+$/, "")}\\${name}`;
+    const target = `${dir}${name}`;
     let error: string | null = null;
     let project: Project | null = null;
-    if (EXISTING_FOLDERS.includes(name) || db.findRepoByPath(target)) {
+    if (!validCloneName(name)) {
+      error = `文件夹名不合法：${name}`;
+    } else if (occupiedTarget(dir, name) || reserved.has(directoryKey(target))) {
       error = `文件夹已存在：${target}，没有覆盖`;
     } else {
+      reserved.add(directoryKey(target));
       const total = jitter(2000, 4000);
       const failing = name.toLowerCase().includes("huge");
       const phases: [ProgressPhase, number][] = [
@@ -235,7 +264,7 @@ export async function cloneRepos(
       if (!error) {
         project = clone(
           db.addRepo({
-            id: `p-${name}`,
+            id: `clone-${directoryKey(target)}`,
             name,
             path: target,
             branch: "main",

@@ -30,7 +30,7 @@ export function AddProjectsPage() {
         <p className="mt-0.5 text-sm text-muted-foreground">
           {tab === "local"
             ? "选择存放代码的目录，自动找出其中的 Git 仓库，勾选后加入监控。"
-            : "填入 GitHub 账号主页，列出名下的仓库，勾选后克隆到默认代码目录并加入监控。"}
+            : "填入 GitHub 账号主页，勾选仓库，可更改本次保存目录，克隆后自动加入监控。"}
         </p>
       </header>
 

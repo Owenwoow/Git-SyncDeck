@@ -970,12 +970,18 @@ pub async fn get_clone_defaults(state: State<'_, Shared>) -> Result<CloneDefault
     }))
 }
 
-/// 本地已有的仓库：默认代码目录下扫描到的 + 监控清单里的，按规范化后的远程地址对应到路径
-async fn local_remotes(st: &AppState, code_dir: &str) -> HashMap<String, String> {
+/// 本地已有的仓库：默认目录、本次保存目录和监控清单，按规范化后的远程地址对应到路径
+async fn local_remotes(st: &AppState, parent: &Path) -> HashMap<String, String> {
     let mut paths: Vec<String> = st.config.read(|c| c.projects.iter().map(|p| p.path.clone()).collect());
-    let root = PathBuf::from(normalize_path(code_dir));
-    if root.is_dir() {
-        let found = tokio::task::spawn_blocking(move || scan::find_repos(&root)).await.unwrap_or_default();
+    let default_dir = PathBuf::from(normalize_path(&st.config.read(code_dir_of)));
+    let mut roots = vec![default_dir];
+    if !same_path(&roots[0].to_string_lossy(), &parent.to_string_lossy()) {
+        roots.push(parent.to_path_buf());
+    }
+    for root in roots.into_iter().filter(|p| p.is_dir()) {
+        let found = tokio::task::spawn_blocking(move || scan::find_repos(&root))
+            .await
+            .unwrap_or_default();
         for p in found {
             let p = p.to_string_lossy().into_owned();
             if !paths.iter().any(|x| same_path(x, &p)) {
@@ -997,6 +1003,52 @@ async fn local_remotes(st: &AppState, code_dir: &str) -> HashMap<String, String>
     map
 }
 
+/// 预览和实际克隆使用相同的目录校验，不创建父目录，也不修改默认设置。
+fn clone_parent(st: &AppState, parent_dir: Option<&str>) -> Result<PathBuf, String> {
+    let text = parent_dir.map(str::to_string).unwrap_or_else(|| st.config.read(code_dir_of));
+    let path = PathBuf::from(normalize_path(&text));
+    let label = if parent_dir.is_some() { "保存目录" } else { "默认代码目录" };
+    if !path.is_absolute() {
+        return Err(format!("{label}必须是绝对路径：{}", path.display()));
+    }
+    if !path.exists() {
+        return Err(format!("{label}不存在：{}，请重新选择目录", path.display()));
+    }
+    if !path.is_dir() {
+        return Err(format!("{label}不是文件夹：{}", path.display()));
+    }
+    Ok(path)
+}
+
+async fn github_targets(st: &AppState, repos: Vec<GithubRepo>, parent: &Path) -> Result<Vec<GithubRepoEntry>, String> {
+    for repo in &repos {
+        if !github::valid_repo_name(&repo.name) {
+            return Err(format!("文件夹名不合法：{}", repo.name));
+        }
+    }
+    let locals = local_remotes(st, parent).await;
+    Ok(repos.into_iter().map(|repo| {
+        let target = parent.join(&repo.name);
+        GithubRepoEntry {
+            local: locals.get(&github::normalize_remote(&repo.clone_url)).cloned(),
+            target: target.to_string_lossy().into_owned(),
+            target_exists: target.exists(),
+            repo,
+        }
+    }).collect())
+}
+
+/// 更换保存目录时，只检查已有列表的本地信息，不重新请求 GitHub。
+#[tauri::command]
+pub async fn inspect_github_targets(
+    state: State<'_, Shared>,
+    repos: Vec<GithubRepo>,
+    parent_dir: String,
+) -> Result<Vec<GithubRepoEntry>, String> {
+    let parent = clone_parent(state.inner(), Some(&parent_dir))?;
+    github_targets(state.inner(), repos, &parent).await
+}
+
 /// 公开接口列仓库，失败翻成人话
 async fn list_public(source: &github::Source) -> Result<Vec<GithubRepo>, String> {
     github::public_list(source).await.map_err(|e| github::public_error_text(&e, source))
@@ -1004,8 +1056,9 @@ async fn list_public(source: &github::Source) -> Result<Vec<GithubRepo>, String>
 
 /// 列出 GitHub 账号名下的仓库（或单个仓库）。优先用 gh（能看到私有仓库），没装 / 没登录 / 失败时退到公开接口
 #[tauri::command]
-pub async fn list_github_repos(state: State<'_, Shared>, input: String) -> Result<GithubListing, String> {
+pub async fn list_github_repos(state: State<'_, Shared>, input: String, parent_dir: Option<String>) -> Result<GithubListing, String> {
     let st = state.inner().clone();
+    let parent = clone_parent(&st, parent_dir.as_deref())?;
     let source = github::parse_source(&input)?;
     refresh_proxy(&st).await;
     let saved = input.trim().to_string();
@@ -1031,20 +1084,7 @@ pub async fn list_github_repos(state: State<'_, Shared>, input: String) -> Resul
         ),
     };
 
-    let code_dir = st.config.read(code_dir_of);
-    let locals = local_remotes(&st, &code_dir).await;
-    let repos = repos
-        .into_iter()
-        .map(|repo| {
-            let target = PathBuf::from(normalize_path(&code_dir)).join(&repo.name);
-            GithubRepoEntry {
-                local: locals.get(&github::normalize_remote(&repo.clone_url)).cloned(),
-                target: target.to_string_lossy().into_owned(),
-                target_exists: target.exists(),
-                repo,
-            }
-        })
-        .collect();
+    let repos = github_targets(&st, repos, &parent).await?;
     Ok(GithubListing { owner: source.owner().to_string(), repos, source: kind.to_string(), notice })
 }
 
@@ -1069,27 +1109,28 @@ pub fn clone_error_text(err: &crate::git::GitError) -> String {
     msg
 }
 
-/// 克隆到默认代码目录，完成后加入监控并联网检查一次。进度通过 Channel 推给前端
+/// 克隆到本批保存目录（未指定则使用默认目录），完成后加入监控并联网检查一次。
 #[tauri::command]
 pub async fn clone_repos(
     state: State<'_, Shared>,
     items: Vec<CloneRequest>,
     on_event: Channel<CloneProgressEvent>,
+    parent_dir: Option<String>,
 ) -> Result<Vec<CloneResult>, String> {
     run_clone(state.inner(), items, Arc::new(move |e| {
         let _ = on_event.send(e);
-    }))
+    }), parent_dir)
     .await
 }
 
-pub async fn run_clone(st: &Shared, items: Vec<CloneRequest>, sink: CloneSink) -> Result<Vec<CloneResult>, String> {
+pub async fn run_clone(st: &Shared, items: Vec<CloneRequest>, sink: CloneSink, parent_dir: Option<String>) -> Result<Vec<CloneResult>, String> {
+    // 在等待联网锁之前固定目录，设置后来发生变化也不会改变这批的目标。
+    let code_dir = clone_parent(st, parent_dir.as_deref())?;
     // 和刷新、一键同步互斥
     let _net = st.net_lock.lock().await;
     refresh_proxy(st).await;
-    let code_dir = PathBuf::from(normalize_path(&st.config.read(code_dir_of)));
-    if !code_dir.is_dir() {
-        return Err(format!("默认代码目录不存在：{}，请先在设置里改一下", code_dir.display()));
-    }
+    // 等待期间目录可能被移走或删除，开始执行前再校验一次。
+    clone_parent(st, Some(&code_dir.to_string_lossy()))?;
     let st = st.clone();
     Ok(map_limited(items, CLONE_CONCURRENCY, move |req| {
         let (st, sink, dir) = (st.clone(), sink.clone(), code_dir.clone());
