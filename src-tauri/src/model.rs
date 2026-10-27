@@ -427,7 +427,7 @@ pub struct DiagnosticInfo {
 // ---------------- 从 GitHub 克隆 ----------------
 
 /// GitHub 上的一个仓库（列表里显示用）
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GithubRepo {
     pub name: String,
@@ -448,9 +448,9 @@ pub struct GithubRepo {
 #[serde(rename_all = "camelCase")]
 pub struct GithubRepoEntry {
     pub repo: GithubRepo,
-    /// 已在本地的仓库路径（默认代码目录下扫描到的仓库或监控清单里的项目，远程地址相同）
+    /// 已在本地的仓库路径（默认目录、本次保存目录或监控清单中，远程地址相同）
     pub local: Option<String>,
-    /// 克隆到哪里：默认代码目录\仓库名
+    /// 克隆到哪里：本批保存目录\仓库名
     pub target: String,
     pub target_exists: bool,
 }
@@ -479,7 +479,7 @@ pub struct CloneDefaults {
 #[serde(rename_all = "camelCase")]
 pub struct CloneRequest {
     pub url: String,
-    /// 克隆到默认代码目录下的这个文件夹名
+    /// 克隆到本批保存目录下的这个文件夹名
     pub name: String,
 }
 

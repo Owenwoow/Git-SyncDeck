@@ -200,6 +200,7 @@ pub fn run() {
             commands::quit_app,
             commands::get_clone_defaults,
             commands::list_github_repos,
+            commands::inspect_github_targets,
             commands::clone_repos,
         ])
         .run(tauri::generate_context!())

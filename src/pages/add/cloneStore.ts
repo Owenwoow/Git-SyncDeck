@@ -19,10 +19,14 @@ export interface CloneRow {
 export interface CloneState {
   /** 正在克隆（整批还没结束） */
   running: boolean;
+  /** 本批开始时固定的保存目录；结果展示期间也保留。 */
+  parentDir: string | null;
+  batchId: number;
   rows: CloneRow[];
 }
 
-const IDLE: CloneState = { running: false, rows: [] };
+const IDLE: CloneState = { running: false, parentDir: null, batchId: 0, rows: [] };
+let nextBatchId = 0;
 
 let state: CloneState = IDLE;
 const listeners = new Set<() => void>();
@@ -86,15 +90,18 @@ function summary(results: CloneResult[]): { ok: number; failed: number } {
 export async function startClone(
   items: CloneRequest[],
   hooks: { setCloning: (on: boolean) => void; onFinished: () => void },
+  parentDir: string,
 ): Promise<void> {
   if (state.running || items.length === 0) return;
   set({
     running: true,
+    parentDir,
+    batchId: ++nextBatchId,
     rows: items.map((i) => ({ url: i.url, name: i.name, status: "waiting", phase: null, percent: null, error: null })),
   });
   hooks.setCloning(true);
   try {
-    const results = await api.cloneRepos(items, onEvent);
+    const results = await api.cloneRepos(items, onEvent, parentDir);
     // 事件可能比返回值晚到或丢失，以返回的结果为准
     set({
       ...state,

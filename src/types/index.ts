@@ -107,9 +107,9 @@ export interface GithubRepo {
 /** 列表里的一行：仓库 + 是否已在本地 + 克隆目标 */
 export interface GithubRepoEntry {
   repo: GithubRepo;
-  /** 已在本地的仓库路径（默认代码目录下或监控清单里，远程地址相同）；没有为 null */
+  /** 已在本地的仓库路径（默认目录、本次保存目录或监控清单中，远程地址相同）；没有为 null */
   local: string | null;
-  /** 克隆到哪里：默认代码目录\仓库名 */
+  /** 克隆到哪里：本批保存目录\仓库名 */
   target: string;
   targetExists: boolean;
 }
@@ -132,7 +132,7 @@ export interface CloneDefaults {
 
 export interface CloneRequest {
   url: string;
-  /** 克隆到默认代码目录下的这个文件夹名 */
+  /** 克隆到本批保存目录下的这个文件夹名 */
   name: string;
 }
 
