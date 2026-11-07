@@ -79,6 +79,10 @@ pub struct Project {
     pub behind: u32,
     pub changes: Vec<FileChange>,
     pub last_sync_at: Option<String>,
+    /// 本进程最近成功检查当前分支云端状态的时间。
+    pub last_checked_at: Option<String>,
+    /// 不能由普通提交入口完成的冲突或 Git 操作。
+    pub commit_block_reason: Option<String>,
     pub issue: Option<String>,
     /// 检查失败（如断网时 fetch 失败）的原因；此时 status 保留上一次的结果
     pub check_error: Option<String>,
@@ -269,6 +273,9 @@ pub struct SyncResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    pub auto_sync_enabled: bool,
+    pub config_read_error: Option<String>,
+    pub runtime_warning: Option<String>,
     pub default_code_dir: String,
     pub theme: Option<String>,
     /// 自动提交的提交信息模板；没设置过时为默认模板
@@ -334,6 +341,7 @@ pub enum ProxySource {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
+    pub auto_sync_enabled: Option<bool>,
     pub default_code_dir: Option<String>,
     pub theme: Option<String>,
     /// 去掉空白后为空（或等于默认模板）时恢复默认
@@ -522,6 +530,8 @@ mod tests {
             behind: 0,
             changes: Vec::new(),
             last_sync_at: None,
+            last_checked_at: None,
+            commit_block_reason: None,
             issue: None,
             check_error: None,
             auto_commit: false,
@@ -567,5 +577,29 @@ mod tests {
         // 没在等重试时的 Begin：新的一轮
         s.apply(&SyncProgressEvent::Begin { project_ids: ids(&["x"]), total: 1 });
         assert_eq!(s.counts(), (0, 1));
+    }
+}
+
+/// 全部仓库联网任务共用的活动与等待状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskInfo {
+    pub id: u64,
+    pub kind: String,
+    pub label: String,
+    pub automatic: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskState {
+    pub active: Option<TaskInfo>,
+    pub waiting: Vec<TaskInfo>,
+    pub installing_update: bool,
+}
+
+impl TaskState {
+    pub fn busy(&self) -> bool {
+        self.active.is_some() || !self.waiting.is_empty() || self.installing_update
     }
 }

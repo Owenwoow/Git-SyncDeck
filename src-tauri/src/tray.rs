@@ -10,6 +10,7 @@ use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::autosync::{self, Host};
 use crate::commands::{self, Shared};
@@ -21,9 +22,11 @@ pub const EVENT_SETTINGS_CHANGED: &str = "settings-changed";
 const MENU_SYNC_NOW: &str = "sync_now";
 const MENU_SHOW: &str = "show";
 const MENU_PAUSE: &str = "pause";
+const MENU_PAUSE_HOUR: &str = "pause_hour";
+const MENU_AUTO: &str = "auto_enabled";
 const MENU_QUIT: &str = "quit";
-const PAUSE_TEXT: &str = "暂停自动同步（到明天）";
-const RESUME_TEXT: &str = "恢复自动同步";
+const PAUSE_TEXT: &str = "暂停仓库自动操作（到明天 00:00）";
+const RESUME_TEXT: &str = "恢复仓库自动操作";
 
 /// 托盘图标的状态色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,12 +67,20 @@ pub struct TraySummary {
 /// - 蓝：正在同步（`syncing` 为这一轮的（已完成, 总数）；总数还是 0 时显示"正在同步…"）
 /// - 绿：其他（包括只是待拉取的）
 pub fn summarize(projects: &[Project], syncing: Option<(usize, usize)>) -> TraySummary {
-    let attention = |p: &Project| p.status == SyncStatus::Diverged || p.issue.is_some() || p.check_error.is_some();
+    let attention = |p: &Project| p.status == SyncStatus::Diverged || p.issue.is_some() || p.check_error.is_some() || p.commit_block_reason.is_some();
     let count = |f: &dyn Fn(&Project) -> bool| projects.iter().filter(|p| f(p)).count();
     let bad = count(&|p| attention(p));
     let pending = count(&|p| !attention(p) && matches!(p.status, SyncStatus::Ahead | SyncStatus::Dirty));
     let behind = count(&|p| !attention(p) && p.status == SyncStatus::Behind);
-    let synced = count(&|p| !attention(p) && p.status == SyncStatus::Synced);
+    let now = Local::now();
+    let verified = |p: &Project| p.last_checked_at.as_deref()
+        .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+        .is_some_and(|time| {
+            let age = now.signed_duration_since(time.with_timezone(&Local));
+            age >= chrono::Duration::zero() && age < chrono::Duration::minutes(30)
+        });
+    let synced = count(&|p| !attention(p) && p.status == SyncStatus::Synced && verified(p));
+    let unverified = count(&|p| !attention(p) && p.status == SyncStatus::Synced && !verified(p));
     let no_remote = count(&|p| !attention(p) && p.status == SyncStatus::NoRemote);
 
     let color = if syncing.is_some() {
@@ -101,7 +112,8 @@ pub fn summarize(projects: &[Project], syncing: Option<(usize, usize)>) -> TrayS
             parts.push(format!("{behind} 个项目待拉取"));
         }
         if parts.is_empty() {
-            parts.push(format!("{synced} 个项目已同步"));
+            if synced > 0 { parts.push(format!("{synced} 个项目当前分支已同步")); }
+            if unverified > 0 { parts.push(format!("{unverified} 个项目待检查云端（仅本地状态）")); }
             if no_remote > 0 {
                 parts.push(format!("{no_remote} 个未关联云端"));
             }
@@ -149,6 +161,7 @@ pub fn with_badge(rgba: &[u8], width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8>
 pub struct Tray {
     icon: TrayIcon,
     pause_item: MenuItem<tauri::Wry>,
+    auto_item: MenuItem<tauri::Wry>,
     icons: Vec<Image<'static>>,
     /// 已经排队等主线程更新，期间的其他更新请求合并掉
     pending: AtomicBool,
@@ -170,6 +183,8 @@ pub fn create(app: &AppHandle, st: Shared, host: Arc<dyn Host>) -> tauri::Result
     let sync_now = MenuItem::with_id(app, MENU_SYNC_NOW, "立即同步", true, None::<&str>)?;
     let show = MenuItem::with_id(app, MENU_SHOW, "打开主界面", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, MENU_PAUSE, PAUSE_TEXT, true, None::<&str>)?;
+    let pause_hour = MenuItem::with_id(app, MENU_PAUSE_HOUR, "暂停仓库自动操作（1 小时）", true, None::<&str>)?;
+    let auto_enabled = MenuItem::with_id(app, MENU_AUTO, "开启自动同步", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -177,6 +192,8 @@ pub fn create(app: &AppHandle, st: Shared, host: Arc<dyn Host>) -> tauri::Result
             &sync_now,
             &show,
             &PredefinedMenuItem::separator(app)?,
+            &auto_enabled,
+            &pause_hour,
             &pause,
             &PredefinedMenuItem::separator(app)?,
             &quit,
@@ -204,6 +221,7 @@ pub fn create(app: &AppHandle, st: Shared, host: Arc<dyn Host>) -> tauri::Result
     app.manage(Tray {
         icon,
         pause_item: pause,
+        auto_item: auto_enabled,
         icons,
         pending: AtomicBool::new(false),
         last: Mutex::new(None),
@@ -217,14 +235,23 @@ fn on_menu(app: &AppHandle, id: &str, st: &Shared, host: &Arc<dyn Host>) {
     match id {
         MENU_SYNC_NOW => autosync::spawn(st.clone(), host.clone(), AutoSyncTrigger::Manual),
         MENU_SHOW => show_main_window(app),
-        MENU_PAUSE => {
+        MENU_PAUSE | MENU_PAUSE_HOUR | MENU_AUTO => {
             let shows_resume = app
                 .try_state::<Tray>()
                 .and_then(|t| t.last.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|l| l.2))
                 .unwrap_or(false);
-            let until = pause_menu_target(shows_resume, &Local::now());
-            if let Err(e) = commands::set_auto_sync_pause(st, until) {
-                eprintln!("保存暂停状态失败：{e}");
+            let result = if id == MENU_AUTO {
+                let enabled = st.config.read(|c| autosync::Switches::from_stored(&c.settings).auto_sync_enabled);
+                commands::set_auto_sync_enabled(st, !enabled)
+            } else {
+                let now = Local::now();
+                let until = if id == MENU_PAUSE_HOUR { Some(now + chrono::Duration::hours(1)) }
+                    else { pause_menu_target(shows_resume, &now) };
+                commands::set_auto_sync_pause(st, until)
+            };
+            if let Err(error) = result {
+                app.dialog().message(format!("保存设置失败：{error}\n原设置保持不变，可以稍后重试。"))
+                    .title("Git SyncDeck").show(|_| {});
                 return;
             }
             // 窗口开着时，主页的"已暂停"提示跟着变
@@ -240,6 +267,12 @@ fn on_menu(app: &AppHandle, id: &str, st: &Shared, host: &Arc<dyn Host>) {
 
 /// 彻底退出 SyncDeck（托盘菜单「退出」和设置页「退出 SyncDeck」共用）
 pub fn quit<R: Runtime>(app: &AppHandle<R>) {
+    let st = app.state::<Shared>();
+    if let Some(tasks) = st.prepare_quit(false) {
+        show_main_window(app);
+        let _ = app.emit("quit-requested", tasks);
+        return;
+    }
     app.exit(0);
 }
 
@@ -274,11 +307,29 @@ fn apply(app: &AppHandle, tray: &Tray) {
     let st = app.state::<Shared>();
     let now = Local::now();
     let paused = st.config.read(|c| autosync::active_pause(&c.settings, &now));
-    let summary = summarize(&st.snapshot(), st.is_syncing().then(|| st.round_snapshot().counts()));
-    let mut tooltip = format!("Git SyncDeck · {}", summary.text);
-    if let Some(until) = &paused {
-        tooltip.push_str(&format!("\n自动同步已暂停到 {}", autosync::describe_until(until, &now)));
+    let tasks = st.task_state();
+    let mut summary = summarize(&st.snapshot(), st.is_syncing().then(|| st.round_snapshot().counts()));
+    if let Some(task) = &tasks.active {
+        summary.color = TrayColor::Blue;
+        if !matches!(task.kind.as_str(), "sync" | "auto-sync") {
+            summary.text = format!("正在{}", task.label);
+        }
+    } else if let Some(task) = tasks.waiting.first() {
+        summary.color = TrayColor::Blue;
+        summary.text = format!("等待{}", task.label);
     }
+    if tasks.installing_update { summary.text = "正在安装更新".into(); summary.color = TrayColor::Blue; }
+    let mut tooltip = format!("Git SyncDeck · {}", summary.text);
+    let switches = st.config.read(|c| autosync::Switches::from_stored(&c.settings));
+    tooltip.push_str(if !switches.auto_sync_enabled { "\n自动同步已关闭" }
+        else if !(switches.sync_on_lock || switches.sync_on_startup || switches.sync_on_resume || switches.sync_on_unlock) { "\n自动同步未选择触发时机" }
+        else { "\n自动同步已开启" });
+    if let Some(until) = &paused {
+        tooltip.push_str(&format!("\n仓库自动操作已暂停至 {}{}", autosync::describe_until(until, &now),
+            if tasks.active.as_ref().is_some_and(|task| task.automatic) { "（当前任务完成后暂停）" } else { "" }));
+    }
+    if switches.periodic_check { tooltip.push_str("\n定时检查云端已开启（只读）"); }
+    let _ = tray.auto_item.set_text(if switches.auto_sync_enabled { "关闭自动同步" } else { "开启自动同步" });
     let next = (summary.color, tooltip, paused.is_some());
     let mut last = tray.last.lock().unwrap_or_else(|e| e.into_inner());
     let prev = last.replace(next.clone());
@@ -331,6 +382,8 @@ mod tests {
             behind: 0,
             changes: Vec::new(),
             last_sync_at: None,
+            last_checked_at: Some(Local::now().to_rfc3339()),
+            commit_block_reason: None,
             issue: None,
             check_error: None,
             auto_commit: false,
@@ -343,7 +396,7 @@ mod tests {
         assert_eq!(s(&[], false), TraySummary { color: TrayColor::Green, text: "还没有监控项目".into() });
 
         let synced: Vec<_> = (0..7).map(|i| project(&format!("p{i}"), SyncStatus::Synced)).collect();
-        assert_eq!(s(&synced, false), TraySummary { color: TrayColor::Green, text: "7 个项目已同步".into() });
+        assert_eq!(s(&synced, false), TraySummary { color: TrayColor::Green, text: "7 个项目当前分支已同步".into() });
         assert_eq!(s(&synced, true).color, TrayColor::Blue, "正在同步优先");
         assert_eq!(s(&synced, true).text, "正在同步…", "这一轮还没开始联网");
         assert_eq!(summarize(&synced, Some((3, 7))).text, "正在同步 3/7");
@@ -354,7 +407,7 @@ mod tests {
         assert_eq!(s(&list, false), TraySummary { color: TrayColor::Green, text: "1 个项目待拉取".into() });
         let mut list = synced.clone();
         list.push(project("n", SyncStatus::NoRemote));
-        assert_eq!(s(&list, false).text, "7 个项目已同步，1 个未关联云端");
+        assert_eq!(s(&list, false).text, "7 个项目当前分支已同步，1 个未关联云端");
 
         // 待推送 / 有未提交改动 → 黄
         let mut list = synced.clone();
@@ -372,6 +425,19 @@ mod tests {
             s(&list, false),
             TraySummary { color: TrayColor::Red, text: "3 个项目需要处理，2 个项目待推送或有改动".into() }
         );
+    }
+
+    #[test]
+    fn local_only_state_and_unfinished_operations_do_not_claim_verified() {
+        let mut local = project("local", SyncStatus::Synced);
+        local.last_checked_at = None;
+        assert_eq!(summarize(&[local], None).text, "1 个项目待检查云端（仅本地状态）");
+        let mut expired = project("expired", SyncStatus::Synced);
+        expired.last_checked_at = Some((Local::now() - chrono::Duration::minutes(31)).to_rfc3339());
+        assert_eq!(summarize(&[expired], None).text, "1 个项目待检查云端（仅本地状态）");
+        let mut unfinished = project("unfinished", SyncStatus::Synced);
+        unfinished.commit_block_reason = Some("合并尚未完成".into());
+        assert_eq!(summarize(&[unfinished], None).color, TrayColor::Red);
     }
 
     #[test]

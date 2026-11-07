@@ -16,8 +16,9 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { StatusBadge } from "@/components/StatusBadge";
 import { FileChangeList } from "@/components/projects/FileChangeList";
 import { ProjectActions } from "@/components/projects/ProjectActions";
-import { STATUS_META, describeStatus } from "@/lib/status";
+import { STATUS_META, cloudCheckDescription, describeStatus, uniqueChangedFileCount } from "@/lib/status";
 import { formatDateTime, formatRelative } from "@/lib/time";
+import { useNow } from "@/lib/useNow";
 import { cn } from "@/lib/utils";
 import { useProjects } from "@/state/projects";
 import { useSettings } from "@/state/settings";
@@ -48,6 +49,8 @@ function DetailBody({ project: p }: { project: Project }) {
   const Icon = meta.icon;
   // 设置还没读到时按默认（自动合并开）显示
   const autoMerge = useSettings().settings?.autoMerge ?? true;
+  const now = useNow(true);
+  const fileCount = uniqueChangedFileCount(p.changes);
 
   return (
     <>
@@ -78,7 +81,14 @@ function DetailBody({ project: p }: { project: Project }) {
         {p.issue && (
           <div className="flex gap-2 text-xs text-status-dirty">
             <AlertTriangle className="size-3.5 shrink-0 translate-y-px" />
-            <span>上次一键同步时被跳过，仍待处理。</span>
+            <span className="min-w-0 break-words whitespace-pre-wrap select-text">上次同步仍有异常：{p.issue}</span>
+          </div>
+        )}
+
+        {p.commitBlockReason && (
+          <div className="flex gap-2 text-xs text-status-diverged" role="alert">
+            <AlertTriangle className="size-3.5 shrink-0 translate-y-px" />
+            <span className="min-w-0 break-words whitespace-pre-wrap select-text">{p.commitBlockReason} 请在终端或 VS Code 中完成处理后再刷新。冲突保护始终有效。</span>
           </div>
         )}
 
@@ -108,6 +118,11 @@ function DetailBody({ project: p }: { project: Project }) {
             {formatRelative(p.lastSyncAt)}
             {p.lastSyncAt && <span className="text-muted-foreground">（{formatDateTime(p.lastSyncAt)}）</span>}
           </dd>
+          <dt className="text-muted-foreground">检查云端</dt>
+          <dd className="space-y-1 text-xs leading-5">
+            <div>{p.lastCheckedAt ? `${formatRelative(p.lastCheckedAt, new Date(now))}（${formatDateTime(p.lastCheckedAt)}）` : "尚无成功检查记录"}</div>
+            <div className="text-muted-foreground">{cloudCheckDescription(p, now)}</div>
+          </dd>
         </dl>
 
         <AutoCommitToggle project={p} />
@@ -116,7 +131,7 @@ function DetailBody({ project: p }: { project: Project }) {
         <section>
           <h3 className="mb-2 text-sm font-medium">
             未提交的文件
-            {p.changes.length > 0 && <span className="ml-1.5 text-muted-foreground">{p.changes.length}</span>}
+            {fileCount > 0 && <span className="ml-1.5 text-muted-foreground">{fileCount}</span>}
           </h3>
           {p.changes.length ? (
             <FileChangeList changes={p.changes} className="rounded-lg border px-3 py-2.5" />
@@ -131,7 +146,7 @@ function DetailBody({ project: p }: { project: Project }) {
         <UnmonitorButton project={p} />
       </div>
 
-      {meta.abnormal && (
+      {(meta.abnormal || p.issue || p.checkError || p.commitBlockReason) && (
         <div className="border-t bg-muted/30 px-5 py-3.5">
           <div className="mb-2 text-xs text-muted-foreground">处理这个项目</div>
           <ProjectActions project={p} />
@@ -195,7 +210,7 @@ function UnmonitorButton({ project: p }: { project: Project }) {
   );
 }
 
-/** "一键同步时自动提交"开关 */
+/** 手动一键同步和后台自动同步共用的项目自动提交规则。 */
 function AutoCommitToggle({ project: p }: { project: Project }) {
   const { setAutoCommit } = useProjects();
   const [saving, setSaving] = useState(false);
@@ -223,9 +238,9 @@ function AutoCommitToggle({ project: p }: { project: Project }) {
       />
       <div className="min-w-0 space-y-1">
         <Label htmlFor={id} className="cursor-pointer">
-          一键同步时自动提交
+          同步时自动提交全部改动
         </Label>
-        <p className="text-xs text-muted-foreground">一键同步时会把所有改动按固定格式提交并推送</p>
+        <p className="text-xs text-muted-foreground">手动一键同步和后台自动同步都会按全局规则提交全部改动并推送；这不是独立的定时上传功能。</p>
         {!p.upstream && (
           <p className="flex items-center gap-1 text-xs text-status-dirty">
             <AlertTriangle className="size-3.5 shrink-0" />

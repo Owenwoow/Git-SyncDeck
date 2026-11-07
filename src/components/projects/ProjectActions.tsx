@@ -17,7 +17,7 @@ import type { Project } from "@/types";
 
 /**
  * 异常项目的操作按钮组。一键同步结果和详情抽屉共用。
- * 详情抽屉里不传 onSkip，就不显示"本次跳过"。
+ * 详情抽屉里不传 onSkip，就不显示"暂不处理"。
  * 分叉（含自动合并预演出冲突）的项目多一个「复制给 AI」：复制一段现成的提示词，让 AI 教用户解决冲突。
  */
 export function ProjectActions({ project, onSkip }: { project: Project; onSkip?: () => void }) {
@@ -59,7 +59,10 @@ export function ProjectActions({ project, onSkip }: { project: Project; onSkip?:
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      {project.status === "diverged" && (
+      {project.commitBlockReason && (
+        <p className="w-full text-xs break-words whitespace-pre-wrap text-status-diverged">{project.commitBlockReason}</p>
+      )}
+      {(project.status === "diverged" || project.commitBlockReason) && (
         <Button variant="outline" size="sm" onClick={copyAiPrompt} title="复制一段提示词：冲突文件、两边最近的提交，要求不用 force push、reset 或 rebase">
           <Bot />
           复制给 AI
@@ -91,9 +94,9 @@ export function ProjectActions({ project, onSkip }: { project: Project; onSkip?:
       )}
 
       {onSkip && (
-        <Button variant="outline" size="sm" onClick={onSkip}>
+        <Button variant="outline" size="sm" onClick={onSkip} title="只收起本次失败项；下次同步仍会处理这个项目">
           <SkipForward />
-          本次跳过
+          暂不处理
         </Button>
       )}
 

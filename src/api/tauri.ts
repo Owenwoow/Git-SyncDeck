@@ -4,7 +4,6 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import type {
   AutoSyncEvent,
@@ -25,6 +24,7 @@ import type {
   SyncProgressEvent,
   SyncResult,
   Theme,
+  TaskState,
   Unlisten,
   UpdateInfo,
   UpdateProgress,
@@ -175,8 +175,8 @@ export function onSettingsChanged(cb: (s: Settings) => void): Promise<Unlisten> 
 // ---------------- 换电脑自动同步（后台进行，结果通过事件推送）----------------
 
 /** 暂停自动同步到明天 00:00，返回最新设置 */
-export async function pauseAutoSync(): Promise<Settings> {
-  return toSettings(await call<StoredSettings>("pause_auto_sync"));
+export async function pauseAutoSync(duration: "hour" | "tomorrow" = "tomorrow"): Promise<Settings> {
+  return toSettings(await call<StoredSettings>("pause_auto_sync", { duration }));
 }
 
 /** 恢复自动同步，返回最新设置 */
@@ -190,8 +190,20 @@ export function getAutoSyncState(): Promise<AutoSyncState> {
 }
 
 /** 彻底退出 SyncDeck（和托盘菜单「退出」一样） */
-export function quitApp(): Promise<void> {
-  return call("quit_app");
+export function quitApp(force = false): Promise<TaskState | null> {
+  return call("quit_app", { force });
+}
+
+export function getTaskState(): Promise<TaskState> {
+  return call("get_task_state");
+}
+
+export function onTasksChanged(cb: (tasks: TaskState) => void): Promise<Unlisten> {
+  return listen<TaskState>("tasks-changed", (e) => cb(e.payload));
+}
+
+export function onQuitRequested(cb: (tasks: TaskState) => void): Promise<Unlisten> {
+  return listen<TaskState>("quit-requested", (e) => cb(e.payload));
 }
 
 /** 后台检查 / 同步之后的最新项目列表 */
@@ -217,6 +229,9 @@ export async function onAutoSync(handlers: {
 
 /** 最近一次 checkForUpdate 发现的新版本，installUpdate 用它下载安装 */
 let pendingUpdate: Update | null = null;
+let downloadedUpdate: Update | null = null;
+let updateOperation = false;
+let installationStarted = false;
 
 export function getAppVersion(): Promise<string> {
   return getVersion();
@@ -224,8 +239,11 @@ export function getAppVersion(): Promise<string> {
 
 /** 有新版本返回版本信息，已是最新返回 null；网络或签名问题抛出 Error */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  if (updateOperation || downloadedUpdate || installationStarted) throw new Error("更新包正在下载或已准备安装，请先完成当前更新");
+  updateOperation = true;
   try {
     const update = await check();
+    await pendingUpdate?.close();
     pendingUpdate = update;
     if (!update) return null;
     return {
@@ -237,17 +255,21 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
   } catch (e) {
     pendingUpdate = null;
     throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
+  } finally {
+    updateOperation = false;
   }
 }
 
 /** 下载并安装最近发现的新版本，完成后重启应用 */
-export async function installUpdate(onProgress: (p: UpdateProgress) => void): Promise<void> {
+export async function downloadUpdate(onProgress: (p: UpdateProgress) => void): Promise<void> {
+  if (updateOperation) throw new Error("更新操作正在进行");
   const update = pendingUpdate;
-  if (!update) throw new Error("没有可安装的更新，请先检查更新");
+  if (!update) throw new Error("没有可下载的更新，请先检查更新");
+  updateOperation = true;
   let downloaded = 0;
   let total: number | null = null;
   try {
-    await update.downloadAndInstall((event) => {
+    await update.download((event) => {
       if (event.event === "Started") {
         total = event.data.contentLength ?? null;
         onProgress({ downloaded: 0, total });
@@ -256,8 +278,33 @@ export async function installUpdate(onProgress: (p: UpdateProgress) => void): Pr
         onProgress({ downloaded, total });
       }
     });
+    downloadedUpdate = update;
   } catch (e) {
     throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
+  } finally {
+    updateOperation = false;
   }
-  await relaunch();
+}
+
+/** 后端原子封闭 Git 任务入口后才允许安装；下载不占用这个闸门。 */
+export async function installUpdate(): Promise<void> {
+  if (installationStarted) throw new Error("已启动更新安装，请等待安装器完成并重启");
+  if (updateOperation) throw new Error("更新操作正在进行");
+  const update = downloadedUpdate;
+  if (!update) throw new Error("请先下载更新包");
+  updateOperation = true;
+  let admitted = false;
+  try {
+    await call("begin_update_install");
+    admitted = true;
+    // 本应用仅发布 Windows：安装器成功启动后插件会退出应用并负责重启。
+    // 不能再额外 relaunch，更不能因重启错误重新开放任务或再次启动安装器。
+    await update.install({ restartAfterInstall: true });
+    installationStarted = true;
+  } catch (e) {
+    if (admitted) await call("cancel_update_install");
+    throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
+  } finally {
+    updateOperation = false;
+  }
 }

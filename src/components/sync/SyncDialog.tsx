@@ -140,7 +140,7 @@ function OutcomeText({ result }: { result: SyncItemResult }) {
     case "pulled":
       return <span className="text-status-synced">已拉取 {result.commits} 个提交</span>;
     case "up-to-date":
-      return <span className="text-muted-foreground">已是最新</span>;
+      return <span className="text-muted-foreground">当前分支已同步</span>;
     case "committed":
       return <span className="text-status-synced">已自动提交并推送 {result.commits} 个提交</span>;
     case "merged":
@@ -187,13 +187,13 @@ function DoneView({ sync, byId, onSkip }: ViewProps & { onSkip: (id: string) => 
         {failed.length > 0 && unresolved.length === 0 && (
           <div className="flex items-center gap-2 rounded-lg bg-status-synced/10 px-3 py-2.5 text-sm text-status-synced">
             <PartyPopper className="size-4" />
-            异常项目都已处理，所有项目都同步好了。
+            本轮异常均已处理，各项目当前分支已同步。
           </div>
         )}
         {failed.length === 0 && (
           <div className="flex items-center gap-2 rounded-lg bg-status-synced/10 px-3 py-2.5 text-sm text-status-synced">
             <PartyPopper className="size-4" />
-            {sync.label ? "这一轮的项目都已同步。" : "全部项目都已同步，可以放心切换电脑了。"}
+            本轮项目的当前分支均已同步，其他分支未检查。
           </div>
         )}
 
@@ -278,7 +278,7 @@ function FailedCard({
       <div className="flex items-center gap-2">
         <span className={cn("truncate text-sm font-medium", skipped && "text-muted-foreground")}>{p.name}</span>
         <StatusBadge status={p.status} />
-        {skipped && !resolved && <span className="ml-auto text-xs text-muted-foreground">已跳过 · 主页会保留异常标记</span>}
+        {skipped && !resolved && <span className="ml-auto text-xs text-muted-foreground">暂不处理 · 下次同步仍会处理</span>}
         {resolved && (
           <span className="ml-auto inline-flex items-center gap-1 text-xs text-status-synced">
             <CheckCircle2 className="size-3.5" />

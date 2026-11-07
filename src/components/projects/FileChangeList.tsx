@@ -1,4 +1,4 @@
-import { CHANGE_KIND_META } from "@/lib/status";
+import { CHANGE_KIND_META, uniqueChangedFileCount } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import type { FileChange } from "@/types";
 
@@ -15,11 +15,11 @@ export function FileChangeList({ changes, className }: { changes: FileChange[]; 
       {groups.map((g) => (
         <div key={g.title}>
           <div className="mb-1 text-xs text-muted-foreground">
-            {g.title} · {g.items.length}
+            {g.title} · {uniqueChangedFileCount(g.items)}
           </div>
           <ul className="space-y-0.5">
             {g.items.map((c) => (
-              <FileChangeItem key={`${c.kind}:${c.path}`} change={c} />
+              <FileChangeItem key={`${c.staged ? "index" : "worktree"}:${c.kind}:${c.path}`} change={c} />
             ))}
           </ul>
         </div>

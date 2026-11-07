@@ -1,8 +1,9 @@
 import { AlertTriangle, GitBranch, GitCommitHorizontal, Loader2 } from "lucide-react";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { repoShortName } from "@/lib/status";
+import { cloudCheckDescription, hasRecentCloudCheck, repoShortName } from "@/lib/status";
 import { formatDateTime, formatRelative } from "@/lib/time";
+import { useNow } from "@/lib/useNow";
 import { cn } from "@/lib/utils";
 import type { Project } from "@/types";
 
@@ -25,13 +26,14 @@ export function ProjectList({
   /** 同步中的项目正在上传 / 下载的百分比，显示在"同步中"旁边 */
   percents?: ReadonlyMap<string, number>;
 }) {
+  const now = useNow(true);
   return (
     <div className="overflow-hidden rounded-lg border bg-card">
       <div className={cn(GRID, "border-b bg-muted/40 px-4 py-2 text-xs text-muted-foreground")}>
         <span>项目</span>
         <span className="hidden @3xl:block">GitHub 仓库</span>
         <span>状态</span>
-        <span className="text-right">上次同步</span>
+        <span className="text-right">检查云端</span>
       </div>
       <ul className="divide-y">
         {projects.map((p) => (
@@ -40,6 +42,7 @@ export function ProjectList({
               project={p}
               selected={p.id === selectedId}
               checking={checkingIds?.has(p.id) ?? false}
+              now={now}
               percent={p.status === "syncing" ? percents?.get(p.id) : undefined}
               onClick={() => onSelect(p.id)}
             />
@@ -54,18 +57,23 @@ function ProjectRow({
   project: p,
   selected,
   checking,
+  now,
   percent,
   onClick,
 }: {
   project: Project;
   selected: boolean;
   checking: boolean;
+  now: number;
   percent?: number;
   onClick: () => void;
 }) {
   const repo = repoShortName(p.remoteUrl);
   // 检查失败优先于上次同步遗留的异常
-  const notice = p.checkError ? `检查失败：${p.checkError}` : p.issue ? `上次同步已跳过：${p.issue}` : null;
+  const notice = p.checkError ? `检查失败：${p.checkError}`
+    : p.issue ? `上次同步异常：${p.issue}`
+    : p.commitBlockReason ? p.commitBlockReason
+    : !hasRecentCloudCheck(p, now) ? cloudCheckDescription(p, now) : null;
   return (
     <button
       type="button"
@@ -86,11 +94,11 @@ function ProjectRow({
           {p.autoCommit && (
             <Tooltip>
               <TooltipTrigger asChild>
-                <span className="inline-flex shrink-0 text-muted-foreground" aria-label="自动提交">
+                <span className="inline-flex shrink-0 text-muted-foreground" aria-label="同步时自动提交全部改动">
                   <GitCommitHorizontal className="size-3.5" />
                 </span>
               </TooltipTrigger>
-              <TooltipContent>自动提交</TooltipContent>
+              <TooltipContent>手动一键同步和后台自动同步时自动提交全部改动</TooltipContent>
             </Tooltip>
           )}
         </div>
@@ -126,9 +134,9 @@ function ProjectRow({
 
       <span
         className="text-right text-xs text-muted-foreground tabular-nums"
-        title={p.lastSyncAt ? formatDateTime(p.lastSyncAt) : undefined}
+        title={`${p.lastCheckedAt ? `最近成功检查：${formatDateTime(p.lastCheckedAt)}` : "尚无成功检查记录"}；${p.lastSyncAt ? `最近成功同步：${formatDateTime(p.lastSyncAt)}` : "从未成功同步"}`}
       >
-        {formatRelative(p.lastSyncAt)}
+        {p.lastCheckedAt ? formatRelative(p.lastCheckedAt, new Date(now)) : "未验证"}
       </span>
     </button>
   );

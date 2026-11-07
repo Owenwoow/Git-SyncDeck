@@ -44,9 +44,13 @@ export const {
   resumeAutoSync,
   getAutoSyncState,
   quitApp,
+  getTaskState,
+  onTasksChanged,
+  onQuitRequested,
   onProjectsChanged,
   onAutoSync,
   getAppVersion,
   checkForUpdate,
+  downloadUpdate,
   installUpdate,
 } = impl;

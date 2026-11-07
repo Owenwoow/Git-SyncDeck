@@ -26,7 +26,11 @@ export function buildDiagnosticText(p: Project, recentCommits: CommitInfo[], now
     `【上游分支】${p.upstream ?? "无（没有设置上游分支）"}`,
     `【远程仓库】${p.remoteUrl ?? "未配置"}`,
     `【同步状态】${STATUS_META[p.status].label}${issue ? `：${issue}` : ""}`,
+    ...(p.issue ? [`【上次同步异常】${p.issue}`] : []),
     ...(p.checkError ? [`【检查失败】${p.checkError}`] : []),
+    ...(p.commitBlockReason ? [`【提交受阻】${p.commitBlockReason}`] : []),
+    `【最近成功检查云端】${p.lastCheckedAt ? formatDateTime(p.lastCheckedAt) : "尚无成功检查记录，仅本地状态"}`,
+    "【检查范围】只检查当前分支，不代表所有分支均已备份",
     `【领先 / 落后】本地领先 ${p.ahead} 个提交，落后 ${p.behind} 个提交`,
     ...fileSection("已暂存的文件", staged),
     ...fileSection("未暂存的文件", unstaged),
@@ -55,7 +59,9 @@ export function buildAiPrompt(info: DiagnosticInfo): string {
   const who = `我的 Git 项目「${p.name}」（${p.path}，分支 ${p.branch}）`;
   const counts = `本地比云端多 ${p.ahead} 个提交、少 ${p.behind} 个提交`;
   const lines = [
-    conflict
+    p.commitBlockReason
+      ? `${who}存在未解决的冲突或未完成的 Git 操作：${p.commitBlockReason}`
+      : conflict
       ? `${who}在两台电脑上改了同一处，自动合并失败。`
       : `${who}在两台电脑上都有新提交，本地和云端分叉了，需要合并。`,
     conflict ? `${counts}；冲突文件：${conflictFiles.join("、")}。` : `${counts}。`,
@@ -64,7 +70,9 @@ export function buildAiPrompt(info: DiagnosticInfo): string {
     `云端最近的提交${p.upstream ? `（${p.upstream}）` : ""}：`,
     ...commitLines(recentRemoteCommits),
     "环境：Windows + Git 命令行。",
-    conflict
+    p.commitBlockReason
+      ? "请先教我确认并处理当前未完成的 Git 操作，在外部工具中解决冲突后再提交推送，不要用 force push、reset 或 rebase。"
+      : conflict
       ? "请一步一步教我在这台电脑上解决冲突并推送，不要用 force push、reset 或 rebase。"
       : "请一步一步教我在这台电脑上合并并推送，不要用 force push、reset 或 rebase。",
   ];

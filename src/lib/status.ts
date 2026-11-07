@@ -120,7 +120,44 @@ export function isAbnormal(status: SyncStatus): boolean {
 /** 一键同步时会自动提交：有未提交改动、打开了自动提交、有上游。
  *  先在本地提交；云端也有新提交时再按分叉处理（预演合并，没有冲突才合并），所以落后、分叉时也会提交 */
 export function willAutoCommit(p: Project): boolean {
-  return p.status === "dirty" && p.autoCommit && !!p.upstream;
+  return p.status === "dirty" && p.autoCommit && !!p.upstream && !p.commitBlockReason;
+}
+
+/** 同一文件可以同时出现在暂存区和工作区，文件总数只计一次。 */
+export function uniqueChangedFileCount(changes: Project["changes"]): number {
+  return new Set(changes.map((c) => c.path)).size;
+}
+
+/** 超过自动检查周期后，不再把旧的远程跟踪信息当作当前云端的确认。 */
+export const CLOUD_CHECK_FRESHNESS_MS = 30 * 60 * 1000;
+
+export function hasRecentCloudCheck(p: Project, now = Date.now()): boolean {
+  const checked = p.lastCheckedAt ? Date.parse(p.lastCheckedAt) : NaN;
+  return !p.checkError && Number.isFinite(checked) && now - checked < CLOUD_CHECK_FRESHNESS_MS;
+}
+
+export function cloudCheckDescription(p: Project, now = Date.now()): string {
+  if (p.checkError) return "检查失败，云端状态待确认";
+  if (!p.lastCheckedAt) return "仅本地状态，尚未成功检查云端";
+  if (!hasRecentCloudCheck(p, now)) return "上次检查已超过 30 分钟，待确认";
+  return "已检查当前分支的云端状态";
+}
+
+/** “需处理”是已有异常或待同步；“待确认”是尚未得到有效云端检查的项目，二者可重叠。 */
+export function summarizeProjects(projects: Project[], autoMerge: boolean, now = Date.now()) {
+  const needsAction = (p: Project) => !!p.issue || !!p.commitBlockReason ||
+    (p.status !== "synced" && p.status !== "syncing");
+  const canAttempt = (p: Project) => !p.commitBlockReason && (
+    STATUS_META[p.status].autoSync || willAutoCommit(p) || (p.status === "diverged" && autoMerge)
+  );
+  return {
+    total: projects.length,
+    confirmedSynced: projects.filter((p) => p.status === "synced" && !p.issue && !p.commitBlockReason && hasRecentCloudCheck(p, now)).length,
+    needsAction: projects.filter(needsAction).length,
+    unconfirmed: projects.filter((p) => !hasRecentCloudCheck(p, now)).length,
+    canAttempt: projects.filter((p) => needsAction(p) && canAttempt(p)).length,
+    manual: projects.filter((p) => needsAction(p) && !canAttempt(p)).length,
+  };
 }
 
 /** 需要处理的排在前面；同权重按名称 */
@@ -143,11 +180,12 @@ function countChanges(p: Project) {
   const untracked = p.changes.filter((c) => c.kind === "?").length;
   const staged = p.changes.filter((c) => c.staged).length;
   const unstaged = p.changes.length - untracked - staged;
-  return { total: p.changes.length, untracked, staged, unstaged };
+  return { total: uniqueChangedFileCount(p.changes), untracked, staged, unstaged };
 }
 
-/** 异常原因（一键同步结果、主页"已跳过"提示、诊断文本里用） */
+/** 异常原因（一键同步结果、主页提示、诊断文本里用） */
 export function describeIssue(p: Project): string {
+  if (p.commitBlockReason) return p.commitBlockReason;
   switch (p.status) {
     case "dirty": {
       const c = countChanges(p);
@@ -156,7 +194,7 @@ export function describeIssue(p: Project): string {
         c.unstaged && `${c.unstaged} 个未暂存`,
         c.untracked && `${c.untracked} 个未跟踪`,
       ].filter(Boolean);
-      return `有 ${c.total} 个未提交的改动（${parts.join("、")}），需要先提交`;
+      return `有 ${c.total} 个未提交的文件（${parts.join("、")}；同一文件可能同时在暂存区和工作区），需要先提交`;
     }
     case "diverged":
       return `本地和云端各有新提交（领先 ${p.ahead}、落后 ${p.behind}），需要先合并`;
@@ -172,7 +210,7 @@ export function describeIssue(p: Project): string {
 export function describeStatus(p: Project, autoMerge = true): string {
   switch (p.status) {
     case "synced":
-      return "本地与 GitHub 完全一致，不需要任何操作。";
+      return `${hasRecentCloudCheck(p) ? "最近一次成功检查时，" : "按本地保存的远程跟踪信息，"}当前分支与上游分支一致。${!hasRecentCloudCheck(p) ? "云端当前状态仍待确认。" : ""}这里只检查当前分支，不代表其他分支均已备份。`;
     case "ahead":
       return `本地有 ${p.ahead} 个提交还没推送到 GitHub。一键同步会自动推送。`;
     case "behind":
@@ -184,12 +222,12 @@ export function describeStatus(p: Project, autoMerge = true): string {
           : autoMerge
             ? "云端也有新提交，提交后会先预演合并，没有冲突就自动合并并推送"
             : "云端也有新提交，而自动合并已关闭，提交后会停在分叉，需要手动合并";
-        return `工作区有 ${p.changes.length} 个文件改动还没提交。已打开自动提交，一键同步会先在本地提交，${then}。`;
+        return `工作区有 ${uniqueChangedFileCount(p.changes)} 个文件改动还没提交。已打开同步时自动提交全部改动，一键同步会先在本地提交，${then}。`;
       }
-      return `工作区有 ${p.changes.length} 个文件改动还没提交。一键同步不会处理，可以在下方直接提交并推送。`;
+      return `工作区有 ${uniqueChangedFileCount(p.changes)} 个文件改动还没提交。${p.commitBlockReason ? "存在未解决冲突或未完成的 Git 操作，需要在外部工具中处理。" : "一键同步不会自动提交，可以在下方直接提交并推送。"}`;
     case "diverged":
       return autoMerge
-        ? `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。一键同步会先预演合并，没有冲突就自动合并。`
+        ? `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。可尝试自动处理：一键同步会先预演合并，只有通过检查且没有冲突才合并并推送；不能保证合并成功。`
         : `本地领先 ${p.ahead} 个提交，同时落后 ${p.behind} 个提交，两边都有对方没有的改动。一键同步不会处理，需要先合并。`;
     case "no-remote":
       if (!p.remoteUrl)
@@ -206,6 +244,7 @@ export function describeStatus(p: Project, autoMerge = true): string {
 
 /** "提交并推送"按钮不可用时的原因；可用时返回 null */
 export function commitPushDisabledReason(p: Project): string | null {
+  if (p.commitBlockReason) return p.commitBlockReason;
   if (p.status === "dirty") {
     if (!p.remoteUrl) return "没有远程仓库，提交后也无处可推";
     if (!p.upstream) return "当前分支没有上游分支，无法直接推送";

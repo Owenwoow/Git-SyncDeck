@@ -8,6 +8,7 @@ import { ProjectToolbar, type StatusFilter } from "@/components/projects/Project
 import { ProjectList } from "@/components/projects/ProjectList";
 import { ProjectDetailSheet } from "@/components/projects/ProjectDetailSheet";
 import { sortProjects } from "@/lib/status";
+import { useTasks } from "@/state/tasks";
 import { useProjects } from "@/state/projects";
 import { activePause, describePauseUntil, useSettings } from "@/state/settings";
 import { headline, overall, resultSummary, shortLabel, type SyncState } from "@/state/syncProgress";
@@ -18,6 +19,7 @@ import { useNow } from "@/lib/useNow";
 export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
   const { projects, loading, refreshing, checkingIds, refresh, sync, startSync, openSync, autoSync, background, openBackground } =
     useProjects();
+  const { tasks } = useTasks();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -31,7 +33,7 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
 
   const selected = projects.find((p) => p.id === selectedId) ?? null;
   // 后台自动同步进行中时也不能再点一键同步 / 刷新（后端同一时间只跑一轮）
-  const syncing = sync.phase === "running" || autoSync !== null;
+  const syncing = tasks.active !== null || tasks.waiting.length > 0 || tasks.installingUpdate || sync.phase === "running";
   // 正在进行的那一轮（一键同步优先）：一键同步按钮变成进度按钮，点开看每个项目的进度
   const runningRound = sync.phase === "running" ? sync : background?.phase === "running" ? background : null;
   const lastBackground = background?.phase === "done" ? background : null;
@@ -90,7 +92,7 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
             </button>
           ) : (
             <p className="mt-0.5 text-sm text-muted-foreground">
-              离开和回到这台电脑时会在后台自动同步（可在设置里调整），也可以随时点"一键同步"。
+              只检查当前分支。你可以随时手动刷新或一键同步。
             </p>
           )}
         </div>
@@ -103,7 +105,7 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
             <ProgressButton round={runningRound} onClick={runningRound === sync ? openSync : openBackground} />
           ) : (
             // 刷新途中也可以点：后端会等这一轮检查结束，再复用刚检查过的结果
-            <Button onClick={startSync} disabled={syncing || loading || projects.length === 0}>
+            <Button onClick={startSync} disabled={tasks.installingUpdate || (syncing && tasks.active?.kind !== "refresh") || loading || projects.length === 0}>
               <ArrowUpDown />
               一键同步
             </Button>
@@ -111,7 +113,7 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
         </div>
       </header>
 
-      <PausedNotice />
+      <AutoSyncControls />
 
       {loading ? (
         <LoadingSkeleton />
@@ -182,45 +184,58 @@ function ProgressButton({ round, onClick }: { round: SyncState; onClick: () => v
   );
 }
 
-/** 自动同步暂停中："自动同步已暂停到 明天 00:00"和「恢复」；到点自动消失 */
-function PausedNotice() {
-  const { settings, resumeAutoSync } = useSettings();
+/** 常用控制固定保留；自动同步和自动检查可同时表达各自的状态。 */
+function AutoSyncControls() {
+  const { settings, updateSettings, pauseAutoSync, resumeAutoSync, error, readError, reloadSettings, retryFailedSave } = useSettings();
+  const { tasks } = useTasks();
   const [now, setNow] = useState(() => Date.now());
   const [busy, setBusy] = useState(false);
   const until = activePause(settings, now);
-
-  // 到了暂停结束的时间重新渲染一次，提示自动消失
   useEffect(() => {
     if (!until) return;
     const timer = window.setTimeout(() => setNow(Date.now()), Math.min(until.getTime() - Date.now() + 500, 2 ** 31 - 1));
     return () => window.clearTimeout(timer);
   }, [until?.getTime()]);
-
-  if (!until) return null;
-
-  async function resume() {
+  async function act(action: () => Promise<void>) {
     setBusy(true);
-    try {
-      await resumeAutoSync();
-      toast.success("已恢复自动同步");
-    } catch (e) {
-      toast.error("恢复失败", { description: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-    }
+    try { await action(); }
+    catch (e) { toast.error("保存自动操作设置失败", { description: e instanceof Error ? e.message : String(e) }); }
+    finally { setBusy(false); }
   }
-
-  return (
-    <div className="flex items-center justify-between gap-3 rounded-lg border bg-muted/40 px-4 py-2.5 text-sm" role="status">
-      <span className="flex min-w-0 items-center gap-2">
-        <PauseCircle className="size-4 shrink-0 text-muted-foreground" />
-        自动同步已暂停到 {describePauseUntil(until)}
-      </span>
-      <Button variant="outline" size="sm" onClick={resume} disabled={busy}>
-        {busy ? <Loader2 className="animate-spin" /> : <Play />}
-        恢复
-      </Button>
+  if (!settings) return (
+    <div className="rounded-lg border px-4 py-3 text-sm" role="status">
+      {readError ? `自动操作设置读取失败：${readError}` : "正在读取自动操作设置…"}
+      {readError && <Button variant="link" onClick={() => void act(reloadSettings)}>重新读取</Button>}
     </div>
+  );
+  const triggers = settings.syncOnLock || settings.syncOnStartup || settings.syncOnResume || settings.syncOnUnlock;
+  const finishing = until && tasks.active?.automatic;
+  const disabled = busy || !!settings.configReadError;
+  const state = !settings.autoSyncEnabled ? "自动同步已关闭" : !triggers ? "自动同步已开启，未选择触发时机" : until ? "自动同步暂停中" : "自动同步已开启";
+  return (
+    <section aria-label="仓库自动操作" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-muted/30 px-4 py-3">
+      <div className="min-w-0 space-y-1 text-sm" role="status">
+        <p className="flex items-center gap-2 font-medium">
+          {until ? <PauseCircle className="size-4 shrink-0" /> : <Play className="size-4 shrink-0" />}{state}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {settings.periodicCheck ? "只读云端检查已开启（每30分钟）" : "只读云端检查已关闭"}
+          {until ? `；仓库自动操作已暂停至 ${describePauseUntil(until)}` : "；手动操作始终可用"}
+        </p>
+        {finishing && <p className="text-xs text-muted-foreground">当前任务完成后暂停，等待中的自动任务不会开始。</p>}
+        {settings.configReadError && <p className="text-xs text-destructive">{settings.configReadError}</p>}
+        {error && <p className="text-xs text-destructive">保存失败：{error}<Button variant="link" size="sm" onClick={() => void act(retryFailedSave)}>重试保存</Button></p>}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {!settings.autoSyncEnabled && <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(() => updateSettings({ autoSyncEnabled: true }))}>开启自动同步</Button>}
+        {until ? <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(resumeAutoSync)}>恢复原有规则</Button> : (
+          <>
+            <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(() => pauseAutoSync("hour"))}>暂停1小时</Button>
+            <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(() => pauseAutoSync("tomorrow"))}>暂停至明天00:00</Button>
+          </>
+        )}
+      </div>
+    </section>
   );
 }
 
