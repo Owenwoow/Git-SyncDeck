@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { FolderPlus, RefreshCw, SearchX, ArrowUpDown, Loader2, PauseCircle, Play, History, ChevronRight } from "lucide-react";
+import { FolderPlus, RefreshCw, SearchX, ArrowUpDown, Loader2, Pause, Play, History, ChevronRight, ChevronDown } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import { OverviewStats } from "@/components/projects/OverviewStats";
 import { ProjectToolbar, type StatusFilter } from "@/components/projects/ProjectToolbar";
@@ -61,8 +62,8 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
 
   return (
     <div className="space-y-5">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div>
+      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2.5">
+        <div className="min-w-0 flex-1 basis-52">
           <h1 className="text-xl font-semibold tracking-tight">监控中的项目</h1>
           {runningRound ? (
             <p className="mt-0.5 flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground" role="status">
@@ -92,11 +93,12 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
             </button>
           ) : (
             <p className="mt-0.5 text-sm text-muted-foreground">
-              只检查当前分支。你可以随时手动刷新或一键同步。
+              查看各项目当前分支的同步状态
             </p>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <AutoSyncControls />
           <Button variant="outline" onClick={handleRefresh} disabled={refreshing || syncing || loading}>
             <RefreshCw className={refreshing ? "animate-spin" : undefined} />
             {refreshing ? "正在刷新…" : "刷新状态"}
@@ -112,8 +114,6 @@ export function HomePage({ onAddProjects }: { onAddProjects: () => void }) {
           )}
         </div>
       </header>
-
-      <AutoSyncControls />
 
       {loading ? (
         <LoadingSkeleton />
@@ -184,7 +184,7 @@ function ProgressButton({ round, onClick }: { round: SyncState; onClick: () => v
   );
 }
 
-/** 常用控制固定保留；自动同步和自动检查可同时表达各自的状态。 */
+/** 页头显示状态，暂停时长与只读检查详情放在同一菜单。 */
 function AutoSyncControls() {
   const { settings, updateSettings, pauseAutoSync, resumeAutoSync, error, readError, reloadSettings, retryFailedSave } = useSettings();
   const { tasks } = useTasks();
@@ -202,40 +202,68 @@ function AutoSyncControls() {
     catch (e) { toast.error("保存自动操作设置失败", { description: e instanceof Error ? e.message : String(e) }); }
     finally { setBusy(false); }
   }
-  if (!settings) return (
-    <div className="rounded-lg border px-4 py-3 text-sm" role="status">
-      {readError ? `自动操作设置读取失败：${readError}` : "正在读取自动操作设置…"}
-      {readError && <Button variant="link" onClick={() => void act(reloadSettings)}>重新读取</Button>}
-    </div>
-  );
-  const triggers = settings.syncOnLock || settings.syncOnStartup || settings.syncOnResume || settings.syncOnUnlock;
+  const triggers = settings && (settings.syncOnLock || settings.syncOnStartup || settings.syncOnResume || settings.syncOnUnlock);
   const finishing = until && tasks.active?.automatic;
-  const disabled = busy || !!settings.configReadError;
-  const state = !settings.autoSyncEnabled ? "自动同步已关闭" : !triggers ? "自动同步已开启，未选择触发时机" : until ? "自动同步暂停中" : "自动同步已开启";
+  const readFailure = readError || settings?.configReadError;
+  const disabled = busy || !!readFailure;
+  const state = !settings ? "读取自动同步设置…"
+    : !settings.autoSyncEnabled ? "自动同步已关闭"
+    : !triggers ? "自动同步未设触发时机" : "自动同步已开启";
+  const label = readFailure ? "自动同步设置异常"
+    : finishing ? "本轮完成后暂停"
+    : until ? `暂停至 ${describePauseUntil(until)}` : state;
+  const dot = readFailure || error ? "bg-destructive"
+    : until ? "bg-status-dirty"
+    : settings?.autoSyncEnabled && triggers ? "bg-status-synced" : "bg-muted-foreground/60";
   return (
-    <section aria-label="仓库自动操作" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-muted/30 px-4 py-3">
-      <div className="min-w-0 space-y-1 text-sm" role="status">
-        <p className="flex items-center gap-2 font-medium">
-          {until ? <PauseCircle className="size-4 shrink-0" /> : <Play className="size-4 shrink-0" />}{state}
-        </p>
-        <p className="text-xs text-muted-foreground">
-          {settings.periodicCheck ? "只读云端检查已开启（每30分钟）" : "只读云端检查已关闭"}
-          {until ? `；仓库自动操作已暂停至 ${describePauseUntil(until)}` : "；手动操作始终可用"}
-        </p>
-        {finishing && <p className="text-xs text-muted-foreground">当前任务完成后暂停，等待中的自动任务不会开始。</p>}
-        {settings.configReadError && <p className="text-xs text-destructive">{settings.configReadError}</p>}
-        {error && <p className="text-xs text-destructive">保存失败：{error}<Button variant="link" size="sm" onClick={() => void act(retryFailedSave)}>重试保存</Button></p>}
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {!settings.autoSyncEnabled && <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(() => updateSettings({ autoSyncEnabled: true }))}>开启自动同步</Button>}
-        {until ? <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(resumeAutoSync)}>恢复原有规则</Button> : (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" className="text-muted-foreground" disabled={!settings && !readFailure} aria-busy={busy}>
+          {busy ? <Loader2 aria-hidden className="size-3.5 animate-spin" /> : <span aria-hidden className={`mx-1 size-1.5 shrink-0 rounded-full ${dot}`} />}
+          <span aria-live="polite">{label}</span>
+          <ChevronDown aria-hidden className="size-3.5 opacity-70" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-60">
+        <DropdownMenuLabel className="space-y-1 whitespace-normal font-normal">
+          <p className="text-sm font-medium text-foreground">{readFailure ? "自动同步设置异常" : state}</p>
+          {settings && <p>{settings.periodicCheck ? "只读云端检查每 30 分钟运行" : "只读云端检查已关闭"}</p>}
+          {until && <p>仓库自动操作暂停至 {describePauseUntil(until)}</p>}
+          {finishing && <p>当前任务完成后暂停。</p>}
+          {readFailure && <p className="break-words text-destructive">{readFailure}</p>}
+          {error && <p className="break-words text-destructive">{error}</p>}
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {readFailure ? (
+          <DropdownMenuItem disabled={busy} onSelect={() => void act(reloadSettings)}>
+            <RefreshCw /> 重新读取设置
+          </DropdownMenuItem>
+        ) : settings && (
           <>
-            <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(() => pauseAutoSync("hour"))}>暂停1小时</Button>
-            <Button size="sm" variant="outline" disabled={disabled} onClick={() => void act(() => pauseAutoSync("tomorrow"))}>暂停至明天00:00</Button>
+            {!settings.autoSyncEnabled && (
+              <DropdownMenuItem disabled={disabled} onSelect={() => void act(() => updateSettings({ autoSyncEnabled: true }))}>
+                <Play /> 开启自动同步
+              </DropdownMenuItem>
+            )}
+            {until ? (
+              <DropdownMenuItem disabled={disabled} onSelect={() => void act(resumeAutoSync)}>
+                <Play /> 恢复原有规则
+              </DropdownMenuItem>
+            ) : (
+              <>
+                <DropdownMenuItem disabled={disabled} onSelect={() => void act(() => pauseAutoSync("hour"))}>
+                  <Pause /> 暂停 1 小时
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={disabled} onSelect={() => void act(() => pauseAutoSync("tomorrow"))}>
+                  <Pause /> 暂停至明天 00:00
+                </DropdownMenuItem>
+              </>
+            )}
           </>
         )}
-      </div>
-    </section>
+        {error && <DropdownMenuItem disabled={disabled} onSelect={() => void act(retryFailedSave)}><RefreshCw /> 重试保存</DropdownMenuItem>}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
