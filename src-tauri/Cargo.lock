@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "git-syncdeck"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
