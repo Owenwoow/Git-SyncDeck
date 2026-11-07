@@ -124,7 +124,11 @@ pub fn run() {
             tray::create(&handle, st.clone(), host.clone())?;
             st.set_change_hook({
                 let handle = handle.clone();
-                move || tray::request_update(&handle)
+                move || {
+                    tray::request_update(&handle);
+                    let state = handle.state::<commands::Shared>();
+                    let _ = handle.emit("tasks-changed", state.task_state());
+                }
             });
 
             // 开机自启：发布版按设置注册 / 取消；调试版不自动注册，只在设置里手动切换开关时才动
@@ -132,11 +136,20 @@ pub fn run() {
                 let handle = handle.clone();
                 move |on| set_autostart(&handle, on)
             });
+            st.set_autostart_query({
+                let handle = handle.clone();
+                move || {
+                    use tauri_plugin_autostart::ManagerExt;
+                    handle.autolaunch().is_enabled().map_err(|error| error.to_string())
+                }
+            });
             #[cfg(not(debug_assertions))]
             {
-                let on = st.config.read(|c| Switches::from_stored(&c.settings).launch_at_login);
-                if let Err(e) = set_autostart(&handle, on) {
-                    eprintln!("同步开机自启设置失败：{e}");
+                if st.config.load_error().is_none() {
+                    let on = st.config.read(|c| Switches::from_stored(&c.settings).launch_at_login);
+                    if let Err(e) = set_autostart(&handle, on) {
+                        st.set_startup_error(format!("同步开机自启设置失败：{e}。请在常规设置中重试，或核对系统启动应用设置"));
+                    }
                 }
             }
 
@@ -175,6 +188,9 @@ pub fn run() {
                 if st.config.read(|c| Switches::from_stored(&c.settings).close_to_tray) {
                     api.prevent_close();
                     let _ = window.hide();
+                } else {
+                    api.prevent_close();
+                    tray::quit(window.app_handle());
                 }
             }
         })
@@ -198,6 +214,9 @@ pub fn run() {
             commands::resume_auto_sync,
             commands::get_auto_sync_state,
             commands::quit_app,
+            commands::get_task_state,
+            commands::begin_update_install,
+            commands::cancel_update_install,
             commands::get_clone_defaults,
             commands::list_github_repos,
             commands::inspect_github_targets,

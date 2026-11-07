@@ -17,6 +17,8 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StoredSettings {
+    /// None 仅用于旧配置迁移；首次创建时显式关闭。
+    pub auto_sync_enabled: Option<bool>,
     pub default_code_dir: Option<String>,
     pub theme: Option<String>,
     /// 自动提交的提交信息模板；None 表示用默认模板
@@ -69,20 +71,52 @@ pub struct StoredProject {
 pub struct ConfigStore {
     path: PathBuf,
     data: Mutex<AppConfig>,
+    load_error: Mutex<Option<String>>,
 }
 
 impl ConfigStore {
     pub fn load(path: PathBuf) -> Self {
-        let data = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| {
-                // 文件损坏：改名保留下来，不删除，然后从空配置开始
-                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                let _ = std::fs::rename(&path, path.with_file_name(format!("config.corrupt-{stamp}.json")));
-                AppConfig::default()
-            }),
-            Err(_) => AppConfig::default(),
+        let fresh = || {
+            let mut c = AppConfig::default();
+            c.settings.auto_sync_enabled = Some(false);
+            c
         };
-        ConfigStore { path, data: Mutex::new(data) }
+        let (data, load_error) = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<AppConfig>(&text) {
+                Ok(mut c) => {
+                    // 文件确实存在才视作升级：保留旧版本有效的自动触发行为。
+                    if c.settings.auto_sync_enabled.is_none() {
+                        c.settings.auto_sync_enabled = Some(true);
+                    }
+                    (c, None)
+                }
+                Err(e) => (fresh(), Some(format!("配置文件无法解析，已保留原文件并停止保存：{e}。请先备份并修复 {} 后重新读取设置或重启应用", path.display()))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (fresh(), None),
+            Err(e) => (fresh(), Some(format!("读取配置失败，已停止保存以保护原数据：{e}。请检查 {} 的权限后重新读取设置或重启应用", path.display()))),
+        };
+        ConfigStore { path, data: Mutex::new(data), load_error: Mutex::new(load_error) }
+    }
+
+    pub fn load_error(&self) -> Option<String> {
+        self.load_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 显式重新读取设置时允许从已修复的文件恢复；失败期间始终禁止覆盖。
+    pub fn reload_if_failed(&self) -> bool {
+        if self.load_error().is_none() { return false; }
+        let loaded = Self::load(self.path.clone());
+        let error = loaded.load_error();
+        if error.is_none() {
+            let restored = loaded.read(Clone::clone);
+            let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+            *data = restored;
+            *self.load_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            true
+        } else {
+            *self.load_error.lock().unwrap_or_else(|e| e.into_inner()) = error;
+            false
+        }
     }
 
     pub fn path(&self) -> &PathBuf {
@@ -96,15 +130,21 @@ impl ConfigStore {
     /// 修改并立即写盘（先写临时文件再改名，中途崩溃不会写坏原文件）
     pub fn update<R>(&self, f: impl FnOnce(&mut AppConfig) -> R) -> Result<R, String> {
         let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        let result = f(&mut data);
-        data.version = 1;
-        let json = serde_json::to_string_pretty(&*data).map_err(|e| e.to_string())?;
+        if let Some(error) = self.load_error() { return Err(error); }
+        let mut candidate = data.clone();
+        let result = f(&mut candidate);
+        candidate.version = 2;
+        let json = serde_json::to_string_pretty(&candidate).map_err(|e| e.to_string())?;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("无法创建配置目录：{e}"))?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("无法写入配置文件：{e}"))?;
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp).map_err(|e| format!("无法写入配置文件：{e}"))?;
+        file.write_all(json.as_bytes()).and_then(|_| file.sync_all()).map_err(|e| format!("无法写入配置文件：{e}"))?;
+        drop(file);
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("无法保存配置文件：{e}"))?;
+        *data = candidate;
         Ok(result)
     }
 }
@@ -160,5 +200,86 @@ mod tests {
         assert!(!sw.sync_on_lock && sw.periodic_check && sw.sync_on_unlock);
         assert_eq!(back.settings.auto_merge, Some(false));
         assert_eq!(back.settings.big_file_limit_mb, Some(10));
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+
+    fn temporary(name: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("syncdeck-config-{name}-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn fresh_default_and_legacy_migration_preserve_choices() {
+        let dir = temporary("migration");
+        let path = dir.join("config.json");
+        let fresh = ConfigStore::load(path.clone());
+        assert_eq!(fresh.read(|c| c.settings.auto_sync_enabled), Some(false));
+        assert!(!path.exists(), "读取本身不能保存默认配置");
+        std::fs::write(&path, r#"{"version":1,"settings":{"theme":"dark","proxyMode":"off","launchAtLogin":false,"syncOnUnlock":false,"autoSyncPausedUntil":"2030-01-01T00:00:00+08:00"},"projects":[{"id":"p","path":"D:/code/test","autoCommit":true}]}"#).unwrap();
+        let old = ConfigStore::load(path.clone());
+        old.read(|c| {
+            assert_eq!(c.settings.auto_sync_enabled, Some(true));
+            assert_eq!(c.settings.theme.as_deref(), Some("dark"));
+            assert_eq!(c.settings.proxy_mode.as_deref(), Some("off"));
+            assert_eq!(c.settings.launch_at_login, Some(false));
+            assert_eq!(c.settings.sync_on_unlock, Some(false));
+            assert!(c.settings.auto_sync_paused_until.is_some());
+            assert!(c.projects[0].auto_commit);
+        });
+        old.update(|c| c.settings.auto_sync_enabled = Some(false)).unwrap();
+        let reopened = ConfigStore::load(path);
+        assert_eq!(reopened.read(|c| c.settings.auto_sync_enabled), Some(false));
+        assert_eq!(reopened.read(|c| c.projects.len()), 1);
+    }
+
+    #[test]
+    fn failed_write_and_replace_never_publish_candidate() {
+        let dir = temporary("write");
+        let path = dir.join("config.json");
+        let store = ConfigStore::load(path.clone());
+        store.update(|c| c.settings.theme = Some("light".into())).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(store.update(|c| c.settings.theme = Some("dark".into())).is_err());
+        assert_eq!(store.read(|c| c.settings.theme.clone()).as_deref(), Some("light"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let target = dir.join("replace-target.json");
+        let replacement = ConfigStore::load(target.clone());
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("preserve"), "existing directory").unwrap();
+        assert!(replacement.update(|c| c.settings.theme = Some("dark".into())).is_err());
+        assert!(replacement.read(|c| c.settings.theme.is_none()));
+        assert_eq!(std::fs::read_to_string(target.join("preserve")).unwrap(), "existing directory");
+    }
+
+    #[test]
+    fn unreadable_or_corrupt_config_is_preserved_and_can_be_reread() {
+        let dir = temporary("read");
+        let path = dir.join("config.json");
+        std::fs::write(&path, "invalid configuration").unwrap();
+        let store = ConfigStore::load(path.clone());
+        assert!(store.load_error().is_some());
+        assert!(store.update(|c| c.projects.clear()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid configuration");
+        assert!(!store.reload_if_failed());
+        std::fs::write(&path, r#"{"settings":{"theme":"dark"},"projects":[]}"#).unwrap();
+        assert!(store.reload_if_failed());
+        assert!(store.load_error().is_none());
+        assert_eq!(store.read(|c| c.settings.theme.clone()).as_deref(), Some("dark"));
+        assert!(store.update(|c| c.settings.theme = Some("light".into())).is_ok());
+
+        let directory = dir.join("directory.json");
+        std::fs::create_dir(&directory).unwrap();
+        let unreadable = ConfigStore::load(directory);
+        assert!(unreadable.load_error().is_some());
+        assert!(unreadable.update(|_| ()).is_err());
     }
 }

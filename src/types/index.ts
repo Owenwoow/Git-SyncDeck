@@ -42,6 +42,10 @@ export interface Project {
   changes: FileChange[];
   /** 上次成功同步的时间（ISO 字符串）；null 表示从未同步 */
   lastSyncAt: string | null;
+  /** 当前进程最近一次成功 fetch 的时间；null 表示仅有本地状态 */
+  lastCheckedAt: string | null;
+  /** 未合并文件或未完成 Git 操作导致的提交禁用原因 */
+  commitBlockReason: string | null;
   /** 一键同步时被判为异常并跳过后保留的原因；null 表示没有遗留问题 */
   issue: string | null;
   /** 检查失败（如断网时 fetch 失败）的原因；此时 status 保留上一次的结果 */
@@ -214,6 +218,12 @@ export interface DiagnosticInfo {
 export type Theme = "light" | "dark";
 
 export interface Settings {
+  /** 只控制换电脑时自动同步；全新安装默认关闭，旧配置保留原有效行为 */
+  autoSyncEnabled: boolean;
+  /** 原配置读取失败时保留文件并阻止写入 */
+  configReadError: string | null;
+  /** 开机自启等外部状态需核对；允许重试并保存其他设置 */
+  runtimeWarning: string | null;
   /** 默认代码目录，添加项目页默认扫描这里 */
   defaultCodeDir: string;
   theme: Theme;
@@ -305,4 +315,20 @@ export interface UpdateInfo {
 export interface UpdateProgress {
   downloaded: number;
   total: number | null;
+}
+
+export type TaskKind = "refresh" | "sync" | "auto-sync" | "commit-push" | "clone" | "auto-check";
+
+export interface TaskInfo {
+  id: number;
+  kind: TaskKind;
+  label: string;
+  automatic: boolean;
+}
+
+/** 后端统一任务快照；等待中的任务也参与退出和更新保护 */
+export interface TaskState {
+  active: TaskInfo | null;
+  waiting: TaskInfo[];
+  installingUpdate: boolean;
 }

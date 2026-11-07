@@ -44,7 +44,9 @@ fn new_app(cfg_file: &Path) -> tauri::App<tauri::test::MockRuntime> {
     let app = tauri::test::mock_builder()
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    app.manage::<Shared>(Arc::new(AppState::new(ConfigStore::load(cfg_file.to_path_buf()))));
+    let store = ConfigStore::load(cfg_file.to_path_buf());
+    store.update(|c| c.settings.auto_sync_enabled = Some(true)).unwrap();
+    app.manage::<Shared>(Arc::new(AppState::new(store)));
     app
 }
 
@@ -148,7 +150,7 @@ async fn arrival_syncs_everything_and_respects_pause() {
     let name_of: HashMap<String, String> = added.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
 
     // 暂停到明天：解锁不做；托盘"立即同步"是手动的，照做
-    let s = commands::pause_auto_sync(app.state()).await.unwrap();
+    let s = commands::pause_auto_sync(app.state(), None).await.unwrap();
     let until = s.auto_sync_paused_until.clone().expect("暂停中");
     assert!(until.contains("T00:00:00"), "暂停到次日 00:00：{until}");
     assert!(commands::get_auto_sync_state(app.state()).running.is_none());

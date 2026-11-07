@@ -43,6 +43,9 @@ jobs:
       - name: 前端类型检查与构建
         run: npm run build
 
+      - name: 前端设置、状态与更新回归
+        run: npm run test:frontend
+
       - name: Rust 测试（只用临时目录里生成的测试仓库）
         working-directory: src-tauri
         run: cargo test

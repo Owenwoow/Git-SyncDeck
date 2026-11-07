@@ -40,6 +40,7 @@ export function Sidebar({
                 <button
                   type="button"
                   onClick={() => onNavigate(p)}
+                  aria-label={label}
                   aria-current={active ? "page" : undefined}
                   className={cn(
                     "flex h-9 items-center gap-2.5 rounded-md px-2.5 text-sm transition-colors",

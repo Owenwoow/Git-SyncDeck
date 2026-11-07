@@ -1,25 +1,26 @@
-import { STATUS_META, willAutoCommit } from "@/lib/status";
+import { summarizeProjects } from "@/lib/status";
+import { useNow } from "@/lib/useNow";
 import { cn } from "@/lib/utils";
+import { useSettings } from "@/state/settings";
 import type { Project } from "@/types";
 
-/** 主页顶部的三张概览卡：项目总数 / 已同步 / 需处理 */
+/** 只将最近成功检查且无异常的当前分支计为已确认同步。 */
 export function OverviewStats({ projects }: { projects: Project[] }) {
-  const total = projects.length;
-  const synced = projects.filter((p) => p.status === "synced").length;
-  // 打开了自动提交的"有未提交改动"项目也算可自动同步
-  const autoSync = projects.filter((p) => STATUS_META[p.status].autoSync || willAutoCommit(p)).length;
-  const manual = projects.filter((p) => STATUS_META[p.status].abnormal && !willAutoCommit(p)).length;
-  const pending = total - synced;
+  const now = useNow(true);
+  const autoMerge = useSettings().settings?.autoMerge ?? true;
+  const stats = summarizeProjects(projects, autoMerge, now);
 
   return (
     <div className="grid grid-cols-3 gap-3">
-      <StatCard label="项目总数" value={total} hint="正在监控" />
-      <StatCard label="已同步" value={synced} hint="本地与云端一致" valueClass="text-status-synced" />
+      <StatCard label="项目总数" value={stats.total} hint="只检查各项目的当前分支" />
+      <StatCard label="已确认同步" value={stats.confirmedSynced} hint={`${stats.unconfirmed} 个待确认 · 30 分钟内检查有效`} valueClass="text-status-synced" />
       <StatCard
         label="需处理"
-        value={pending}
-        valueClass={pending ? "text-status-dirty" : undefined}
-        hint={pending ? `其中 ${autoSync} 个可自动同步，${manual} 个需手动处理` : "全部都是最新的"}
+        value={stats.needsAction}
+        valueClass={stats.needsAction ? "text-status-dirty" : undefined}
+        hint={stats.needsAction
+          ? `${stats.canAttempt} 个可尝试自动处理，${stats.manual} 个需手动处理`
+          : stats.unconfirmed ? "请刷新以确认当前云端状态" : stats.total ? "最近检查时当前分支均已同步" : "尚未添加项目"}
       />
     </div>
   );

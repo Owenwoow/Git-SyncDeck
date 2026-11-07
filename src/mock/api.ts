@@ -21,6 +21,9 @@ import type {
   ProxyMode,
   ScannedRepo,
   Settings,
+  TaskInfo,
+  TaskKind,
+  TaskState,
   SyncItemResult,
   SyncProgressEvent,
   SyncProgressSnapshot,
@@ -61,13 +64,17 @@ export async function listProjects(): Promise<Project[]> {
 let refreshing: Promise<unknown> | null = null;
 
 /** 演示：每个项目各自"联网"一段时间，检查完就回调一次 */
-export async function refreshStatus(onProgress?: (p: Project) => void): Promise<Project[]> {
+async function refreshStatusImpl(onProgress?: (p: Project) => void): Promise<Project[]> {
   const run = (async () => {
     await Promise.all(
       db.monitoredProjects().map(async (p) => {
         await delay(jitter(400, 2600));
         const latest = db.getRepo(p.id);
-        if (latest && db.isMonitored(p.id)) onProgress?.(clone(latest));
+        if (latest && db.isMonitored(p.id)) {
+          const checked = latest.remoteUrl && latest.upstream && !latest.checkError
+            ? db.updateRepo(p.id, { lastCheckedAt: new Date().toISOString() }) : latest;
+          onProgress?.(clone(checked));
+        }
       }),
     );
     return clone(db.monitoredProjects());
@@ -220,7 +227,7 @@ export async function inspectGithubTargets(repos: GithubRepo[], parentDir: strin
 }
 
 /** 演示：每个仓库 2~4 秒，下载 → 处理差异 → 检出，每 200 毫秒报一次百分比；名字含 huge 的模拟超时失败；最多同时 3 个 */
-export async function cloneRepos(
+async function cloneReposImpl(
   items: CloneRequest[],
   onProgress: (e: CloneProgressEvent) => void,
   parentDir?: string,
@@ -275,6 +282,8 @@ export async function cloneRepos(
             behind: 0,
             changes: [],
             lastSyncAt: null,
+            lastCheckedAt: new Date().toISOString(),
+            commitBlockReason: null,
             issue: null,
             checkError: null,
             autoCommit: false,
@@ -305,7 +314,7 @@ function mergeConflictReason(files: string[]): string {
 /** 正在进行的一轮同步（一键同步或演示的后台同步）；同一时间只跑一轮，和真实实现一样 */
 let syncBusy = false;
 
-export async function syncAll(onProgress: (e: SyncProgressEvent) => void): Promise<SyncResult> {
+async function syncAllImpl(onProgress: (e: SyncProgressEvent) => void): Promise<SyncResult> {
   if (syncBusy) throw new Error("正在同步中，请等这一轮结束");
   syncBusy = true;
   try {
@@ -377,6 +386,7 @@ async function runRound(
         ahead: 0,
         behind: 0,
         lastSyncAt: new Date().toISOString(),
+        lastCheckedAt: new Date().toISOString(),
         issue: null,
         checkError: null,
       }),
@@ -414,6 +424,7 @@ async function runRound(
         ahead: 0,
         behind: 0,
         lastSyncAt: new Date().toISOString(),
+        lastCheckedAt: new Date().toISOString(),
         issue: null,
         checkError: null,
       });
@@ -434,13 +445,21 @@ async function runRound(
   return { startedAt, finishedAt: new Date().toISOString(), items, syncedCount: items.length - failedCount, failedCount };
 }
 
-export async function commitAndPush(projectId: string, message: string): Promise<Project> {
+async function commitAndPushImpl(projectId: string, message: string): Promise<Project> {
   await delay(1200);
   const p = db.getRepo(projectId);
   if (!p) throw new Error("项目不存在");
+  if (p.commitBlockReason) throw new Error(p.commitBlockReason);
   if (p.status !== "dirty") throw new Error("这个项目没有需要提交的改动");
   if (!message.trim()) throw new Error("提交说明不能为空");
+  if (!p.upstream) throw new Error("当前分支未关联云端");
+  if (p.behind > 0) {
+    const reason = "已提交到本地，但云端也有新提交，没有推送。请在外部工具完成合并后重试；手动提交不自动合并";
+    db.updateRepo(projectId, { changes: [], ahead: p.ahead + 1, status: "diverged", lastCheckedAt: new Date().toISOString(), issue: reason });
+    throw new Error(reason);
+  }
   const updated = db.updateRepo(projectId, {
+    lastCheckedAt: new Date().toISOString(),
     status: "synced",
     changes: [],
     ahead: 0,
@@ -544,8 +563,8 @@ function normalizeHostName(input: string): string {
 function writeSettings(s: StoredSettings) {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-  } catch {
-    // 存储不可用时只在本次会话生效
+  } catch (e) {
+    throw new Error(`无法保存设置：${String(e)}`);
   }
 }
 
@@ -557,9 +576,27 @@ function readSettings(): StoredSettings {
   const fallback: StoredSettings = { ...defaultSettings, theme: systemTheme() };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    return raw ? { ...fallback, ...JSON.parse(raw) } : fallback;
-  } catch {
-    return fallback;
+    if (!raw) return fallback;
+    const stored = JSON.parse(raw);
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) throw new Error("配置必须是设置对象");
+    for (const [key, initial] of Object.entries(fallback)) {
+      if (typeof initial === "boolean") {
+        if (stored[key] != null && typeof stored[key] !== "boolean") throw new Error(`设置 ${key} 必须是开关值`);
+        stored[key] ??= key === "autoSyncEnabled" ? true : initial;
+      } else if (typeof initial === "string") {
+        if (stored[key] != null && typeof stored[key] !== "string") throw new Error(`设置 ${key} 必须是文本`);
+        stored[key] ??= initial;
+      } else if (typeof initial === "number") {
+        if (stored[key] != null && (!Number.isSafeInteger(stored[key]) || stored[key] < 0)) throw new Error(`设置 ${key} 必须是非负整数`);
+        stored[key] ??= initial;
+      }
+    }
+    for (const key of ["proxyUrl", "autoSyncPausedUntil"]) {
+      if (stored[key] != null && typeof stored[key] !== "string") throw new Error(`设置 ${key} 必须是文本`);
+    }
+    return { ...fallback, ...stored, autoSyncEnabled: stored.autoSyncEnabled ?? true, configReadError: null };
+  } catch (e) {
+    return { ...fallback, configReadError: `无法读取设置，原数据已保留：${String(e)}` };
   }
 }
 
@@ -578,6 +615,7 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
     throw new Error(`大文件上限要在 1 ~ ${MAX_BIG_FILE_LIMIT_MB} MB 之间：${mb} MB`);
   }
   const cur = readSettings();
+  if (cur.configReadError) throw new Error(cur.configReadError);
   // 代理：和真实实现一致，先校验，不合法时什么都不改
   if (patch.proxyMode !== undefined && !PROXY_MODES.includes(patch.proxyMode)) {
     throw new Error(`未知的代理模式：${patch.proxyMode}`);
@@ -592,6 +630,9 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
   const hostName = patch.hostName !== undefined ? normalizeHostName(patch.hostName) : cur.hostName;
 
   const next: StoredSettings = {
+    autoSyncEnabled: patch.autoSyncEnabled ?? cur.autoSyncEnabled,
+    configReadError: null,
+    runtimeWarning: null,
     defaultCodeDir: patch.defaultCodeDir ?? cur.defaultCodeDir,
     theme: patch.theme ?? cur.theme,
     // 和真实实现一致：模板为空时恢复默认
@@ -616,31 +657,44 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
     bigFileLimitMb: patch.bigFileLimitMb ?? cur.bigFileLimitMb,
   };
   writeSettings(next);
-  return withProxy(next);
+  const saved = withProxy(next);
+  settingsListeners.forEach((cb) => cb(clone(saved)));
+  return saved;
 }
 
 /** 演示：没有托盘，不会推送设置变化 */
-export async function onSettingsChanged(_cb: (s: Settings) => void): Promise<Unlisten> {
-  return () => {};
+const settingsListeners = new Set<(s: Settings) => void>();
+export async function onSettingsChanged(cb: (s: Settings) => void): Promise<Unlisten> {
+  settingsListeners.add(cb);
+  return () => settingsListeners.delete(cb);
 }
 
 // ---------------- 换电脑自动同步（演示：切到别的窗口再切回来 = 解锁后同步）----------------
 
 /** 演示：暂停到本地时间明天 00:00 */
-export async function pauseAutoSync(): Promise<Settings> {
+export async function pauseAutoSync(duration: "hour" | "tomorrow" = "tomorrow"): Promise<Settings> {
   await delay(100);
   const midnight = new Date();
-  midnight.setHours(24, 0, 0, 0);
-  const next = { ...readSettings(), autoSyncPausedUntil: midnight.toISOString() };
+  if (duration === "hour") midnight.setTime(midnight.getTime() + 3_600_000);
+  else midnight.setHours(24, 0, 0, 0);
+  const stored = readSettings();
+  if (stored.configReadError) throw new Error(stored.configReadError);
+  const next = { ...stored, autoSyncPausedUntil: midnight.toISOString() };
   writeSettings(next);
-  return withProxy(next);
+  const saved = withProxy(next);
+  settingsListeners.forEach((cb) => cb(clone(saved)));
+  return saved;
 }
 
 export async function resumeAutoSync(): Promise<Settings> {
   await delay(100);
-  const next = { ...readSettings(), autoSyncPausedUntil: null };
+  const stored = readSettings();
+  if (stored.configReadError) throw new Error(stored.configReadError);
+  const next = { ...stored, autoSyncPausedUntil: null };
   writeSettings(next);
-  return withProxy(next);
+  const saved = withProxy(next);
+  settingsListeners.forEach((cb) => cb(clone(saved)));
+  return saved;
 }
 
 export async function getAutoSyncState(): Promise<AutoSyncState> {
@@ -649,8 +703,12 @@ export async function getAutoSyncState(): Promise<AutoSyncState> {
 }
 
 /** 演示：不会真的退出 */
-export async function quitApp(): Promise<void> {
+export async function quitApp(force = false): Promise<TaskState | null> {
+  const snapshot = clone(taskState);
+  if (snapshot.installingUpdate) throw new Error("正在安装更新，请稍候");
+  if (!force && (snapshot.active || snapshot.waiting.length)) return snapshot;
   toast.info("演示模式不会真的退出");
+  return null;
 }
 
 type AutoHandlers = {
@@ -702,6 +760,28 @@ function applySnapshot(s: SyncProgressSnapshot, e: SyncProgressEvent): SyncProgr
 
 /** 演示一次后台同步：锁屏只推有东西要推的项目，其余（解锁、唤醒……）同步所有项目；比一键同步慢一些，方便看进度 */
 async function simulateAutoSync(trigger: AutoSyncTrigger = "unlock") {
+  if (!automaticAllowed(trigger)) return;
+  return withTask(trigger === "periodic" ? "auto-check" : "auto-sync", AUTO_LABELS[trigger], trigger !== "manual", async () => {
+    if (!automaticAllowed(trigger)) return;
+    if (trigger === "periodic") {
+      const list = await refreshStatusImpl();
+      projectsListeners.forEach((cb) => cb(list));
+      return;
+    }
+    await simulateAutoSyncImpl(trigger);
+  });
+}
+
+function automaticAllowed(trigger: AutoSyncTrigger): boolean {
+  if (trigger === "manual") return true;
+  const s = readSettings();
+  if (s.configReadError || (s.autoSyncPausedUntil && Date.parse(s.autoSyncPausedUntil) > Date.now())) return false;
+  if (trigger === "periodic") return s.periodicCheck;
+  const field = { lock: "syncOnLock", startup: "syncOnStartup", resume: "syncOnResume", unlock: "syncOnUnlock" } as const;
+  return s.autoSyncEnabled && s[field[trigger]];
+}
+
+async function simulateAutoSyncImpl(trigger: AutoSyncTrigger = "unlock") {
   if (syncBusy || autoRunning) return;
   syncBusy = true;
   const label = AUTO_LABELS[trigger];
@@ -776,7 +856,7 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
 }
 
 /** 演示：模拟下载进度，最后不会真的安装或重启 */
-export async function installUpdate(onProgress: (p: UpdateProgress) => void): Promise<void> {
+export async function downloadUpdate(onProgress: (p: UpdateProgress) => void): Promise<void> {
   const total = 24_000_000;
   onProgress({ downloaded: 0, total });
   for (let downloaded = 0; downloaded < total; ) {
@@ -784,6 +864,56 @@ export async function installUpdate(onProgress: (p: UpdateProgress) => void): Pr
     downloaded = Math.min(total, downloaded + Math.round(total * (0.06 + Math.random() * 0.08)));
     onProgress({ downloaded, total });
   }
-  await delay(400);
-  toast.info("演示模式：不会真的更新", { description: "真实环境下这里会安装新版本并自动重启应用" });
+  mockDownloaded = true;
+}
+
+
+// 和真实后端一致：统一活动/等待状态，联网任务串行，安装原子封闭入口。
+let taskSerial = Promise.resolve();
+let taskId = 0;
+const taskState: TaskState = { active: null, waiting: [], installingUpdate: false };
+const taskListeners = new Set<(s: TaskState) => void>();
+function emitTasks() { taskListeners.forEach((cb) => cb(clone(taskState))); }
+async function withTask<T>(kind: TaskKind, label: string, automatic: boolean, run: () => Promise<T>): Promise<T> {
+  if (taskState.installingUpdate) throw new Error("正在安装更新，暂时不能开始仓库任务");
+  const info: TaskInfo = { id: ++taskId, kind, label, automatic };
+  taskState.waiting.push(info);
+  emitTasks();
+  const before = taskSerial;
+  let release!: () => void;
+  taskSerial = new Promise<void>((resolve) => { release = resolve; });
+  await before;
+  taskState.waiting = taskState.waiting.filter((t) => t.id !== info.id);
+  taskState.active = info;
+  emitTasks();
+  try { return await run(); }
+  finally { taskState.active = null; emitTasks(); release(); }
+}
+export async function getTaskState(): Promise<TaskState> { return clone(taskState); }
+export async function onTasksChanged(cb: (s: TaskState) => void): Promise<Unlisten> {
+  taskListeners.add(cb); return () => taskListeners.delete(cb);
+}
+export async function onQuitRequested(_cb: (s: TaskState) => void): Promise<Unlisten> { return () => {}; }
+export function refreshStatus(onProgress?: (p: Project) => void): Promise<Project[]> {
+  return withTask("refresh", "刷新项目状态", false, () => refreshStatusImpl(onProgress));
+}
+export function syncAll(onProgress: (e: SyncProgressEvent) => void): Promise<SyncResult> {
+  return withTask("sync", "一键同步", false, () => syncAllImpl(onProgress));
+}
+export function commitAndPush(id: string, message: string): Promise<Project> {
+  return withTask("commit-push", "手动提交并推送", false, () => commitAndPushImpl(id, message));
+}
+export function cloneRepos(items: CloneRequest[], onProgress: (e: CloneProgressEvent) => void, parentDir?: string): Promise<CloneResult[]> {
+  return withTask("clone", "从 GitHub 克隆", false, () => cloneReposImpl(items, onProgress, parentDir));
+}
+let mockDownloaded = false;
+export async function installUpdate(): Promise<void> {
+  if (!mockDownloaded) throw new Error("请先下载更新包");
+  if (taskState.installingUpdate || taskState.active || taskState.waiting.length) throw new Error("仓库任务仍在进行，请完成后再安装更新");
+  taskState.installingUpdate = true;
+  emitTasks();
+  try {
+    await delay(1000);
+    toast.info("演示模式：不会真的安装或重启");
+  } finally { taskState.installingUpdate = false; emitTasks(); }
 }

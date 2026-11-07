@@ -245,20 +245,8 @@ pub async fn sync_one(dir: &Path, opts: &SyncOptions) -> SyncOne {
 /// 4. 云端没有新提交 → push（不强推）；云端也有新提交（现在是分叉）→ 打开了自动合并就预演，
 ///    无冲突再合并并推送（见 `merge_upstream`），否则提交留在本地、记为异常。推送失败时提交保留在本地
 async fn auto_commit_and_push(dir: &Path, ins: Inspection, message: &str, opts: &SyncOptions) -> SyncOne {
-    if ins.conflicts > 0 {
-        let reason = format!("有 {} 个文件处于冲突状态（合并未完成），不会自动提交，请先手动解决冲突", ins.conflicts);
-        return SyncOne::failed(reason, Some(ins), false);
-    }
-    match operation_in_progress(dir).await {
-        Ok(None) => {}
-        Ok(Some(op)) => {
-            let reason = format!("仓库正在{op}，还没完成，不会自动提交，请先手动完成或中止");
-            return SyncOne::failed(reason, Some(ins), false);
-        }
-        Err(e) => {
-            let reason = format!("无法确认仓库是否正在合并，未提交任何内容：{}", e.message());
-            return SyncOne::failed(reason, Some(ins), false);
-        }
+    if let Some(reason) = &ins.commit_block_reason {
+        return SyncOne::failed(reason.clone(), Some(ins), false);
     }
     if let Some(check) = opts.precommit {
         match files_to_commit(dir).await {
@@ -352,9 +340,9 @@ async fn merge_upstream(dir: &Path, ins: &Inspection, message: &str) -> Result<I
     if !ins.changes.is_empty() {
         return Err(format!("工作区有 {} 个未提交的改动，不会自动合并", ins.changes.len()));
     }
-    match operation_in_progress(dir).await {
+    match crate::status::commit_block_reason(dir, ins.conflicts).await {
         Ok(None) => {}
-        Ok(Some(op)) => return Err(format!("仓库正在{op}，还没完成，不会自动合并，请先手动完成或中止")),
+        Ok(Some(reason)) => return Err(reason),
         Err(e) => return Err(format!("无法确认仓库是否正在合并，没有自动合并：{}", e.message())),
     }
     match branch_merge_options(dir, &ins.branch).await {
@@ -663,23 +651,6 @@ async fn files_to_commit(dir: &Path) -> Result<Vec<(String, u64)>, GitError> {
     Ok(files)
 }
 
-/// 是否有未完成的 merge / cherry-pick / revert（此时提交会把它们"完成"掉，所以不自动提交）
-async fn operation_in_progress(dir: &Path) -> Result<Option<&'static str>, GitError> {
-    for (head, label) in [
-        ("MERGE_HEAD", "合并（merge）"),
-        ("CHERRY_PICK_HEAD", "拣选提交（cherry-pick）"),
-        ("REVERT_HEAD", "撤销提交（revert）"),
-    ] {
-        match run_git(dir, &["rev-parse", "-q", "--verify", head], STATUS_TIMEOUT).await {
-            Ok(_) => return Ok(Some(label)),
-            // 不存在时退出码为 1
-            Err(GitError::Failed { .. }) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(None)
-}
-
 /// 操作成功后重新读取状态；万一读取失败，就用操作前的结果
 async fn reinspect(dir: &Path, fallback: Inspection) -> Inspection {
     inspect(dir).await.unwrap_or(fallback)
@@ -692,6 +663,10 @@ pub async fn commit_and_push(dir: &Path, message: &str) -> Result<Inspection, St
         return Err("提交说明不能为空".into());
     }
     let ins = inspect(dir).await.map_err(|e| e.message())?;
+    if let Some(reason) = crate::status::commit_block_reason(dir, ins.conflicts).await.map_err(|e| e.message())? {
+        return Err(reason);
+    }
+
     match ins.status {
         SyncStatus::Dirty => {}
         SyncStatus::NoRemote => return Err(no_remote_reason(&ins)),

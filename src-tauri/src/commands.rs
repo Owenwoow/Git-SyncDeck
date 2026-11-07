@@ -31,10 +31,14 @@ use crate::{scan, system, util};
 
 pub struct AppState {
     pub config: ConfigStore,
+    tasks: Mutex<TaskRegistry>,
+    settings_lock: tokio::sync::Mutex<()>,
+    startup_error: Mutex<Option<String>>,
     /// 每个项目最近一次检查的结果（内存），检查失败时用它保留上一次的状态
     cache: Mutex<HashMap<String, Project>>,
     /// 每个项目最近一次联网检查（fetch）成功的时间，刷新和一键同步都会记；一键同步据此跳过刚 fetch 过的项目
     checked_at: Mutex<HashMap<String, Instant>>,
+    checked_wall: Mutex<HashMap<String, (String, CheckContext)>>,
     /// 联网操作（刷新、一键同步、提交推送）互斥，避免同一个仓库被同时 fetch / push
     net_lock: tokio::sync::Mutex<()>,
     syncing: AtomicBool,
@@ -48,6 +52,7 @@ pub struct AppState {
     on_change: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// 注册 / 取消开机自启（需要 AppHandle，由 lib.rs 设置）；测试里不设置
     autostart: OnceLock<Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>>,
+    autostart_state: OnceLock<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
 }
 
 pub type Shared = Arc<AppState>;
@@ -60,14 +65,69 @@ pub type RefreshSink = Arc<dyn Fn(RefreshProgressEvent) + Send + Sync>;
 /// 已经有一轮同步在进行时 `run_sync` 返回的错误
 pub const SYNC_BUSY: &str = "正在同步中，请等这一轮结束";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckContext {
+    branch: String,
+    upstream: Option<String>,
+    remote_url: Option<String>,
+}
+
+impl From<&Inspection> for CheckContext {
+    fn from(ins: &Inspection) -> Self {
+        Self { branch: ins.branch.clone(), upstream: ins.upstream.clone(), remote_url: ins.remote_url.clone() }
+    }
+}
+
+#[derive(Default)]
+struct TaskRegistry {
+    next_id: u64,
+    blocked: bool,
+    state: TaskState,
+}
+
+/// 注册任务和安装闸门共用一把锁；注册发生在等待 net_lock 之前。
+pub struct TaskGuard {
+    st: Shared,
+    id: u64,
+}
+
+impl TaskGuard {
+    fn activate(&self) {
+        {
+            let mut registry = self.st.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(index) = registry.state.waiting.iter().position(|task| task.id == self.id) {
+                registry.state.active = Some(registry.state.waiting.remove(index));
+            }
+        }
+        self.st.changed();
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        {
+            let mut registry = self.st.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            registry.state.waiting.retain(|task| task.id != self.id);
+            if registry.state.active.as_ref().is_some_and(|task| task.id == self.id) {
+                registry.state.active = None;
+            }
+        }
+        self.st.changed();
+    }
+}
+
 impl AppState {
     pub fn new(config: ConfigStore) -> Self {
         set_network_timeout(config.read(network_timeout_of));
         util::set_host_name(config.read(|c| c.settings.host_name.clone()).as_deref());
         AppState {
             config,
+            tasks: Mutex::new(TaskRegistry::default()),
+            settings_lock: tokio::sync::Mutex::new(()),
+            startup_error: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             checked_at: Mutex::new(HashMap::new()),
+            checked_wall: Mutex::new(HashMap::new()),
             net_lock: tokio::sync::Mutex::new(()),
             syncing: AtomicBool::new(false),
             round: Mutex::new(SyncProgressSnapshot::default()),
@@ -75,7 +135,63 @@ impl AppState {
             auto: AutoSync::new(),
             on_change: OnceLock::new(),
             autostart: OnceLock::new(),
+            autostart_state: OnceLock::new(),
         }
+    }
+
+    pub fn task_state(&self) -> TaskState {
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).state.clone()
+    }
+
+    pub fn register_task(st: &Shared, kind: &str, label: &str, automatic: bool) -> Result<TaskGuard, String> {
+        let id = {
+            let mut registry = st.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if registry.blocked || registry.state.installing_update {
+                return Err("应用正在安装更新或退出，暂时不能开始新的仓库任务".into());
+            }
+            registry.next_id += 1;
+            let id = registry.next_id;
+            registry.state.waiting.push(TaskInfo { id, kind: kind.into(), label: label.into(), automatic });
+            id
+        };
+        st.changed();
+        Ok(TaskGuard { st: st.clone(), id })
+    }
+
+    /// 原子检查全部活动/等待任务并封闭入口，安装与重启只能持有此闸门执行。
+    pub fn begin_install(&self) -> Result<(), String> {
+        {
+            let mut registry = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if registry.blocked || registry.state.busy() {
+                let label = registry.state.active.as_ref().or(registry.state.waiting.first())
+                    .map(|task| task.label.as_str()).unwrap_or("更新安装");
+                return Err(format!("{label}尚未结束，请稍后再安装更新"));
+            }
+            registry.state.installing_update = true;
+        }
+        self.changed();
+        Ok(())
+    }
+
+    pub fn cancel_install(&self) {
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).state.installing_update = false;
+        self.changed();
+    }
+
+    /// 返回忙碌状态供用户决定；确认后封闭任务入口，避免检查后新任务插入。
+    pub fn prepare_quit(&self, force: bool) -> Option<TaskState> {
+        let mut registry = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if registry.state.installing_update || (!force && registry.state.busy()) { return Some(registry.state.clone()); }
+        registry.blocked = true;
+        None
+    }
+
+    pub fn set_startup_error(&self, error: String) {
+        *self.startup_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+    }
+
+    fn runtime_warning(&self) -> Option<String> {
+        self.startup_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 设置"状态变化"回调（只能设置一次）
@@ -86,6 +202,11 @@ impl AppState {
     /// 设置"注册 / 取消开机自启"的实现（只能设置一次）
     pub fn set_autostart_hook(&self, f: impl Fn(bool) -> Result<(), String> + Send + Sync + 'static) {
         let _ = self.autostart.set(Box::new(f));
+    }
+
+    /// 保存前读取系统实际值，写盘失败时补偿到原外部状态。
+    pub fn set_autostart_query(&self, f: impl Fn() -> Result<bool, String> + Send + Sync + 'static) {
+        let _ = self.autostart_state.set(Box::new(f));
     }
 
     /// 通知托盘等：状态变了。调用时不能持有任何锁
@@ -137,15 +258,23 @@ impl AppState {
     fn forget(&self, id: &str) {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.checked_wall.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         self.changed();
     }
 
     /// 记下"刚刚联网检查成功"
-    fn mark_checked(&self, id: &str) {
+    fn mark_checked(&self, id: &str, ins: &Inspection) {
+        self.checked_wall.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), (now_iso(), CheckContext::from(ins)));
         self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), Instant::now());
     }
 
-    fn last_checked(&self, id: &str) -> Option<Instant> {
+    fn checked_time(&self, id: &str, ins: &Inspection) -> Option<String> {
+        self.checked_wall.lock().unwrap_or_else(|e| e.into_inner()).get(id)
+            .filter(|(_, context)| *context == CheckContext::from(ins)).map(|(time, _)| time.clone())
+    }
+
+    fn last_checked(&self, id: &str, ins: &Inspection) -> Option<Instant> {
+        self.checked_time(id, ins)?;
         self.checked_at.lock().unwrap_or_else(|e| e.into_inner()).get(id).copied()
     }
 
@@ -154,7 +283,7 @@ impl AppState {
     }
 
     /// 更新某个项目的持久化字段，返回更新后的记录
-    fn update_stored(&self, sp: &StoredProject, f: impl FnOnce(&mut StoredProject)) -> StoredProject {
+    fn update_stored(&self, sp: &StoredProject, f: impl FnOnce(&mut StoredProject)) -> Result<StoredProject, String> {
         self.config
             .update(|c| match c.projects.iter_mut().find(|p| p.id == sp.id) {
                 Some(entry) => {
@@ -163,13 +292,12 @@ impl AppState {
                 }
                 None => sp.clone(), // 处理过程中被取消监控了
             })
-            .unwrap_or_else(|_| sp.clone())
     }
 }
 
 // ---------------- 组装 Project ----------------
 
-fn project_from(sp: &StoredProject, ins: &Inspection) -> Project {
+fn project_from(st: &AppState, sp: &StoredProject, ins: &Inspection) -> Project {
     Project {
         id: sp.id.clone(),
         name: folder_name(&sp.path),
@@ -182,6 +310,8 @@ fn project_from(sp: &StoredProject, ins: &Inspection) -> Project {
         behind: ins.behind,
         changes: ins.changes.clone(),
         last_sync_at: sp.last_sync_at.clone(),
+        last_checked_at: st.checked_time(&sp.id, ins),
+        commit_block_reason: ins.commit_block_reason.clone(),
         issue: sp.issue.clone(),
         check_error: None,
         auto_commit: sp.auto_commit,
@@ -202,6 +332,8 @@ fn with_error(prev: Option<Project>, sp: &StoredProject, error: String) -> Proje
         behind: 0,
         changes: Vec::new(),
         last_sync_at: None,
+        last_checked_at: None,
+        commit_block_reason: None,
         issue: None,
         check_error: None,
         auto_commit: false,
@@ -218,7 +350,7 @@ async fn local_project(st: &AppState, sp: &StoredProject) -> Project {
     let prev = st.cached(&sp.id);
     let p = match inspect(Path::new(&sp.path)).await {
         Ok(ins) => {
-            let mut p = project_from(sp, &ins);
+            let mut p = project_from(st, sp, &ins);
             // 本地检查不涉及网络，保留上一次联网检查的失败原因
             p.check_error = prev.and_then(|x| x.check_error);
             p
@@ -238,17 +370,19 @@ async fn remote_project(st: &AppState, sp: &StoredProject) -> Option<Project> {
     let prev = st.cached(&sp.id);
     let mut p = match checked {
         Checked::Fresh(ins) => {
-            st.mark_checked(&sp.id);
-            project_from(&sp, &ins)
+            if ins.can_fetch() { st.mark_checked(&sp.id, &ins); }
+            project_from(st, &sp, &ins)
         }
         // fetch 失败：状态停留在上一次 fetch 时的结果（本地的远程跟踪分支没变）
-        Checked::FetchFailed { local, error } => with_error(Some(project_from(&sp, &local)), &sp, error.message()),
+        Checked::FetchFailed { local, error } => with_error(Some(project_from(st, &sp, &local)), &sp, error.message()),
         Checked::Failed(error) => with_error(prev, &sp, error.message()),
     };
     // 刷新检测到已同步：清除遗留的异常标记
     if p.status == SyncStatus::Synced && p.check_error.is_none() && p.issue.is_some() {
-        st.update_stored(&sp, |e| e.issue = None);
-        p.issue = None;
+        match st.update_stored(&sp, |e| e.issue = None) {
+            Ok(_) => p.issue = None,
+            Err(error) => p.issue = Some(format!("{}；保存检查结果失败：{error}", p.issue.as_deref().unwrap_or_default())),
+        }
     }
     st.remember(&p);
     Some(p)
@@ -385,15 +519,27 @@ pub async fn refresh_status(
     state: State<'_, Shared>,
     on_event: Channel<RefreshProgressEvent>,
 ) -> Result<Vec<Project>, String> {
-    Ok(run_refresh(state.inner(), Arc::new(move |e| {
+    run_refresh(state.inner(), Arc::new(move |e| {
         let _ = on_event.send(e);
     }))
-    .await)
+    .await
 }
 
 /// 刷新状态的主体（fetch + status，不拉取）：窗口里的"刷新状态"和后台的定时检查云端都用它
-pub async fn run_refresh(st: &Shared, on_event: RefreshSink) -> Vec<Project> {
+pub async fn run_refresh(st: &Shared, on_event: RefreshSink) -> Result<Vec<Project>, String> {
+    run_refresh_for(st, on_event, None).await
+}
+
+pub async fn run_refresh_for(st: &Shared, on_event: RefreshSink, trigger: Option<AutoSyncTrigger>) -> Result<Vec<Project>, String> {
+    let task = AppState::register_task(st, if trigger.is_some() { "auto-check" } else { "refresh" },
+        if trigger.is_some() { "自动检查云端" } else { "刷新状态" }, trigger.is_some())?;
     let _net = st.net_lock.lock().await;
+    if let Some(trigger) = trigger {
+        if !st.config.read(|c| autosync::allowed_now(&c.settings, trigger)) {
+            return Err("自动仓库操作已暂停或关闭，本次等待任务已取消".into());
+        }
+    }
+    task.activate();
     refresh_proxy(st).await;
     let stored = st.config.read(|c| c.projects.clone());
     let total = stored.len();
@@ -411,7 +557,7 @@ pub async fn run_refresh(st: &Shared, on_event: RefreshSink) -> Vec<Project> {
         }
     })
     .await;
-    checked.into_iter().flatten().collect()
+    Ok(checked.into_iter().flatten().collect())
 }
 
 #[tauri::command]
@@ -521,12 +667,25 @@ pub async fn sync_all(
 /// `only` 为 None 时同步所有项目，否则只同步这些 id 的项目（离开时只挑有东西要推的）。
 /// 同一时间只允许一轮（"正在同步"标记），已经有一轮在跑时返回 `SYNC_BUSY`；联网操作之间用 net_lock 互斥。
 pub async fn run_sync(st: &Shared, only: Option<Vec<String>>, on_event: SyncSink) -> Result<SyncResult, String> {
+    run_sync_for(st, only, on_event, None).await
+}
+
+pub async fn run_sync_for(st: &Shared, only: Option<Vec<String>>, on_event: SyncSink, trigger: Option<AutoSyncTrigger>) -> Result<SyncResult, String> {
+    let automatic = trigger.is_some_and(|t| t != AutoSyncTrigger::Manual);
+    let task = AppState::register_task(st, if automatic { "auto-sync" } else { "sync" },
+        trigger.map_or("一键同步", |t| t.label()), automatic)?;
     if st.syncing.swap(true, Ordering::SeqCst) {
         return Err(SYNC_BUSY.into());
     }
     st.changed();
     let _flag = SyncingFlag(st.clone());
     let _net = st.net_lock.lock().await;
+    if let Some(trigger) = trigger {
+        if !st.config.read(|c| autosync::allowed_now(&c.settings, trigger)) {
+            return Err("自动仓库操作已暂停或关闭，本次等待任务已取消".into());
+        }
+    }
+    task.activate();
     refresh_proxy(st).await;
 
     let started_at = now_iso();
@@ -574,7 +733,7 @@ pub async fn run_sync(st: &Shared, only: Option<Vec<String>>, on_event: SyncSink
                     })
                 })
             };
-            let opts = sync_options_for(&st, &sp, &commit_message, progress);
+            let opts = sync_options_for(&st, &sp, &commit_message, progress).await;
             let one = ops::sync_one(Path::new(&sp.path), &opts).await;
             let (project, result) = record_sync(&st, &sp, &opts, one);
             let index = finished.fetch_add(1, Ordering::SeqCst);
@@ -605,7 +764,7 @@ pub fn should_skip_fetch(last_checked: Option<Instant>, now: Instant) -> bool {
 /// 一键同步时单个项目的选项。**唯一的构造入口**：`sync_all` 只通过这里拿选项，以后加选项也只改这里。
 /// `commit_message` 是本轮共用的自动提交信息，只给打开了自动提交的项目用；`progress` 接收这个项目的 git 进度。
 /// 自动合并的提交信息"自动合并：来自 {host}"里的 `{host}` 和自动提交信息用同一个取电脑名的来源。
-fn sync_options_for(
+async fn sync_options_for(
     st: &AppState,
     sp: &StoredProject,
     commit_message: &str,
@@ -613,9 +772,13 @@ fn sync_options_for(
 ) -> ops::SyncOptions {
     let (auto_merge, precommit_check, big_file_limit_mb) =
         st.config.read(|c| (auto_merge_of(c), precommit_check_of(c), big_file_limit_of(c)));
+    let reuse = match inspect(Path::new(&sp.path)).await {
+        Ok(ins) => should_skip_fetch(st.last_checked(&sp.id, &ins), Instant::now()),
+        Err(_) => false,
+    };
     ops::SyncOptions {
         auto_commit: sp.auto_commit.then(|| commit_message.to_string()),
-        skip_fetch: should_skip_fetch(st.last_checked(&sp.id), Instant::now()),
+        skip_fetch: reuse,
         auto_merge,
         merge_message: ops::merge_message(&util::computer_name()),
         precommit: precommit_check.then_some(ops::PrecommitCheck { big_file_limit_mb }),
@@ -626,11 +789,12 @@ fn sync_options_for(
 /// 记录单个项目的同步结果：成功（含自动提交并推送）→ 更新上次同步时间、清除异常；失败 → 保存异常原因。
 /// 这次真的 fetch 成功了，就记下检查时间（跳过 fetch 时不记，免得一直沿用旧结果）。
 fn record_sync(st: &AppState, sp: &StoredProject, opts: &ops::SyncOptions, one: SyncOne) -> (Project, SyncItemResult) {
-    if !opts.skip_fetch && !one.check_failed {
-        st.mark_checked(&sp.id);
+    if !opts.skip_fetch && !one.check_failed && one.inspection.as_ref().is_some_and(|ins| ins.can_fetch()) {
+        if let Some(ins) = &one.inspection { st.mark_checked(&sp.id, ins); }
     }
     let success = one.outcome != SyncOutcome::Failed;
-    let reason = one.reason.clone();
+    let mut reason = one.reason.clone();
+    let mut outcome = one.outcome;
     let now = now_iso();
     let updated = st.update_stored(sp, |e| {
         if success {
@@ -640,13 +804,24 @@ fn record_sync(st: &AppState, sp: &StoredProject, opts: &ops::SyncOptions, one: 
             e.issue = reason.clone();
         }
     });
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(error) => {
+            let detail = format!("{}保存同步记录失败：{error}", if success { "仓库操作已完成，但" } else { "" });
+            reason = Some(match reason { Some(reason) => format!("{reason}；{detail}"), None => detail });
+            outcome = SyncOutcome::Failed;
+            let mut fallback = sp.clone();
+            fallback.issue = reason.clone();
+            fallback
+        }
+    };
     let project = match (&one.inspection, one.check_failed) {
-        (Some(ins), false) => project_from(&updated, ins),
-        (Some(ins), true) => with_error(Some(project_from(&updated, ins)), &updated, reason.clone().unwrap_or_default()),
+        (Some(ins), false) => project_from(st, &updated, ins),
+        (Some(ins), true) => with_error(Some(project_from(st, &updated, ins)), &updated, reason.clone().unwrap_or_default()),
         (None, _) => with_error(st.cached(&sp.id), &updated, reason.clone().unwrap_or_default()),
     };
     st.remember(&project);
-    let result = SyncItemResult { project_id: sp.id.clone(), outcome: one.outcome, commits: one.commits, reason };
+    let result = SyncItemResult { project_id: sp.id.clone(), outcome, commits: one.commits, reason };
     (project, result)
 }
 
@@ -657,24 +832,27 @@ pub async fn commit_and_push(
     message: String,
 ) -> Result<Project, String> {
     let st = state.inner().clone();
+    let task = AppState::register_task(&st, "commit-push", "手动提交并推送", false)?;
     let _net = st.net_lock.lock().await;
+    task.activate();
     refresh_proxy(&st).await;
     let sp = st.stored(&project_id).ok_or("项目不存在")?;
     let dir = PathBuf::from(&sp.path);
     match ops::commit_and_push(&dir, &message).await {
         Ok(ins) => {
+            st.mark_checked(&sp.id, &ins);
             let updated = st.update_stored(&sp, |e| {
                 e.last_sync_at = Some(now_iso());
                 e.issue = None;
-            });
-            let p = project_from(&updated, &ins);
+            }).map_err(|error| format!("提交和推送已完成，但保存同步记录失败：{error}"))?;
+            let p = project_from(&st, &updated, &ins);
             st.remember(&p);
             Ok(p)
         }
         Err(msg) => {
             // 可能已经提交到本地，刷新一下缓存里的状态
             if let Ok(ins) = inspect(&dir).await {
-                st.remember(&project_from(&sp, &ins));
+                st.remember(&project_from(&st, &sp, &ins));
             }
             Err(msg)
         }
@@ -688,7 +866,7 @@ pub async fn get_diagnostic_info(state: State<'_, Shared>, project_id: String) -
     let prev = state.cached(&sp.id);
     let project = match inspect(&dir).await {
         Ok(ins) => {
-            let mut p = project_from(&sp, &ins);
+            let mut p = project_from(&state, &sp, &ins);
             p.check_error = prev.and_then(|x| x.check_error);
             p
         }
@@ -725,9 +903,12 @@ pub async fn open_in_editor(state: State<'_, Shared>, project_id: String) -> Res
     Ok(sp.path)
 }
 
-fn settings_of(c: &AppConfig, proxy: &ResolvedProxy) -> Settings {
+fn settings_of(st: &AppState, c: &AppConfig, proxy: &ResolvedProxy) -> Settings {
     let sw = Switches::from_stored(&c.settings);
     Settings {
+        auto_sync_enabled: sw.auto_sync_enabled,
+        config_read_error: st.config.load_error(),
+        runtime_warning: st.runtime_warning(),
         default_code_dir: code_dir_of(c),
         theme: c.settings.theme.clone(),
         commit_template: commit_template_of(c),
@@ -809,12 +990,27 @@ fn commit_template_of(c: &AppConfig) -> String {
 /// 读取设置；顺带重新解析一次代理，设置页显示的"当前代理"是此刻的实际情况
 #[tauri::command]
 pub async fn get_settings(state: State<'_, Shared>) -> Result<Settings, String> {
+    let _settings = state.settings_lock.lock().await;
+    if state.config.reload_if_failed() {
+        state.config.read(|c| {
+            set_network_timeout(network_timeout_of(c));
+            util::set_host_name(c.settings.host_name.as_deref());
+        });
+        #[cfg(not(debug_assertions))]
+        if let Some(apply) = state.autostart.get() {
+            let on = state.config.read(|c| Switches::from_stored(&c.settings).launch_at_login);
+            if let Err(error) = apply(on) { state.set_startup_error(format!("重新读取配置成功，但恢复开机自启设置失败：{error}")); }
+        }
+        state.changed();
+    }
     let proxy = refresh_proxy(&state).await;
-    Ok(state.config.read(|c| settings_of(c, &proxy)))
+    Ok(state.config.read(|c| settings_of(&state, c, &proxy)))
 }
 
 #[tauri::command]
 pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Result<Settings, String> {
+    let _settings = state.settings_lock.lock().await;
+    if let Some(error) = state.config.load_error() { return Err(error); }
     if let Some(t) = &patch.theme {
         if t != "light" && t != "dark" {
             return Err(format!("未知的主题：{t}"));
@@ -855,14 +1051,17 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
         None
     };
     let host_name = patch.host_name.as_deref().map(validate_host_name).transpose()?;
-    // 开机自启：先注册 / 取消，成功了再保存，免得设置显示的和实际不一致
+    let old_autostart = match (patch.launch_at_login, state.autostart_state.get()) {
+        (Some(_), Some(query)) => query().map_err(|error| format!("读取系统开机自启状态失败，未修改设置：{error}"))?,
+        _ => state.config.read(|c| Switches::from_stored(&c.settings).launch_at_login),
+    };
+    // 外部注册成功后若写盘失败，补偿恢复原值；任何错误均返回界面。
     if let (Some(on), Some(apply)) = (patch.launch_at_login, state.autostart.get()) {
         apply(on).map_err(|e| format!("设置开机自启失败：{e}"))?;
     }
-    state.config.update(|c| {
+    let saved = state.config.update(|c| {
         if let Some(name) = &host_name {
             c.settings.host_name = name.clone();
-            util::set_host_name(name.as_deref());
         }
         let mut sw = Switches::from_stored(&c.settings);
         sw.apply(&patch);
@@ -896,16 +1095,42 @@ pub async fn save_settings(state: State<'_, Shared>, patch: SettingsPatch) -> Re
         if let Some(mb) = patch.big_file_limit_mb {
             c.settings.big_file_limit_mb = (mb != ops::DEFAULT_BIG_FILE_LIMIT_MB).then_some(mb);
         }
+    });
+    if let Err(error) = saved {
+        if patch.launch_at_login.is_some() {
+            if let Some(apply) = state.autostart.get() {
+                if let Err(compensation) = apply(old_autostart) {
+                    let detail = format!("{error}；恢复开机自启也失败：{compensation}。请在系统启动应用设置中核对原状态");
+                    state.set_startup_error(detail.clone());
+                    return Err(detail);
+                }
+            }
+        }
+        return Err(error);
+    }
+    state.config.read(|c| {
         set_network_timeout(network_timeout_of(c));
-    })?;
+        util::set_host_name(c.settings.host_name.as_deref());
+    });
+    if patch.launch_at_login.is_some() {
+        *state.startup_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    state.changed();
     let proxy = refresh_proxy(&state).await;
-    Ok(state.config.read(|c| settings_of(c, &proxy)))
+    Ok(state.config.read(|c| settings_of(&state, c, &proxy)))
 }
 
 /// 当前设置（托盘里暂停 / 恢复后，用它把最新设置推给前端）
 pub async fn current_settings(st: &AppState) -> Settings {
     let proxy = refresh_proxy(st).await;
-    st.config.read(|c| settings_of(c, &proxy))
+    st.config.read(|c| settings_of(st, c, &proxy))
+}
+
+/// 托盘的总开关保留所有触发规则和暂停期限，不立即触发同步。
+pub fn set_auto_sync_enabled(st: &AppState, enabled: bool) -> Result<(), String> {
+    st.config.update(|c| c.settings.auto_sync_enabled = Some(enabled))?;
+    st.changed();
+    Ok(())
 }
 
 /// 暂停自动同步到某个时间（None = 恢复）。托盘菜单和设置页都用它
@@ -917,8 +1142,14 @@ pub fn set_auto_sync_pause(st: &AppState, until: Option<DateTime<Local>>) -> Res
 
 /// 暂停自动同步到明天 00:00（本地时间）
 #[tauri::command]
-pub async fn pause_auto_sync(state: State<'_, Shared>) -> Result<Settings, String> {
-    set_auto_sync_pause(&state, Some(autosync::next_midnight(&Local::now())))?;
+pub async fn pause_auto_sync(state: State<'_, Shared>, duration: Option<String>) -> Result<Settings, String> {
+    let now = Local::now();
+    let until = match duration.as_deref().unwrap_or("tomorrow") {
+        "hour" => now + chrono::Duration::hours(1),
+        "tomorrow" => autosync::next_midnight(&now),
+        _ => return Err("不支持的暂停时长".into()),
+    };
+    set_auto_sync_pause(&state, Some(until))?;
     Ok(current_settings(&state).await)
 }
 
@@ -938,10 +1169,31 @@ pub fn get_auto_sync_state(state: State<'_, Shared>) -> AutoSyncState {
     s
 }
 
-/// 退出 SyncDeck（设置页「退出 SyncDeck」按钮；和托盘菜单「退出」同一个逻辑）
 #[tauri::command]
-pub fn quit_app<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
-    crate::tray::quit(&app);
+pub fn get_task_state(state: State<'_, Shared>) -> TaskState {
+    state.task_state()
+}
+
+#[tauri::command]
+pub fn begin_update_install(state: State<'_, Shared>) -> Result<(), String> {
+    state.begin_install()
+}
+
+#[tauri::command]
+pub fn cancel_update_install(state: State<'_, Shared>) {
+    state.cancel_install();
+}
+
+/// 所有退出入口在后端原子检查全部任务，忙时交给同一个前端确认框。
+#[tauri::command]
+pub fn quit_app<R: tauri::Runtime>(app: tauri::AppHandle<R>, state: State<'_, Shared>, force: Option<bool>) -> Result<Option<TaskState>, String> {
+    if state.task_state().installing_update { return Err("正在安装更新，请等待安装完成后自动重启".into()); }
+    if let Some(tasks) = state.prepare_quit(force.unwrap_or(false)) {
+        if tasks.installing_update { return Err("正在安装更新，请等待安装完成后自动重启".into()); }
+        return Ok(Some(tasks));
+    }
+    app.exit(0);
+    Ok(None)
 }
 
 // ---------------- 从 GitHub 克隆 ----------------
@@ -1127,7 +1379,9 @@ pub async fn run_clone(st: &Shared, items: Vec<CloneRequest>, sink: CloneSink, p
     // 在等待联网锁之前固定目录，设置后来发生变化也不会改变这批的目标。
     let code_dir = clone_parent(st, parent_dir.as_deref())?;
     // 和刷新、一键同步互斥
+    let task = AppState::register_task(st, "clone", "克隆仓库", false)?;
     let _net = st.net_lock.lock().await;
+    task.activate();
     refresh_proxy(st).await;
     // 等待期间目录可能被移走或删除，开始执行前再校验一次。
     clone_parent(st, Some(&code_dir.to_string_lossy()))?;
@@ -1334,5 +1588,132 @@ mod tests {
             decide_proxy("manual", None, &nothing, None, sys),
             decide_proxy("auto", None, &nothing, None, sys)
         );
+    }
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+
+    fn state() -> Shared {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Arc::new(AppState::new(ConfigStore::load(std::env::temp_dir().join(format!("syncdeck-task-{}-{stamp}", std::process::id())).join("config.json"))))
+    }
+
+    #[test]
+    fn all_tasks_protect_quit_and_install_and_gate_rejects_new_work() {
+        for kind in ["refresh", "sync", "auto-sync", "commit-push", "clone", "auto-check"] {
+            let st = state();
+            let task = AppState::register_task(&st, kind, kind, kind.starts_with("auto-")).unwrap();
+            assert_eq!(st.task_state().waiting[0].kind, kind);
+            assert!(st.prepare_quit(false).is_some(), "等待中的任务也保护退出");
+            assert!(st.begin_install().is_err());
+            task.activate();
+            assert_eq!(st.task_state().active.as_ref().unwrap().kind, kind);
+            assert!(st.task_state().waiting.is_empty());
+            assert!(st.prepare_quit(false).is_some());
+            assert!(st.begin_install().is_err());
+            drop(task);
+            assert!(!st.task_state().busy());
+            st.begin_install().unwrap();
+            assert!(st.prepare_quit(true).is_some(), "安装期间即使确认强制退出也必须拒绝");
+            assert!(AppState::register_task(&st, kind, kind, false).is_err());
+            assert!(st.begin_install().is_err(), "不能重复安装");
+            st.cancel_install();
+            let task = AppState::register_task(&st, kind, kind, false).unwrap();
+            drop(task);
+            assert!(st.prepare_quit(false).is_none(), "空闲退出不需要确认");
+            assert!(AppState::register_task(&st, kind, kind, false).is_err(), "退出确认与拒绝新任务同一原子操作");
+        }
+    }
+
+    #[test]
+    fn installation_and_registration_or_confirmed_quit_are_atomic() {
+        for _ in 0..32 {
+            let st = state();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let (one, two) = (st.clone(), st.clone());
+            let (start_one, start_two) = (barrier.clone(), barrier.clone());
+            let register = std::thread::spawn(move || {
+                start_one.wait();
+                AppState::register_task(&one, "refresh", "刷新状态", false)
+            });
+            let install = std::thread::spawn(move || { start_two.wait(); two.begin_install() });
+            barrier.wait();
+            let task = register.join().unwrap();
+            let install = install.join().unwrap();
+            assert_ne!(task.is_ok(), install.is_ok(), "安装与任务注册必须恰有一个取得资格");
+            drop(task);
+            st.cancel_install();
+
+            let st = state();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let (one, two) = (st.clone(), st.clone());
+            let (start_one, start_two) = (barrier.clone(), barrier.clone());
+            let quit = std::thread::spawn(move || { start_one.wait(); one.prepare_quit(true).is_none() });
+            let install = std::thread::spawn(move || { start_two.wait(); two.begin_install().is_ok() });
+            barrier.wait();
+            assert_ne!(quit.join().unwrap(), install.join().unwrap(), "确认退出与安装不能同时取得资格");
+        }
+    }
+
+    async fn wait_queued(st: &Shared) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while st.task_state().waiting.is_empty() { tokio::task::yield_now().await; }
+        }).await.expect("任务已注册并等待网络锁");
+    }
+
+    #[tokio::test]
+    async fn queued_auto_sync_rechecks_pause_and_master_but_manual_remains_available() {
+        for pause in [true, false] {
+            let st = state();
+            st.config.update(|c| c.settings.auto_sync_enabled = Some(true)).unwrap();
+            let net = st.net_lock.lock().await;
+            let events = Arc::new(AtomicUsize::new(0));
+            let (worker, observed) = (st.clone(), events.clone());
+            let task = tokio::spawn(async move {
+                run_sync_for(&worker, None, Arc::new(move |_| { observed.fetch_add(1, Ordering::SeqCst); }), Some(AutoSyncTrigger::Unlock)).await
+            });
+            wait_queued(&st).await;
+            if pause { set_auto_sync_pause(&st, Some(Local::now() + chrono::Duration::hours(1))).unwrap(); }
+            else { set_auto_sync_enabled(&st, false).unwrap(); }
+            drop(net);
+            assert!(task.await.unwrap().is_err());
+            assert_eq!(events.load(Ordering::SeqCst), 0, "等待期间取消的任务不能开始执行");
+            assert!(!st.task_state().busy());
+            assert!(run_sync(&st, None, Arc::new(|_| {})).await.is_ok());
+            assert!(run_refresh(&st, Arc::new(|_| {})).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_readonly_check_obeys_pause_even_when_master_is_off() {
+        let st = state();
+        st.config.update(|c| c.settings.periodic_check = Some(true)).unwrap();
+        assert!(st.config.read(|c| autosync::allowed_now(&c.settings, AutoSyncTrigger::Periodic)));
+        let net = st.net_lock.lock().await;
+        let worker = st.clone();
+        let task = tokio::spawn(async move { run_refresh_for(&worker, Arc::new(|_| {}), Some(AutoSyncTrigger::Periodic)).await });
+        wait_queued(&st).await;
+        set_auto_sync_pause(&st, Some(Local::now() + chrono::Duration::hours(1))).unwrap();
+        drop(net);
+        assert!(task.await.unwrap().is_err());
+        assert!(!st.task_state().busy());
+    }
+
+    #[tokio::test]
+    async fn pause_during_active_round_allows_that_round_to_finish() {
+        let st = state();
+        st.config.update(|c| c.settings.auto_sync_enabled = Some(true)).unwrap();
+        let worker = st.clone();
+        let result = run_sync_for(&st, None, Arc::new(move |event| {
+            if matches!(event, SyncProgressEvent::Begin { .. }) {
+                assert!(worker.task_state().active.is_some());
+                set_auto_sync_pause(&worker, Some(Local::now() + chrono::Duration::hours(1))).unwrap();
+            }
+        }), Some(AutoSyncTrigger::Unlock)).await;
+        assert!(result.is_ok(), "已开始的一轮允许完成");
+        assert!(!st.task_state().busy());
+        assert!(!st.config.read(|c| autosync::allowed_now(&c.settings, AutoSyncTrigger::Unlock)));
     }
 }

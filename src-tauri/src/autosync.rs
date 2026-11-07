@@ -62,6 +62,7 @@ impl AutoSyncTrigger {
 /// 后台运行与自动同步的各个开关（读取时已套上默认值）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Switches {
+    pub auto_sync_enabled: bool,
     pub launch_at_login: bool,
     pub close_to_tray: bool,
     pub sync_on_lock: bool,
@@ -76,6 +77,7 @@ pub struct Switches {
 /// 对每个开关执行同一段代码：`$m!(字段名)`
 macro_rules! each_switch {
     ($m:ident) => {
+        $m!(auto_sync_enabled);
         $m!(launch_at_login);
         $m!(close_to_tray);
         $m!(sync_on_lock);
@@ -89,8 +91,10 @@ macro_rules! each_switch {
 }
 
 impl Switches {
-    /// 默认值：开机自启、关窗口隐藏到托盘、锁屏和启动 / 唤醒 / 解锁都开；定时检查关；只在出错或冲突时通知
+    /// 旧配置的兼容默认值；全新配置由 ConfigStore 显式关闭自动同步总开关。
+    /// 开机自启、关窗口隐藏到托盘及各触发规则保持原默认；定时检查关；出错才通知
     pub const DEFAULT: Switches = Switches {
+        auto_sync_enabled: true,
         launch_at_login: true,
         close_to_tray: true,
         sync_on_lock: true,
@@ -141,6 +145,7 @@ impl Switches {
     /// 这种触发对应的开关是否打开（托盘"立即同步"没有开关）
     pub fn allows(&self, t: AutoSyncTrigger) -> bool {
         use AutoSyncTrigger::*;
+        if !self.auto_sync_enabled && !matches!(t, Manual | Periodic) { return false; }
         match t {
             Lock => self.sync_on_lock,
             Startup => self.sync_on_startup,
@@ -213,6 +218,13 @@ pub fn next_midnight<Tz: TimeZone>(now: &DateTime<Tz>) -> DateTime<Tz> {
 pub fn active_pause(s: &StoredSettings, now: &DateTime<Local>) -> Option<DateTime<Local>> {
     let until = DateTime::parse_from_rfc3339(s.auto_sync_paused_until.as_deref()?).ok()?.with_timezone(&Local);
     (until > *now).then_some(until)
+}
+
+/// 等待网络锁的任务开始执行和失败重试前都重新读取，不沿用排队时的决定。
+pub fn allowed_now(settings: &StoredSettings, trigger: AutoSyncTrigger) -> bool {
+    if trigger == AutoSyncTrigger::Manual { return true; }
+    let now = Local::now();
+    Switches::from_stored(settings).allows(trigger) && active_pause(settings, &now).is_none()
 }
 
 /// 暂停到的时间怎么显示："今天 18:00" / "明天 00:00" / "10月20日 00:00"
@@ -454,18 +466,12 @@ pub async fn handle(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> O
 
 /// 程序启动 = 一次"到达"。要做的话由后端做（前端启动时就不再自己刷新），不做的话只做一次本地检查给托盘用
 pub fn on_startup(st: Shared, host: Arc<dyn Host>) {
-    let decision = st.config.read(|c| st.auto.claim(AutoSyncTrigger::Startup, Local::now(), &c.settings));
-    if decision == Decision::Run {
-        st.auto.startup_sync.store(true, Ordering::SeqCst);
-        tauri::async_runtime::spawn(async move {
-            execute(&st, &*host, AutoSyncTrigger::Startup).await;
-        });
-    } else {
-        tauri::async_runtime::spawn(async move {
-            commands::local_projects(&st).await;
-            host.projects_changed(st.snapshot());
-        });
-    }
+    st.auto.startup_sync.store(true, Ordering::SeqCst);
+    tauri::async_runtime::spawn(async move {
+        commands::local_projects(&st).await;
+        host.projects_changed(st.snapshot());
+        handle(&st, &*host, AutoSyncTrigger::Startup).await;
+    });
 }
 
 /// 在后台处理一次触发，不等结果（系统事件、托盘菜单用）
@@ -488,7 +494,10 @@ async fn execute(st: &Shared, host: &dyn Host, trigger: AutoSyncTrigger) -> Outc
     if trigger.kind() == Kind::Check {
         // 定时检查只是看一眼（不拉取、不推送），不占"正在后台同步"：
         // 期间来的到达同步照常开始，靠 net_lock 排在它后面
-        let checked = commands::run_refresh(st, Arc::new(|_| {})).await.len();
+        let checked = match commands::run_refresh_for(st, Arc::new(|_| {}), Some(trigger)).await {
+            Ok(projects) => projects.len(),
+            Err(error) => return Outcome::Failed(error),
+        };
         host.projects_changed(st.snapshot());
         return Outcome::Checked(checked);
     }
@@ -532,17 +541,24 @@ async fn sync_and_report(
         let _ = tx.send(e);
     });
     let work = async move {
-        let mut result = commands::run_sync(st, only, sink.clone()).await;
+        let mut result = commands::run_sync_for(st, only, sink.clone(), Some(trigger)).await;
         if let (true, Ok(first)) = (retry, &mut result) {
             let again = network_failures(st, first);
-            if !again.is_empty() {
+            if !again.is_empty() && st.config.read(|c| allowed_now(&c.settings, trigger)) {
                 let retry_at = (Local::now() + chrono::Duration::from_std(RETRY_DELAY).unwrap_or_default()).to_rfc3339();
                 let notice = SyncProgressEvent::Retry { project_ids: again.clone(), retry_at };
                 st.note_progress(&notice);
                 sink(notice);
-                tokio::time::sleep(RETRY_DELAY).await;
-                if let Ok(second) = commands::run_sync(st, Some(again), sink.clone()).await {
+                // 重试等待也属于忙碌任务；暂停/关闭后立刻放弃，不进入下一轮。
+                let waiting = commands::AppState::register_task(st, "auto-sync", "等待网络重试", true).ok();
+                let deadline = Instant::now() + RETRY_DELAY;
+                while waiting.is_some() && Instant::now() < deadline && st.config.read(|c| allowed_now(&c.settings, trigger)) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if waiting.is_some() && st.config.read(|c| allowed_now(&c.settings, trigger)) {
+                  if let Ok(second) = commands::run_sync_for(st, Some(again), sink.clone(), Some(trigger)).await {
                     merge_retry(first, second);
+                  }
                 }
             }
         }
@@ -751,6 +767,8 @@ mod tests {
             behind: 0,
             changes: Vec::new(),
             last_sync_at: None,
+            last_checked_at: None,
+            commit_block_reason: None,
             issue: None,
             check_error: None,
             auto_commit,
@@ -841,7 +859,9 @@ mod tests {
     fn empty_state(name: &str) -> Shared {
         let dir = std::env::temp_dir().join(name);
         let _ = std::fs::remove_dir_all(&dir); // 测试自己的临时配置目录
-        Arc::new(crate::commands::AppState::new(crate::config::ConfigStore::load(dir.join("config.json"))))
+        let store = crate::config::ConfigStore::load(dir.join("config.json"));
+        store.update(|c| c.settings.auto_sync_enabled = Some(true)).unwrap();
+        Arc::new(crate::commands::AppState::new(store))
     }
 
     #[tokio::test(flavor = "multi_thread")]

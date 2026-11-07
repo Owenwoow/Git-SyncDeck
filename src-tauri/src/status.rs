@@ -31,6 +31,7 @@ pub struct Inspection {
     pub changes: Vec<FileChange>,
     /// 处于冲突状态（未合并）的文件数
     pub conflicts: u32,
+    pub commit_block_reason: Option<String>,
     pub status: SyncStatus,
 }
 
@@ -46,7 +47,31 @@ pub async fn inspect(dir: &Path) -> Result<Inspection, GitError> {
     let out = run_git(dir, &["status", "--porcelain=v2", "--branch", "-z"], STATUS_TIMEOUT).await?;
     let porcelain = parse_porcelain_v2(&out.stdout);
     let config = read_config(dir).await?;
-    Ok(build_inspection(porcelain, &config))
+    let mut inspection = build_inspection(porcelain, &config);
+    inspection.commit_block_reason = commit_block_reason(dir, inspection.conflicts).await?;
+    Ok(inspection)
+}
+
+/// 在任何 add/commit 之前读取 Git 自己的操作标记，兼容 .git 文件与 worktree。
+pub async fn commit_block_reason(dir: &Path, conflicts: u32) -> Result<Option<String>, GitError> {
+    if conflicts > 0 {
+        return Ok(Some(format!("有 {conflicts} 个文件尚未解决合并冲突，请在终端或编辑器中解决，并完成或中止合并后再提交")));
+    }
+    let out = run_git(dir, &["rev-parse", "--absolute-git-dir"], STATUS_TIMEOUT).await?;
+    let metadata = std::path::PathBuf::from(out.stdout.trim());
+    for (file, label) in [
+        ("MERGE_HEAD", "合并（merge）"),
+        ("CHERRY_PICK_HEAD", "拣选提交（cherry-pick）"),
+        ("REVERT_HEAD", "撤销提交（revert）"),
+        ("rebase-merge", "变基（rebase）"),
+        ("rebase-apply", "变基或邮件补丁（rebase / am）"),
+        ("sequencer", "序列操作（cherry-pick / revert）"),
+    ] {
+        if metadata.join(file).try_exists().map_err(|e| GitError::Io(e.to_string()))? {
+            return Ok(Some(format!("仓库有未完成的{label}，请在终端或编辑器中完成或中止该操作后再提交")));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------- git status --porcelain=v2 ----------------
@@ -245,6 +270,7 @@ pub fn build_inspection(p: Porcelain, cfg: &RepoConfig) -> Inspection {
         behind,
         changes: p.changes,
         conflicts: p.conflicts,
+        commit_block_reason: None,
         status,
     }
 }
@@ -283,8 +309,9 @@ pub fn issue_text(ins: &Inspection) -> String {
         SyncStatus::Dirty => {
             let untracked = ins.changes.iter().filter(|c| c.kind == ChangeKind::Untracked).count();
             let staged = ins.changes.iter().filter(|c| c.staged).count();
-            let total = ins.changes.len();
-            let unstaged = total - untracked - staged;
+            let total = ins.changes.iter().map(|change| &change.path).collect::<std::collections::HashSet<_>>().len();
+            let unstaged = ins.changes.iter().filter(|c| !c.staged && c.kind != ChangeKind::Untracked)
+                .map(|c| &c.path).collect::<std::collections::HashSet<_>>().len();
             let parts: Vec<String> = [(staged, "已暂存"), (unstaged, "未暂存"), (untracked, "未跟踪")]
                 .iter()
                 .filter(|(n, _)| *n > 0)

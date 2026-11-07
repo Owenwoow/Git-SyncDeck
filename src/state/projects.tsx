@@ -100,6 +100,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     syncOpenRef.current = sync.open;
   }, [sync.open]);
   const [autoSync, setAutoSync] = useState<AutoSyncEvent | null>(null);
+  const autoRevision = useRef(0);
   /** 「添加项目 → 从 GitHub 克隆」正在克隆（退出前要确认） */
   const [cloning, setCloning] = useState(false);
   /** 正在进行的后台同步的进度、最近一次后台同步的结果、后台同步弹窗是否打开 */
@@ -172,8 +173,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // 启动：挂上后台事件的监听 → 检测 git → 先显示本地状态（不联网）→ 联网刷新一次。
-  // 打开了"启动时同步"时，启动的到达同步由后端做：前端只显示本地状态，等后端推结果，避免同时跑两轮。
+  // 启动仅做本地检查。自动联网由后端总开关、暂停和只读检查规则统一决定。
   // 监听在整个应用期间都有效（这个 Provider 不会卸载），所以不取消
   useEffect(() => {
     if (started.current) return; // 开发模式下 StrictMode 会执行两次 effect，避免重复 fetch
@@ -187,15 +187,18 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
         }),
         api.onAutoSync({
           started: (e) => {
+            autoRevision.current++;
             setAutoSync(e);
             setBgRun(backgroundStarted(e));
           },
           progress: (e) => {
+            autoRevision.current++;
             // 先记下开始时的状态，再把那一行改成"同步中"
             setBgRun((cur) => (cur ? applyEvent(cur, e, latest) : cur));
             applyToList(e);
           },
           finished: (e) => {
+            autoRevision.current++;
             // 只清掉同一轮的
             setAutoSync((cur) => (cur && cur.trigger !== e.trigger ? cur : null));
             setBgRun((cur) => {
@@ -214,18 +217,18 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
         });
       }
       await reload();
+      const autoSeq = autoRevision.current;
       const auto = await api
         .getAutoSyncState()
         .catch(() => ({ running: null, startupSync: false, progress: null, last: null }));
+      if (autoRevision.current !== autoSeq) return;
       setAutoSync((cur) => cur ?? auto.running);
       // 窗口中途打开：补上正在进行的后台同步的进度和最近一次的结果（已经从事件收到的为准）
       const running = auto.running;
       if (running) setBgRun((cur) => (cur && cur.order.length ? cur : fromSnapshot(running, auto.progress, latest)));
       const last = auto.last;
       if (last) setBgLast((cur) => cur ?? backgroundFinished(null, last));
-      if (git.installed && !auto.startupSync) {
-        await refresh().catch(() => undefined);
-      } else if (auto.startupSync && !auto.running) {
+      if (auto.startupSync && !auto.running) {
         // 兜底：后端的启动同步已经结束（或还没开始），再读一次列表，不让列表停在同步前的状态；
         // 还在进行的话，结束时会推 projects-changed
         await reload();
